@@ -132,7 +132,7 @@ namespace xajh
 
             int written;
             WriteProcessMemory(_hProcess, allocCode, code, (uint)code.Length, out written);
-            WriteProcessMemory(_hProcess, IntPtr.Zero, paramsBuffer, 8, out written);
+            
 
             // Create the thread
             IntPtr hThread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, allocCode, IntPtr.Zero, 0, out _);
