@@ -96,8 +96,12 @@ namespace xajh
 
                     if (_target != null)
                     {
-                        // 3. Execute Auto-Face via Internal Call 0x6ACCCC
-                        ExecuteRemoteFace(new IntPtr(playerObj), new IntPtr(_target.NpcObjAddr));
+                        // 3. Execute Auto-Face via Internal Call 0x6ACCCC.
+                        // Prefer node pointer first; fallback to npc_obj pointer if needed.
+                        IntPtr targetPtr = _target.NodeAddr != 0
+                                                    ? new IntPtr(_target.NodeAddr)
+                                                    : new IntPtr(_target.NpcObjAddr);
+                        ExecuteRemoteFace(new IntPtr(playerObj), targetPtr);
 
                         // 4. Brief delay to let the engine process the turn, then Send Attack Key
                         Thread.Sleep(1000);

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Xml.Linq;
 
 namespace xajh
 {
@@ -10,6 +11,7 @@ namespace xajh
         public float X { get; set; }
         public float Y { get; set; }
         public float Z { get; set; }
+        public uint NodeAddr { get; set; }    // list node pointer (node+0x4C -> npc_obj)
         public uint NpcObjAddr { get; set; }  // raw npc_obj pointer, for direct call injection
 
         public override string ToString() =>
@@ -83,7 +85,7 @@ namespace xajh
 
                     if (npcRaw != 0)
                     {
-                        var npc = ReadNpc(new IntPtr((uint)npcRaw));
+                        var npc = ReadNpc(new IntPtr((uint)npcRaw), node);
                         if (npc != null) result.Add(npc);
                     }
 
@@ -95,7 +97,7 @@ namespace xajh
             return result;
         }
 
-        private Npc ReadNpc(IntPtr npcObj)
+        private Npc ReadNpc(IntPtr npcObj, uint nodeAddr)
         {
             try
             {
@@ -124,8 +126,16 @@ namespace xajh
                         new IntPtr((uint)charPtrRaw), buf, nameLen, out _);
                     name = Encoding.GetEncoding("GBK").GetString(buf);
                 }
+                return new Npc
+                {
+                    Name = name,
+                    X = x,
+                    Y = y,
+                    Z = z,
+                    NodeAddr = nodeAddr,
+                    NpcObjAddr = (uint)npcObj.ToInt64()
+                };
 
-                return new Npc { Name = name, X = x, Y = y, Z = z, NpcObjAddr = (uint)npcObj.ToInt64() };
             }
             catch { return null; }
         }
