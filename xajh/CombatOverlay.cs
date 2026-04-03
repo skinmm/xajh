@@ -24,6 +24,9 @@ namespace xajh
         static extern bool CloseHandle(IntPtr hObject);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetExitCodeThread(IntPtr hThread, out uint lpExitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -118,13 +121,14 @@ namespace xajh
                 0x60,                               // pushad
                 0xB9, 0,0,0,0,                      // mov ecx, playerPtr  (patch bytes 2-5)
                 0x68, 0,0,0,0,                      // push targetPtr      (patch bytes 7-10)
-                0xB8, 0xCC,0xCC,0x6A,0x00,          // mov eax, 0x6ACCCC
+                0xB8, 0xCC,0xCC,0x6A,0x00,          // mov eax, 0x6ACCC0
                 0xFF, 0xD0,                         // call eax
                 0x61,                               // popad
-                0xC3                                // ret
+                0xC2, 0x04, 0x00                    // ret 4 (LPTHREAD_START_ROUTINE stdcall)
             };
 
             IntPtr allocCode = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)code.Length, 0x1000, 0x40);
+            if (allocCode == IntPtr.Zero) return;
             //IntPtr allocData = VirtualAllocEx(_hProcess, IntPtr.Zero, 8, 0x1000, 0x04);
 
             Array.Copy(BitConverter.GetBytes(playerPtr.ToInt32()), 0, code, 2, 4);
@@ -132,7 +136,12 @@ namespace xajh
 
             int written;
             WriteProcessMemory(_hProcess, allocCode, code, (uint)code.Length, out written);
-            
+            if (!WriteProcessMemory(_hProcess, allocCode, code, (uint)code.Length, out written) ||
+                written != code.Length)
+            {
+                VirtualFreeEx(_hProcess, allocCode, 0, 0x8000);
+                return;
+            }
 
             // Create the thread
             IntPtr hThread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, allocCode, IntPtr.Zero, 0, out _);
@@ -142,6 +151,9 @@ namespace xajh
                 // Wait for the thread to finish before freeing memory
                 // Using WaitForSingleObject is safer than Thread.Sleep
                 WaitForSingleObject(hThread, 1000);
+                GetExitCodeThread(hThread, out uint ec);
+                if (ec == 0xC0000005)
+                    Console.WriteLine("[!] Remote face thread crashed with access violation.");
                 CloseHandle(hThread);
             }
 
