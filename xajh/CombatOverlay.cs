@@ -1,13 +1,17 @@
 using System;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
-using System.Linq;
 
 namespace xajh
 {
     public class CombatOverlay
     {
+        private const uint INFINITE = 0xFFFFFFFF;
+        private const uint WAIT_OBJECT_0 = 0x00000000;
+        private const uint WAIT_TIMEOUT = 0x00000102;
         private IntPtr _hProcess;
         private IntPtr _moduleBase;
         private bool _running = true;
@@ -113,16 +117,22 @@ namespace xajh
         private void ExecuteRemoteFace(IntPtr playerPtr, IntPtr targetPtr)
         {
             if (playerPtr == IntPtr.Zero || targetPtr == IntPtr.Zero) return;
-
+            if (!CanRead(playerPtr, 0x108) || !CanRead(targetPtr, 4)) return;
             // --- PROTECTIVE SHELLCODE ---
-            // This version preserves all registers (pushad/popad) to prevent crashing 
-            // the game's thread context.
+            // 0x6ACCCC is in the middle of a prologued function and expects [ebp-4] = this.
+            // Build a tiny frame so thiscall state is valid before jumping there.
             byte[] code = {
                 0x60,                               // pushad
-                0xB9, 0,0,0,0,                      // mov ecx, playerPtr  (patch bytes 2-5)
-                0x68, 0,0,0,0,                      // push targetPtr      (patch bytes 7-10)
+                0x55,                               // push ebp
+                0x8B, 0xEC,                         // mov ebp, esp
+                0x83, 0xEC, 0x50,                   // sub esp, 0x50
+                0xB8, 0,0,0,0,                      // mov eax, playerPtr  (patch bytes 8-11)
+                0x89, 0x45, 0xFC,                   // mov [ebp-4], eax
+                0x68, 0,0,0,0,                      // push targetPtr      (patch bytes 16-19)
                 0xB8, 0xCC,0xCC,0x6A,0x00,          // mov eax, 0x6ACCC0
                 0xFF, 0xD0,                         // call eax
+                0x8B, 0xE5,                         // mov esp, ebp
+                0x5D,                               // pop ebp
                 0x61,                               // popad
                 0xC2, 0x04, 0x00                    // ret 4 (LPTHREAD_START_ROUTINE stdcall)
             };
@@ -131,8 +141,8 @@ namespace xajh
             if (allocCode == IntPtr.Zero) return;
             //IntPtr allocData = VirtualAllocEx(_hProcess, IntPtr.Zero, 8, 0x1000, 0x04);
 
-            Array.Copy(BitConverter.GetBytes(playerPtr.ToInt32()), 0, code, 2, 4);
-            Array.Copy(BitConverter.GetBytes(targetPtr.ToInt32()), 0, code, 7, 4);
+            Array.Copy(BitConverter.GetBytes(playerPtr.ToInt32()), 0, code, 8, 4);
+            Array.Copy(BitConverter.GetBytes(targetPtr.ToInt32()), 0, code, 16, 4);
 
             int written;
             WriteProcessMemory(_hProcess, allocCode, code, (uint)code.Length, out written);
@@ -148,9 +158,18 @@ namespace xajh
 
             if (hThread != IntPtr.Zero)
             {
-                // Wait for the thread to finish before freeing memory
-                // Using WaitForSingleObject is safer than Thread.Sleep
-                WaitForSingleObject(hThread, 1000);
+                // Avoid freeing shellcode while thread still executes it.
+                uint waitRc = WaitForSingleObject(hThread, INFINITE);
+                if (waitRc != WAIT_OBJECT_0)
+                {
+                    if (waitRc == WAIT_TIMEOUT)
+                        Console.WriteLine("[!] Remote face thread timed out; keeping code memory allocated.");
+                    else
+                        Console.WriteLine("[!] WaitForSingleObject failed for remote face thread.");
+                    CloseHandle(hThread);
+                    return;
+                 }
+
                 GetExitCodeThread(hThread, out uint ec);
                 if (ec == 0xC0000005)
                     Console.WriteLine("[!] Remote face thread crashed with access violation.");
@@ -162,6 +181,13 @@ namespace xajh
             VirtualFreeEx(_hProcess, IntPtr.Zero, 0, 0x8000);
         }
 
+        private bool CanRead(IntPtr basePtr, int size)
+        {
+            if (basePtr == IntPtr.Zero || size <= 0) return false;
+            var tmp = new byte[size];
+            return MemoryHelper.ReadProcessMemory(_hProcess, basePtr, tmp, size, out int read) &&
+                   read == size;
+        }
         private int GetPlayerObject()
         {
             // Based on your NpcReader notes: [moduleBase + 0x9D4518] is the Manager
