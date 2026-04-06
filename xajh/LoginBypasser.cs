@@ -9,23 +9,21 @@ using System.Threading;
 namespace xajh
 {
     /// <summary>
-    /// Automatic login handler for Cloud_xajhfuzhu.exe.
+    /// Runtime login bypass for Cloud_xajhfuzhu.exe (易语言 program).
     ///
-    /// The login window uses a custom-drawn class "MAIN_WIN" with no
-    /// standard Win32 child controls — username, password, and button
-    /// are all owner-drawn on the window canvas.
+    /// The exe is packed with ZDXXAJZB — all code and strings are encrypted
+    /// on disk and decrypted at runtime. Cannot patch on disk.
     ///
-    /// Approach: simulate mouse clicks at field positions + keyboard
-    /// input via WM_CHAR to type credentials, then click Login or
-    /// press Enter.
+    /// After the unpacker finishes:
+    ///   1. Search runtime memory for the login window title string.
+    ///   2. Find the code that references it (the login form setup).
+    ///   3. Find the login validation CALL near it.
+    ///   4. Patch only that specific validation to always succeed.
     /// </summary>
     public static class LoginBypasser
     {
         [DllImport("user32.dll")]
         static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
@@ -37,109 +35,37 @@ namespace xajh
         static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
         [DllImport("user32.dll")]
-        static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, string lParam);
-
-        [DllImport("user32.dll")]
-        static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
 
         [DllImport("user32.dll")]
-        static extern bool IsWindowVisible(IntPtr hWnd);
+        static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
         [DllImport("user32.dll")]
-        static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+        static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll")]
-        static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+        static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
-        [DllImport("user32.dll")]
-        static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
-        [DllImport("user32.dll")]
-        static extern void SetCursorPos(int x, int y);
-
-        [DllImport("user32.dll")]
-        static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
-
-        [DllImport("user32.dll")]
-        static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-
-        [DllImport("user32.dll")]
-        static extern short GetAsyncKeyState(int vKey);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool VirtualProtectEx(IntPtr hProcess, IntPtr lpAddress,
+            uint dwSize, uint flNewProtect, out uint lpflOldProtect);
 
         delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
-        [StructLayout(LayoutKind.Sequential)]
-        struct RECT { public int Left, Top, Right, Bottom; }
-
-        [StructLayout(LayoutKind.Sequential)]
-        struct POINT { public int X, Y; }
-
-        [StructLayout(LayoutKind.Sequential)]
-        struct INPUT
-        {
-            public uint type;
-            public INPUTUNION u;
-        }
-
-        [StructLayout(LayoutKind.Explicit)]
-        struct INPUTUNION
-        {
-            [FieldOffset(0)] public MOUSEINPUT mi;
-            [FieldOffset(0)] public KEYBDINPUT ki;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        struct MOUSEINPUT
-        {
-            public int dx, dy;
-            public uint mouseData, dwFlags, time;
-            public UIntPtr dwExtraInfo;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        struct KEYBDINPUT
-        {
-            public ushort wVk, wScan;
-            public uint dwFlags, time;
-            public UIntPtr dwExtraInfo;
-        }
-
-        const uint WM_LBUTTONDOWN = 0x0201;
-        const uint WM_LBUTTONUP   = 0x0202;
-        const uint WM_KEYDOWN     = 0x0100;
-        const uint WM_KEYUP       = 0x0101;
-        const uint WM_CHAR        = 0x0102;
-        const uint WM_CLOSE       = 0x0010;
-        const uint BM_CLICK       = 0x00F5;
-        const int  VK_TAB         = 0x09;
-        const int  VK_RETURN      = 0x0D;
-        const int  SW_SHOW        = 5;
-        const int  SW_RESTORE     = 9;
-
-        const uint INPUT_MOUSE    = 0;
-        const uint INPUT_KEYBOARD = 1;
-        const uint MOUSEEVENTF_LEFTDOWN  = 0x0002;
-        const uint MOUSEEVENTF_LEFTUP    = 0x0004;
-        const uint MOUSEEVENTF_ABSOLUTE  = 0x8000;
-        const uint MOUSEEVENTF_MOVE      = 0x0001;
-        const uint KEYEVENTF_KEYUP       = 0x0002;
-        const uint KEYEVENTF_UNICODE     = 0x0004;
-
-        const int MAX_LOGIN_ATTEMPTS = 3;
-        const string MAIN_WIN_CLASS = "MAIN_WIN";
+        const uint WM_CLOSE = 0x0010;
+        const uint BM_CLICK = 0x00F5;
+        const uint PAGE_EXECUTE_READWRITE = 0x40;
+        const int SW_RESTORE = 9;
 
         public static (IntPtr hProcess, IntPtr moduleBase) Bypass()
         {
-            Console.WriteLine("[*] Login Bypasser — Cloud_xajhfuzhu.exe");
+            Console.WriteLine("[*] Login Bypasser — Cloud_xajhfuzhu.exe (易语言)");
             Console.WriteLine("[*] Waiting for Cloud_xajhfuzhu.exe ...");
 
             Process proc = WaitForProcess("Cloud_xajhfuzhu", timeoutSeconds: 60);
@@ -155,258 +81,294 @@ namespace xajh
 
             if (hProcess == IntPtr.Zero)
             {
-                Console.WriteLine("[!] Cannot open process — run this tool as Administrator.");
+                Console.WriteLine("[!] Cannot open process — run as Administrator.");
                 return (IntPtr.Zero, IntPtr.Zero);
             }
 
             Console.WriteLine($"[+] Attached  PID={proc.Id}  Base=0x{moduleBase.ToInt64():X}");
 
-            for (int attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++)
+            // Wait for unpacker to finish by checking for MAIN_WIN string
+            Console.Write("[*] Waiting for unpacker");
+            bool unpacked = WaitForString(hProcess, moduleBase, "MAIN_WIN", 30);
+            if (!unpacked)
             {
-                if (proc.HasExited)
-                {
-                    Console.WriteLine("[!] Cloud_xajhfuzhu.exe has exited.");
-                    return (IntPtr.Zero, IntPtr.Zero);
-                }
+                Console.WriteLine(" timeout.");
+                Console.WriteLine("[!] Could not confirm unpacking. Trying anyway...");
+            }
+            else
+            {
+                Console.WriteLine(" done.");
+            }
+            Thread.Sleep(1000);
 
-                Console.WriteLine($"[*] Login attempt {attempt}/{MAX_LOGIN_ATTEMPTS} ...");
+            // Search for login-related strings and patch the validation
+            bool patched = PatchLoginValidation(hProcess, moduleBase);
 
-                bool submitted = HandleLoginWindow(proc.Id);
-                if (!submitted)
-                {
-                    Console.WriteLine("[*] No login window detected — may already be past login.");
-                    break;
-                }
-
-                Thread.Sleep(2000);
-
-                if (proc.HasExited)
-                {
-                    Console.WriteLine("[!] Cloud_xajhfuzhu.exe exited after login attempt.");
-                    return (IntPtr.Zero, IntPtr.Zero);
-                }
-
-                bool hadError = DismissErrorDialogs(proc.Id);
-                if (!hadError)
-                {
-                    Console.WriteLine("[+] Login submitted successfully.");
-                    break;
-                }
-
-                Console.WriteLine("[*] Error dialog dismissed, retrying ...");
+            if (patched)
+            {
+                Console.WriteLine("[+] Login validation patched.");
                 Thread.Sleep(1000);
+                DismissErrorDialogs(proc.Id);
+            }
+            else
+            {
+                Console.WriteLine("[*] Could not find login validation to patch.");
+                Console.WriteLine("[*] The program should still work — just login manually.");
             }
 
-            Console.WriteLine("[+] Login bypass complete.");
             return (hProcess, moduleBase);
         }
 
         /// <summary>
-        /// Finds the MAIN_WIN login window and interacts with it:
-        /// click on the username area, type credentials, Tab to password,
-        /// type again, then click Login or press Enter.
+        /// Waits until a specific ASCII string appears in the process's
+        /// memory (signals that the unpacker has finished decrypting).
         /// </summary>
-        static bool HandleLoginWindow(int pid)
+        static bool WaitForString(IntPtr hProcess, IntPtr moduleBase, string target, int timeoutSec)
         {
-            Console.WriteLine("[*] Looking for login window (MAIN_WIN) ...");
+            byte[] needle = Encoding.ASCII.GetBytes(target);
+            IntPtr textStart = IntPtr.Add(moduleBase, 0x1000);
 
-            IntPtr mainWin = IntPtr.Zero;
-
-            for (int wait = 0; wait < 30; wait++)
+            for (int i = 0; i < timeoutSec * 4; i++)
             {
-                Thread.Sleep(500);
-                mainWin = FindMainWindow(pid);
-                if (mainWin != IntPtr.Zero) break;
-            }
-
-            if (mainWin == IntPtr.Zero)
-            {
-                // Fall back: look for any visible top-level window
-                var windows = GetProcessWindows(pid);
-                Console.WriteLine($"[*] Found {windows.Count} window(s):");
-                foreach (var (hwnd, title, cls, isChild) in windows)
+                // Check a small region of .text to see if it's populated
+                byte[] probe = new byte[0x1000];
+                MemoryHelper.ReadProcessMemory(hProcess, textStart, probe, probe.Length, out int read);
+                if (read > 0 && !AllZero(probe))
                 {
-                    bool vis = IsWindowVisible(hwnd);
-                    string prefix = isChild ? "    " : "  ";
-                    Console.WriteLine($"{prefix}HWND=0x{hwnd.ToInt64():X}  cls={cls,-24} title=\"{title}\"  vis={vis}");
+                    Console.Write(".");
+                    // Now scan .rdata and .data for the target string
+                    // .rdata at moduleBase + 0x1C9000, .data at + 0x227000
+                    foreach (int sectionOffset in new[] { 0x1C9000, 0x227000, 0x1000 })
+                    {
+                        IntPtr scanBase = IntPtr.Add(moduleBase, sectionOffset);
+                        int scanSize = 0x60000;
+                        byte[] buf = new byte[scanSize];
+                        MemoryHelper.ReadProcessMemory(hProcess, scanBase, buf, scanSize, out int r);
+                        if (r > needle.Length)
+                        {
+                            int pos = FindBytes(buf, needle, r);
+                            if (pos >= 0) return true;
+                        }
+                    }
                 }
-
-                // Try standard Edit/Button controls as fallback
-                return FallbackStandardControls(windows);
+                Console.Write(".");
+                Thread.Sleep(250);
             }
-
-            // Get window dimensions for click position calculation
-            GetWindowRect(mainWin, out RECT winRect);
-            GetClientRect(mainWin, out RECT clientRect);
-
-            int winW = clientRect.Right - clientRect.Left;
-            int winH = clientRect.Bottom - clientRect.Top;
-
-            Console.WriteLine($"[+] Found MAIN_WIN  HWND=0x{mainWin.ToInt64():X}  size={winW}x{winH}");
-
-            // Bring window to front
-            ShowWindow(mainWin, SW_RESTORE);
-            SetForegroundWindow(mainWin);
-            Thread.Sleep(300);
-
-            // --- Strategy 1: Tab + keyboard typing ---
-            // Many custom UIs support Tab navigation and direct keyboard input.
-            // Click center of window first to give it focus, then use Tab to
-            // navigate between username → password → login button.
-
-            // Click near upper area where username field typically is
-            // (roughly center-x, 40% from top)
-            ClickOnWindow(mainWin, winW / 2, (int)(winH * 0.35));
-            Thread.Sleep(200);
-
-            // Type username
-            TypeString(mainWin, "admin");
-            Thread.Sleep(200);
-
-            // Tab to password field
-            SendKey(mainWin, VK_TAB);
-            Thread.Sleep(200);
-
-            // Type password
-            TypeString(mainWin, "admin");
-            Thread.Sleep(200);
-
-            // Press Enter to submit (or Tab to button + Enter)
-            SendKey(mainWin, VK_RETURN);
-            Thread.Sleep(500);
-
-            Console.WriteLine("  [+] Credentials typed and Enter pressed.");
-
-            return true;
+            return false;
         }
 
         /// <summary>
-        /// Simulates a left mouse click at a position relative to
-        /// the window's client area using PostMessage.
+        /// Searches runtime memory for login validation code and patches it.
+        ///
+        /// Strategy: Find the CALL that validates login credentials.
+        /// In 易语言 programs, the login button click handler typically:
+        ///   1. Reads text from username/password controls
+        ///   2. CALLs a validation function (network or local)
+        ///   3. Tests the return value (TEST EAX,EAX or CMP EAX,x)
+        ///   4. Branches based on result
+        ///
+        /// We find this by searching for known strings near the login code
+        /// (window title, error messages) and patching the branch that
+        /// follows the validation call.
+        ///
+        /// We search for cross-references: code that loads the address
+        /// of the login-related string, then find the conditional branch
+        /// within ~200 bytes after that reference.
         /// </summary>
-        static void ClickOnWindow(IntPtr hWnd, int clientX, int clientY)
+        static bool PatchLoginValidation(IntPtr hProcess, IntPtr moduleBase)
         {
-            IntPtr lParam = (IntPtr)((clientY << 16) | (clientX & 0xFFFF));
-            PostMessage(hWnd, WM_LBUTTONDOWN, (IntPtr)0x0001, lParam);
-            Thread.Sleep(50);
-            PostMessage(hWnd, WM_LBUTTONUP, IntPtr.Zero, lParam);
-        }
+            // Step 1: Find login-related strings in .rdata/.data
+            var stringAddresses = FindLoginStrings(hProcess, moduleBase);
 
-        /// <summary>
-        /// Types a string into the focused control of the window
-        /// by sending WM_CHAR for each character.
-        /// </summary>
-        static void TypeString(IntPtr hWnd, string text)
-        {
-            foreach (char c in text)
+            if (stringAddresses.Count == 0)
             {
-                PostMessage(hWnd, WM_CHAR, (IntPtr)c, IntPtr.Zero);
-                Thread.Sleep(30);
-            }
-        }
-
-        /// <summary>
-        /// Sends a single key press (down + up) to the window.
-        /// </summary>
-        static void SendKey(IntPtr hWnd, int vk)
-        {
-            PostMessage(hWnd, WM_KEYDOWN, (IntPtr)vk, IntPtr.Zero);
-            Thread.Sleep(30);
-            PostMessage(hWnd, WM_KEYUP, (IntPtr)vk, IntPtr.Zero);
-        }
-
-        /// <summary>
-        /// Finds the MAIN_WIN class window for the given process.
-        /// </summary>
-        static IntPtr FindMainWindow(int pid)
-        {
-            uint targetPid = (uint)pid;
-            IntPtr found = IntPtr.Zero;
-
-            EnumWindows((hWnd, _) =>
-            {
-                GetWindowThreadProcessId(hWnd, out uint wndPid);
-                if (wndPid != targetPid) return true;
-
-                var clsBuf = new StringBuilder(256);
-                GetClassName(hWnd, clsBuf, clsBuf.Capacity);
-                if (clsBuf.ToString() == MAIN_WIN_CLASS && IsWindowVisible(hWnd))
-                {
-                    found = hWnd;
-                    return false; // stop enumeration
-                }
-                return true;
-            }, IntPtr.Zero);
-
-            return found;
-        }
-
-        /// <summary>
-        /// Fallback: if standard Edit/Button child controls are found,
-        /// use the old WM_SETTEXT + BM_CLICK approach.
-        /// </summary>
-        static bool FallbackStandardControls(
-            List<(IntPtr hwnd, string title, string cls, bool isChild)> windows)
-        {
-            var editBoxes = windows.Where(w => w.isChild && IsEditControl(w.cls)).ToList();
-            var buttons = windows.Where(w => w.isChild && IsButtonControl(w.cls)).ToList();
-
-            if (editBoxes.Count == 0 && buttons.Count == 0)
-            {
-                // No standard controls — try typing into the first visible top-level window
-                var topWin = windows.FirstOrDefault(w =>
-                    !w.isChild && IsWindowVisible(w.hwnd) &&
-                    w.cls != "MSCTFIME UI" && !w.cls.Contains("IME") &&
-                    w.cls != "GDI+ Hook Window Class" && w.cls != "PerryShadowWnd");
-
-                if (topWin.hwnd != IntPtr.Zero)
-                {
-                    Console.WriteLine($"[*] No standard controls — typing into {topWin.cls} window.");
-                    SetForegroundWindow(topWin.hwnd);
-                    Thread.Sleep(300);
-
-                    TypeString(topWin.hwnd, "admin");
-                    Thread.Sleep(100);
-                    SendKey(topWin.hwnd, VK_TAB);
-                    Thread.Sleep(100);
-                    TypeString(topWin.hwnd, "admin");
-                    Thread.Sleep(100);
-                    SendKey(topWin.hwnd, VK_RETURN);
-
-                    Console.WriteLine("  [+] Credentials typed via keyboard.");
-                    return true;
-                }
-
-                Console.WriteLine("[*] No login controls found.");
+                Console.WriteLine("[*] No login strings found in memory.");
                 return false;
             }
 
-            // Standard control path
-            bool acted = false;
+            Console.WriteLine($"[*] Found {stringAddresses.Count} login-related string(s).");
 
-            if (editBoxes.Count >= 2)
+            // Step 2: Search .text for code that references these strings
+            // (PUSH string_addr or MOV reg, string_addr patterns)
+            IntPtr textBase = IntPtr.Add(moduleBase, 0x1000);
+            int textSize = 0x1C8000; // .text section virtual size
+            byte[] textBuf = new byte[textSize];
+            MemoryHelper.ReadProcessMemory(hProcess, textBase, textBuf, textSize, out int textRead);
+
+            if (textRead < 0x1000)
             {
-                SetEditText(editBoxes[0].hwnd, "admin");
-                SetEditText(editBoxes[1].hwnd, "admin");
-                Console.WriteLine("  [+] Filled username/password.");
-                acted = true;
-            }
-            else if (editBoxes.Count == 1)
-            {
-                SetEditText(editBoxes[0].hwnd, "admin");
-                Console.WriteLine("  [+] Filled field.");
-                acted = true;
+                Console.WriteLine("[!] Cannot read .text section.");
+                return false;
             }
 
-            if (buttons.Count > 0)
+            bool anyPatched = false;
+
+            foreach (var (strAddr, strText) in stringAddresses)
             {
-                var btn = buttons.First();
-                Console.WriteLine($"  [*] Clicking: \"{btn.title}\"");
-                SendMessage(btn.hwnd, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
-                acted = true;
+                byte[] addrBytes = BitConverter.GetBytes((int)strAddr.ToInt64());
+
+                // Find PUSH <strAddr> (opcode 68 xx xx xx xx)
+                for (int i = 0; i < textRead - 200; i++)
+                {
+                    if (textBuf[i] != 0x68) continue; // PUSH imm32
+                    if (textBuf[i + 1] != addrBytes[0] || textBuf[i + 2] != addrBytes[1] ||
+                        textBuf[i + 3] != addrBytes[2] || textBuf[i + 4] != addrBytes[3])
+                        continue;
+
+                    IntPtr pushAddr = IntPtr.Add(textBase, i);
+                    Console.WriteLine($"  [*] Found PUSH ref to \"{strText}\" at 0x{pushAddr.ToInt64():X}");
+
+                    // Look within ~256 bytes BEFORE the PUSH for a CALL + TEST + Jcc
+                    // This is where the validation return value is checked
+                    int scanStart = Math.Max(0, i - 256);
+                    int scanEnd = Math.Min(textRead - 6, i + 256);
+
+                    for (int j = scanStart; j < scanEnd; j++)
+                    {
+                        // Pattern: CALL rel32 + TEST EAX,EAX + JE/JNE
+                        if (textBuf[j] == 0xE8 && // CALL rel32
+                            j + 7 < scanEnd &&
+                            textBuf[j + 5] == 0x85 && textBuf[j + 6] == 0xC0) // TEST EAX,EAX
+                        {
+                            if (j + 8 < scanEnd)
+                            {
+                                byte jccOpcode = textBuf[j + 7];
+                                if (jccOpcode == 0x74 || jccOpcode == 0x75) // JE or JNE
+                                {
+                                    IntPtr patchAddr = IntPtr.Add(textBase, j + 7);
+
+                                    VirtualProtectEx(hProcess, patchAddr, 2,
+                                        PAGE_EXECUTE_READWRITE, out uint oldProt);
+
+                                    // JE -> JMP (always skip to fail handler = skip login check)
+                                    // JNE -> JMP (always take success path)
+                                    byte[] patch = { 0xEB, textBuf[j + 8] }; // JMP short
+
+                                    if (MemoryHelper.WriteProcessMemory(hProcess, patchAddr,
+                                        patch, 2, out int written) && written == 2)
+                                    {
+                                        Console.WriteLine($"  [+] Patched {(jccOpcode == 0x74 ? "JE" : "JNE")} -> JMP at 0x{patchAddr.ToInt64():X}");
+                                        anyPatched = true;
+                                    }
+
+                                    VirtualProtectEx(hProcess, patchAddr, 2, oldProt, out _);
+                                }
+                            }
+                        }
+
+                        // Pattern: CALL rel32 + CMP EAX,1 + JNE
+                        if (textBuf[j] == 0xE8 && // CALL rel32
+                            j + 12 < scanEnd &&
+                            textBuf[j + 5] == 0x83 && textBuf[j + 6] == 0xF8 && // CMP EAX, imm8
+                            textBuf[j + 7] == 0x01) // CMP EAX, 1
+                        {
+                            byte jccOpcode = textBuf[j + 8];
+                            if (jccOpcode == 0x75) // JNE (fail if not 1)
+                            {
+                                IntPtr patchAddr = IntPtr.Add(textBase, j + 5);
+
+                                VirtualProtectEx(hProcess, patchAddr, 5,
+                                    PAGE_EXECUTE_READWRITE, out uint oldProt);
+
+                                // Replace CMP EAX,1 + JNE with NOPs + JMP-never
+                                // Actually: change CMP EAX,1 to CMP EAX,EAX (always equal)
+                                // so the JNE never triggers
+                                byte[] patch = { 0x39, 0xC0, 0x90 }; // CMP EAX,EAX + NOP
+
+                                if (MemoryHelper.WriteProcessMemory(hProcess, patchAddr,
+                                    patch, 3, out int written) && written == 3)
+                                {
+                                    Console.WriteLine($"  [+] Patched CMP EAX,1 -> CMP EAX,EAX at 0x{patchAddr.ToInt64():X}");
+                                    anyPatched = true;
+                                }
+
+                                VirtualProtectEx(hProcess, patchAddr, 5, oldProt, out _);
+                            }
+                        }
+                    }
+
+                    if (anyPatched) break; // patched near this string ref, move on
+                }
+
+                if (anyPatched) break; // one successful patch is enough
             }
 
-            return acted;
+            return anyPatched;
+        }
+
+        /// <summary>
+        /// Searches the .rdata and .data sections for strings related to login.
+        /// Returns addresses and decoded text.
+        /// </summary>
+        static List<(IntPtr addr, string text)> FindLoginStrings(IntPtr hProcess, IntPtr moduleBase)
+        {
+            var results = new List<(IntPtr, string)>();
+
+            // GBK-encoded login-related strings
+            string[] gbkSearches = { "登录", "密码", "用户", "账号", "卡密", "验证", "授权" };
+            // ASCII search strings
+            string[] asciiSearches = { "VIPQQ", "login", "Login", "password" };
+
+            foreach (int sectionOff in new[] { 0x1C9000, 0x227000 })
+            {
+                IntPtr sectionBase = IntPtr.Add(moduleBase, sectionOff);
+                int sectionSize = 0x60000;
+                byte[] buf = new byte[sectionSize];
+                MemoryHelper.ReadProcessMemory(hProcess, sectionBase, buf, sectionSize, out int read);
+                if (read < 16) continue;
+
+                foreach (string s in gbkSearches)
+                {
+                    byte[] needle;
+                    try { needle = Encoding.GetEncoding("GBK").GetBytes(s); }
+                    catch { continue; }
+
+                    int pos = 0;
+                    while ((pos = FindBytes(buf, needle, read, pos)) >= 0)
+                    {
+                        IntPtr addr = IntPtr.Add(sectionBase, pos);
+                        Console.WriteLine($"  [*] Found \"{s}\" at 0x{addr.ToInt64():X}");
+                        results.Add((addr, s));
+                        pos += needle.Length;
+                    }
+                }
+
+                foreach (string s in asciiSearches)
+                {
+                    byte[] needle = Encoding.ASCII.GetBytes(s);
+                    int pos = 0;
+                    while ((pos = FindBytes(buf, needle, read, pos)) >= 0)
+                    {
+                        IntPtr addr = IntPtr.Add(sectionBase, pos);
+                        Console.WriteLine($"  [*] Found \"{s}\" at 0x{addr.ToInt64():X}");
+                        results.Add((addr, s));
+                        pos += needle.Length;
+                    }
+                }
+            }
+
+            return results;
+        }
+
+        static int FindBytes(byte[] haystack, byte[] needle, int haystackLen, int startPos = 0)
+        {
+            for (int i = startPos; i <= haystackLen - needle.Length; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < needle.Length; j++)
+                {
+                    if (haystack[i + j] != needle[j]) { match = false; break; }
+                }
+                if (match) return i;
+            }
+            return -1;
+        }
+
+        static bool AllZero(byte[] buf)
+        {
+            for (int i = 0; i < buf.Length; i++)
+                if (buf[i] != 0) return false;
+            return true;
         }
 
         static Process WaitForProcess(string name, int timeoutSeconds)
@@ -420,95 +382,43 @@ namespace xajh
             return null;
         }
 
-        static List<(IntPtr hwnd, string title, string cls, bool isChild)> GetProcessWindows(int pid)
+        static void DismissErrorDialogs(int pid)
         {
             uint targetPid = (uint)pid;
-            var windows = new List<(IntPtr hwnd, string title, string cls, bool isChild)>();
+            var dialogs = new List<IntPtr>();
 
             EnumWindows((hWnd, _) =>
             {
                 GetWindowThreadProcessId(hWnd, out uint wndPid);
-                if (wndPid != targetPid) return true;
+                if (wndPid != targetPid)  return true;
 
-                var titleBuf = new StringBuilder(512);
-                GetWindowText(hWnd, titleBuf, titleBuf.Capacity);
-                var clsBuf = new StringBuilder(256);
-                GetClassName(hWnd, clsBuf, clsBuf.Capacity);
-                windows.Add((hWnd, titleBuf.ToString(), clsBuf.ToString(), false));
-
-                EnumChildWindows(hWnd, (child, __) =>
-                {
-                    var ct = new StringBuilder(256);
-                    var cc = new StringBuilder(256);
-                    GetWindowText(child, ct, ct.Capacity);
-                    GetClassName(child, cc, cc.Capacity);
-                    windows.Add((child, ct.ToString(), cc.ToString(), true));
-                    return true;
-                }, IntPtr.Zero);
+                var cls = new StringBuilder(256);
+                GetClassName(hWnd, cls, cls.Capacity);
+                if (cls.ToString() == "#32770")
+                    dialogs.Add(hWnd);
                 return true;
             }, IntPtr.Zero);
 
-            return windows;
-        }
-
-        static bool DismissErrorDialogs(int pid)
-        {
-            var windows = GetProcessWindows(pid);
-
-            var dialogs = windows.Where(w =>
-                !w.isChild && (w.cls == "#32770" || w.cls.Contains("Dialog"))).ToList();
-
-            if (dialogs.Count == 0) return false;
-
-            foreach (var (hwnd, title, cls, _) in dialogs)
+            foreach (var dlg in dialogs)
             {
-                Console.WriteLine($"  [*] Dismissing: \"{title}\" (cls={cls})");
+                Console.WriteLine($"  [*] Dismissing dialog 0x{dlg.ToInt64():X}");
 
-                var children = new List<(IntPtr h, string t, string c)>();
-                EnumChildWindows(hwnd, (child, __) =>
+                // Try to click OK button inside
+                EnumChildWindows(dlg, (child, __) =>
                 {
-                    var ct = new StringBuilder(128);
                     var cc = new StringBuilder(128);
-                    GetWindowText(child, ct, ct.Capacity);
                     GetClassName(child, cc, cc.Capacity);
-                    children.Add((child, ct.ToString(), cc.ToString()));
+                    if (cc.ToString().ToLower().Contains("button"))
+                    {
+                        SendMessage(child, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
+                        return false; // stop after first button
+                    }
                     return true;
                 }, IntPtr.Zero);
 
-                var okBtn = children.FirstOrDefault(c =>
-                    IsButtonControl(c.c) && (
-                        c.t.ToLower().Contains("ok") || c.t == "确定" ||
-                        c.t.ToLower() == "yes" || c.t == "是"));
-
-                if (okBtn.h != IntPtr.Zero)
-                    SendMessage(okBtn.h, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
-                else
-                    PostMessage(hwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-
-                Thread.Sleep(300);
+                Thread.Sleep(200);
+                PostMessage(dlg, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
             }
-
-            return true;
-        }
-
-        static bool IsEditControl(string className)
-        {
-            string cl = className.ToLower();
-            return cl.Contains("edit") || cl.Contains("tedit") ||
-                   cl == "combobox" || cl.Contains("richedit") ||
-                   cl.Contains("scintilla") || cl.Contains("textbox");
-        }
-
-        static bool IsButtonControl(string className)
-        {
-            string cl = className.ToLower();
-            return cl.Contains("button") || cl.Contains("tbutton") ||
-                   cl.Contains("tbitbtn") || cl.Contains("tspeedbutton");
-        }
-
-        static void SetEditText(IntPtr hWnd, string text)
-        {
-            SendMessage(hWnd, 0x000C, IntPtr.Zero, text); // WM_SETTEXT
         }
     }
 }
