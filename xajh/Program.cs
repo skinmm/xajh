@@ -54,7 +54,7 @@ namespace Xajh
             var npcReader = new NpcReader(hProcess, moduleBase);
             var playerReader = new PlayerReader(hProcess, moduleBase);
 
-            Console.Clear();
+            //Console.Clear();
             Console.WriteLine("=== XAJH NPC List ===");
             Console.WriteLine("Press [R] to Refresh | [End] to Exit\n");
 
