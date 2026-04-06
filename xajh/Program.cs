@@ -9,7 +9,6 @@ namespace Xajh
     {
         static void Main(string[] args)
         {
-            // Required on .NET 5+ for GBK encoding (Chinese NPC names)
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
             //var procs = Process.GetProcessesByName("vrchat1");
@@ -45,6 +44,7 @@ namespace Xajh
                 Console.WriteLine("[!] Failed to open process. Run as Administrator.");
                 Console.ReadKey(); return;
             }
+
             string dllPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "XajhSmileDll.dll");
             if (!DllInjector.Inject(hProcess, dllPath))
             {
@@ -55,7 +55,6 @@ namespace Xajh
             
             var overlay = new CombatOverlay(hProcess, moduleBase);
             overlay.Run();
-
         }
     }
 }
