@@ -15,13 +15,11 @@ namespace Xajh
             bool bypassLogin = args.Length == 0 || Array.Exists(args, a =>
                 a.Equals("--bypass", StringComparison.OrdinalIgnoreCase));
 
-            if (bypassLogin)
+            // --- Step 1: Bypass Cloud_xajhfuzhu.exe login ---
+            var (cloudH, cloudBase) = LoginBypasser.Bypass();
+            if (cloudH == IntPtr.Zero)
             {
-                var (cloudH, cloudBase) = LoginBypasser.Bypass();
-                if (cloudH == IntPtr.Zero)
-                {
-                    Console.WriteLine("[!] Login bypass could not attach. Continuing anyway ...");
-                }
+                Console.WriteLine("[!] Login bypass could not attach. Continuing anyway ...");
             }
 
             Console.WriteLine("[*] Waiting for game process (vrchat1) ...");
