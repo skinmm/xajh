@@ -382,11 +382,14 @@ namespace xajh
 
             List<(IntPtr hwnd, string title, string cls, bool isChild)> windows = null;
 
-            for (int attempt = 0; attempt < 30; attempt++)
+            // Wait until we see edit boxes or buttons — the login form is ready
+            for (int attempt = 0; attempt < 40; attempt++)
             {
                 Thread.Sleep(500);
                 windows = GetProcessWindows(pid);
-                if (windows.Count > 0) break;
+                bool hasEdits = windows.Any(w => w.isChild && IsEditControl(w.cls));
+                bool hasButtons = windows.Any(w => w.isChild && IsButtonControl(w.cls));
+                if (hasEdits || hasButtons) break;
             }
 
             if (windows == null || windows.Count == 0)
