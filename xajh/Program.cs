@@ -50,6 +50,10 @@ namespace Xajh
                 Console.ReadKey(); return;
             }
 
+            // --- Step 2b: Patch exit calls to prevent auto game exit ---
+            var antiExit = new AntiExitPatcher(hProcess, moduleBase, game.Id);
+            antiExit.Apply();
+
             // --- Step 3: List NPCs continuously (no auto-face) ---
             var npcReader = new NpcReader(hProcess, moduleBase);
             var playerReader = new PlayerReader(hProcess, moduleBase);
@@ -93,6 +97,8 @@ namespace Xajh
 
                 Thread.Sleep(1000);
             }
+
+            antiExit.Stop();
         }
     }
 }
