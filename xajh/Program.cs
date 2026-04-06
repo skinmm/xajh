@@ -11,9 +11,11 @@ namespace Xajh
         {
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
+            //var procs = Process.GetProcessesByName("vrchat1");
+            //if (procs.Length == 0) { Console.WriteLine("Game not found."); return; }
             bool bypassLogin = args.Length == 0 || Array.Exists(args, a =>
                 a.Equals("--bypass", StringComparison.OrdinalIgnoreCase));
-
+            //var game = procs[0];
             if (bypassLogin)
             {
                 var (cloudH, cloudBase) = LoginBypasser.Bypass();
@@ -33,7 +35,6 @@ namespace Xajh
             }
 
             if (game == null) { Console.WriteLine("[!] Game not found."); Console.ReadKey(); return; }
-
             IntPtr moduleBase = game.MainModule.BaseAddress;
             IntPtr hProcess = MemoryHelper.OpenProcess(
                 MemoryHelper.PROCESS_ALL_ACCESS, false, game.Id);
@@ -51,6 +52,7 @@ namespace Xajh
                 Console.ReadKey(); return;
             }
 
+            
             var overlay = new CombatOverlay(hProcess, moduleBase);
             overlay.Run();
         }
