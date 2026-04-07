@@ -56,7 +56,7 @@ namespace Xajh
             var combat = new CombatOverlay(hProcess, moduleBase);
 
             Console.WriteLine("=== XAJH NPC List ===");
-            Console.WriteLine("Press [F] to Face Nearest NPC | [End] to Exit\n");
+            Console.WriteLine("[F] Face Nearest NPC | [D] Dump Player Floats | [End] Exit\n");
 
             string lastFaceMsg = "";
 
@@ -73,8 +73,14 @@ namespace Xajh
                         var faceNpcs = npcReader.GetAllNpcs();
                         string faced = combat.FaceNearest(fx, fy, fz, faceNpcs);
                         lastFaceMsg = faced != null
-                            ? $"[+] Turned to: {faced}"
+                            ? $"[+] {faced}"
                             : "[!] No NPC found to face";
+                    }
+                    else if (key == ConsoleKey.D)
+                    {
+                        combat.DumpPlayerFloats();
+                        Console.WriteLine("Turn your character in-game, then press [D] again.");
+                        Console.WriteLine("The float that changed is the facing offset.\n");
                     }
                 }
 
