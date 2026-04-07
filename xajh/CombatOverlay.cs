@@ -50,24 +50,56 @@ namespace xajh
 
             var obj = new IntPtr((uint)playerObj);
 
-            float oldCosA = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x70));
-            float oldSinA = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x7C));
-            float oldYaw = (float)Math.Atan2(oldSinA, oldCosA);
+            float oldCos = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x10));
+            float oldSin = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x1C));
+            float oldYaw = (float)Math.Atan2(oldSin, oldCos);
 
-            // Matrix A: standard rotation [ cos -sin ; sin cos ]
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x70), cosY);   // A.m00
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x74), -sinY);  // A.m01
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x7C), sinY);   // A.m10
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x80), cosY);   // A.m11
-
-            // Matrix B: transpose (inverse rotation) [ cos sin ; -sin cos ]
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xA0), cosY);   // B.m00
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xA4), sinY);   // B.m01
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xAC), -sinY);  // B.m10
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xB0), cosY);   // B.m11
+            WriteYawToAllMatrices(obj, cosY, sinY);
 
             double dist = Math.Sqrt(dx * dx + dz * dz);
             return $"{nearest.Name} (dist={dist:F0}, yaw {oldYaw:F2}->{yaw:F2})";
+        }
+
+        /// <summary>
+        /// Writes cos/sin yaw to all four rotation matrix copies in the
+        /// player object, plus the partial copy at +0x0E0.
+        ///
+        /// Layout (confirmed from wide dump diff):
+        ///   Set 1 (+0x010): primary forward  [cos -sin ; sin cos]
+        ///   Set 2 (+0x040): primary inverse  [cos sin ; -sin cos]
+        ///   Set 3 (+0x070): copy of Set 1
+        ///   Set 4 (+0x0A0): copy of Set 2
+        ///   +0x0E0/+0x0E4:  partial (sin, cos)
+        /// </summary>
+        private void WriteYawToAllMatrices(IntPtr obj, float cosY, float sinY)
+        {
+            // Set 1 (+0x010): PRIMARY forward rotation — game reads this
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x10), cosY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x14), -sinY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x1C), sinY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x20), cosY);
+
+            // Set 2 (+0x040): PRIMARY inverse rotation
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x40), cosY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x44), sinY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x4C), -sinY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x50), cosY);
+
+            // Set 3 (+0x070): copy forward
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x70), cosY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x74), -sinY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x7C), sinY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x80), cosY);
+
+            // Set 4 (+0x0A0): copy inverse
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xA0), cosY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xA4), sinY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xAC), -sinY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xB0), cosY);
+
+            // Partial at +0x0E0
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xE0), sinY);
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xE4), cosY);
         }
 
         /// <summary>
