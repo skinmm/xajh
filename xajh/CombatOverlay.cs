@@ -49,16 +49,37 @@ namespace xajh
             _playerReader = new PlayerReader(hProcess, moduleBase);
         }
 
+        /// <summary>
+        /// One-shot: face the nearest NPC from a given player position.
+        /// Returns the name of the NPC faced, or null if none found.
+        /// </summary>
+        public string FaceNearest(float px, float py, float pz, List<Npc> npcs)
+        {
+            int playerObj = GetPlayerObject();
+            if (playerObj == 0) return null;
+
+            var nearest = npcs
+                .OrderBy(n => Math.Pow(n.X - px, 2) + Math.Pow(n.Z - pz, 2))
+                .FirstOrDefault();
+
+            if (nearest == null) return null;
+
+            IntPtr targetPtr = nearest.NodeAddr != 0
+                ? new IntPtr(nearest.NodeAddr)
+                : new IntPtr(nearest.NpcObjAddr);
+
+            ExecuteRemoteFace(new IntPtr(playerObj), targetPtr);
+            return nearest.Name;
+        }
+
         public void Run()
         {
             Console.Clear();
             Console.WriteLine("=== XAJH Combat Engine Initialized ===");
             Console.WriteLine("Press [Home] to Toggle Auto-Combat | [End] to Exit");
 
-            // Start logic thread
             new Thread(CombatLoop) { IsBackground = true }.Start();
 
-            // Main UI Loop
             while (true)
             {
                 if (Console.KeyAvailable)
@@ -80,32 +101,16 @@ namespace xajh
 
                 try
                 {
-                    // 1. Get Player Object Address (using the offset from your NpcReader notes)
-                    // [moduleBase + 0x9D451C] -> NpcListMgr -> Player is usually found here or via Manager
-                    int playerObj = GetPlayerObject();
-                    if (playerObj == 0) { Thread.Sleep(1000); continue; }
-
-                    // 2. Scan for nearest NPC
                     var npcs = _npcReader.GetAllNpcs();
                     var (px, py, pz) = _playerReader.Get();
 
-                    _target = npcs
-                        .OrderBy(n => Math.Pow(n.X - px, 2) + Math.Pow(n.Z - pz, 2))
-                        .FirstOrDefault();
-
-                    if (_target != null)
+                    string faced = FaceNearest(px, py, pz, npcs);
+                    if (faced != null)
                     {
-                        // 3. Execute Auto-Face via Internal Call 0x6ACCCC.
-                        // Prefer node pointer first; fallback to npc_obj pointer if needed.
-                        IntPtr targetPtr = _target.NodeAddr != 0
-                                                    ? new IntPtr(_target.NodeAddr)
-                                                    : new IntPtr(_target.NpcObjAddr);
-                        ExecuteRemoteFace(new IntPtr(playerObj), targetPtr);
-
-                        // 4. Brief delay to let the engine process the turn, then Send Attack Key
+                        _target = npcs
+                            .OrderBy(n => Math.Pow(n.X - px, 2) + Math.Pow(n.Z - pz, 2))
+                            .FirstOrDefault();
                         Thread.Sleep(1000);
-                        // PostMessage 'F' to the game window if needed, 
-                        // though 0x6ACCCC might trigger auto-pathing/combat depending on state.
                     }
                 }
                 catch (Exception ex) { Console.WriteLine($"Loop Error: {ex.Message}"); }

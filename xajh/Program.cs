@@ -50,13 +50,15 @@ namespace Xajh
                 Console.ReadKey(); return;
             }
 
-            // --- Step 3: List NPCs continuously (no auto-face) ---
+            // --- Step 3: List NPCs, press [F] to face nearest ---
             var npcReader = new NpcReader(hProcess, moduleBase);
             var playerReader = new PlayerReader(hProcess, moduleBase);
+            var combat = new CombatOverlay(hProcess, moduleBase);
 
-            //Console.Clear();
             Console.WriteLine("=== XAJH NPC List ===");
-            Console.WriteLine("Press [R] to Refresh | [End] to Exit\n");
+            Console.WriteLine("Press [F] to Face Nearest NPC | [End] to Exit\n");
+
+            string lastFaceMsg = "";
 
             while (true)
             {
@@ -64,6 +66,16 @@ namespace Xajh
                 {
                     var key = Console.ReadKey(true).Key;
                     if (key == ConsoleKey.End) break;
+
+                    if (key == ConsoleKey.F)
+                    {
+                        var (fx, fy, fz) = playerReader.Get();
+                        var faceNpcs = npcReader.GetAllNpcs();
+                        string faced = combat.FaceNearest(fx, fy, fz, faceNpcs);
+                        lastFaceMsg = faced != null
+                            ? $"[+] Turned to: {faced}"
+                            : "[!] No NPC found to face";
+                    }
                 }
 
                 var (px, py, pz) = playerReader.Get();
@@ -71,7 +83,7 @@ namespace Xajh
 
                 Console.SetCursorPosition(0, 3);
                 Console.WriteLine($"Player Position: ({px:F1}, {py:F1}, {pz:F1})          ");
-                Console.WriteLine($"NPCs found: {npcs.Count,-6}");
+                Console.WriteLine($"NPCs found: {npcs.Count,-6}  {lastFaceMsg,-40}");
                 Console.WriteLine(new string('-', 70));
                 Console.WriteLine($"{"#",-4} {"Name",-20} {"X",9} {"Y",9} {"Z",9}  {"Dist",8}");
                 Console.WriteLine(new string('-', 70));
@@ -87,7 +99,6 @@ namespace Xajh
                         $"{i + 1,-4} {n.Name,-20} {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}  {dist,8:F1}");
                 }
 
-                // Clear leftover lines from previous longer lists
                 for (int i = npcs.Count; i < 30; i++)
                     Console.WriteLine(new string(' ', 70));
 
