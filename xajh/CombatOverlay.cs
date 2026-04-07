@@ -105,11 +105,117 @@ namespace xajh
 
             bool ok = ExecuteOnMainThread(new IntPtr(playerObj), targetPtr);
 
-            float dx = nearest.X - px;
-            float dz = nearest.Z - pz;
-            double dist = Math.Sqrt(dx * dx + dz * dz);
+            // After the player turns, sync the back-trace camera to face the same direction.
+            if (ok)
+            {
+                float dx = nearest.X - px;
+                float dz = nearest.Z - pz;
+                float yaw = (float)Math.Atan2(dx, dz);
+                SyncCameraYaw(yaw);
+            }
+
+            float ddx = nearest.X - px;
+            float ddz = nearest.Z - pz;
+            double dist = Math.Sqrt(ddx * ddx + ddz * ddz);
             string status = ok ? "OK" : "FAIL";
             return $"{nearest.Name} (dist={dist:F0}) [{status}]";
+        }
+
+        /// <summary>
+        /// Writes the yaw angle into the back-trace camera's rotation matrices.
+        /// The camera object is accessed via [moduleBase + 0x9D4518] -> mgr.
+        /// The camera typically stores its own 3x3 rotation at an offset from
+        /// a camera pointer accessible near the player manager.
+        ///
+        /// Common camera pointer chains in this engine:
+        ///   [moduleBase + 0x9E2C60] -> camera mgr -> camera obj
+        /// or the camera transform is embedded in the same manager.
+        ///
+        /// We scan for the camera yaw by looking at the player's rotation
+        /// matrices (which the face function just updated) and writing the
+        /// same cos/sin values to the camera's known rotation offsets.
+        /// </summary>
+        private void SyncCameraYaw(float yaw)
+        {
+            float cosY = (float)Math.Cos(yaw);
+            float sinY = (float)Math.Sin(yaw);
+
+            // The camera yaw address is found via a scan the first time.
+            // Common approach: write to a known static camera address.
+            if (_camYawAddr == IntPtr.Zero)
+                _camYawAddr = FindCameraYawAddr(yaw);
+
+            if (_camYawAddr != IntPtr.Zero)
+            {
+                MemoryHelper.WriteFloat(_hProcess, _camYawAddr, yaw);
+            }
+
+            // Also write camera rotation matrices if we found them
+            if (_camMatrixBase != IntPtr.Zero)
+            {
+                // Same layout as player: forward rotation at +0x10, inverse at +0x40
+                MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(_camMatrixBase, 0x10), cosY);
+                MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(_camMatrixBase, 0x14), -sinY);
+                MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(_camMatrixBase, 0x1C), sinY);
+                MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(_camMatrixBase, 0x20), cosY);
+
+                MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(_camMatrixBase, 0x40), cosY);
+                MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(_camMatrixBase, 0x44), sinY);
+                MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(_camMatrixBase, 0x4C), -sinY);
+                MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(_camMatrixBase, 0x50), cosY);
+            }
+        }
+
+        private IntPtr _camYawAddr = IntPtr.Zero;
+        private IntPtr _camMatrixBase = IntPtr.Zero;
+
+        /// <summary>
+        /// Scans writable memory for float values matching the current camera yaw.
+        /// The camera yaw should closely match the player's current facing direction.
+        /// We look for a standalone yaw float (not part of the player object).
+        /// </summary>
+        private IntPtr FindCameraYawAddr(float expectedYaw)
+        {
+            // Try known camera pointer chains first
+            // Chain 1: [moduleBase + 0x9E2C60] -> +0x?? -> camera yaw
+            int camMgr = MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(_moduleBase, 0x9E2C60));
+            if (camMgr != 0)
+            {
+                var camBase = new IntPtr((uint)camMgr);
+                // Scan the camera manager object for yaw-like floats
+                for (int off = 0; off < 0x200; off += 4)
+                {
+                    float val = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(camBase, off));
+                    if (!float.IsNaN(val) && !float.IsInfinity(val) &&
+                        Math.Abs(val - expectedYaw) < 0.5f)
+                    {
+                        Console.WriteLine($"[+] Camera yaw candidate at camMgr+0x{off:X} = {val:F4}");
+                        return IntPtr.Add(camBase, off);
+                    }
+                }
+
+                // Also try following pointers from the camera manager
+                for (int ptrOff = 0; ptrOff < 0x40; ptrOff += 4)
+                {
+                    int sub = MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(camBase, ptrOff));
+                    if (sub < 0x10000 || sub > 0x7FFFFFFF) continue;
+                    var subPtr = new IntPtr((uint)sub);
+                    for (int off = 0; off < 0x200; off += 4)
+                    {
+                        float val = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(subPtr, off));
+                        if (!float.IsNaN(val) && !float.IsInfinity(val) &&
+                            Math.Abs(val - expectedYaw) < 0.5f)
+                        {
+                            Console.WriteLine($"[+] Camera yaw at [camMgr+0x{ptrOff:X}]+0x{off:X} = {val:F4}");
+                            _camMatrixBase = subPtr;
+                            return IntPtr.Add(subPtr, off);
+                        }
+                    }
+                }
+            }
+
+            Console.WriteLine("[!] Camera yaw address not found automatically.");
+            return IntPtr.Zero;
         }
 
         /// <summary>
