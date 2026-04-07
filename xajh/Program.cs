@@ -56,7 +56,7 @@ namespace Xajh
             var combat = new CombatOverlay(hProcess, moduleBase);
 
             Console.WriteLine("=== XAJH NPC List ===");
-            Console.WriteLine("[F] Face Nearest NPC | [D] Dump Player Floats | [End] Exit\n");
+            Console.WriteLine("[F] Face Nearest | [D] Dump Floats (pauses list) | [End] Exit\n");
 
             string lastFaceMsg = "";
 
@@ -79,8 +79,11 @@ namespace Xajh
                     else if (key == ConsoleKey.D)
                     {
                         combat.DumpPlayerFloats();
-                        Console.WriteLine("Turn your character in-game, then press [D] again.");
-                        Console.WriteLine("The float that changed is the facing offset.\n");
+                        Console.WriteLine("  Turn your character in-game, press any key to dump again.");
+                        Console.ReadKey(true);
+                        combat.DumpPlayerFloats();
+                        Console.WriteLine("  Press any key to resume NPC list ...");
+                        Console.ReadKey(true);
                     }
                 }
 
@@ -89,7 +92,7 @@ namespace Xajh
 
                 Console.SetCursorPosition(0, 3);
                 Console.WriteLine($"Player Position: ({px:F1}, {py:F1}, {pz:F1})          ");
-                Console.WriteLine($"NPCs found: {npcs.Count,-6}  {lastFaceMsg,-40}");
+                Console.WriteLine($"NPCs found: {npcs.Count,-6}  {lastFaceMsg,-50}");
                 Console.WriteLine(new string('-', 70));
                 Console.WriteLine($"{"#",-4} {"Name",-20} {"X",9} {"Y",9} {"Z",9}  {"Dist",8}");
                 Console.WriteLine(new string('-', 70));
