@@ -79,16 +79,8 @@ namespace Xajh
                     else if (key == ConsoleKey.D)
                     {
                         Console.Clear();
-                        Console.WriteLine("[D] Camera scan — stand still, do NOT turn yet.");
-                        Console.WriteLine("    Press any key to take snapshot 1 ...");
-                        Console.ReadKey(true);
-                        var snap1 = combat.DumpCameraWide();
-                        Console.WriteLine("    Now TURN your camera in-game (right-click drag).");
-                        Console.WriteLine("    Press any key to take snapshot 2 ...");
-                        Console.ReadKey(true);
-                        var snap2 = combat.DumpCameraWide();
-                        CombatOverlay.CompareDumps(snap1, snap2);
-                        Console.WriteLine("    Press any key to resume NPC list ...");
+                        combat.ScanCameraYaw();
+                        Console.WriteLine("\n    Press any key to resume NPC list ...");
                         Console.ReadKey(true);
                     }
                 }
