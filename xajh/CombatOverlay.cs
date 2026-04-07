@@ -9,15 +9,14 @@ namespace xajh
 {
     public class CombatOverlay
     {
-        private const uint INFINITE = 0xFFFFFFFF;
         private const uint WAIT_OBJECT_0 = 0x00000000;
-        private const uint WAIT_TIMEOUT = 0x00000102;
         private IntPtr _hProcess;
         private IntPtr _moduleBase;
         private bool _running = true;
         private Npc _target;
         private NpcReader _npcReader;
         private PlayerReader _playerReader;
+        private IntPtr _funcEntryCache = IntPtr.Zero;
 
         // --- Win32 API for Remote Execution ---
         // Add this to your Win32 imports in CombatOverlay.cs
@@ -115,74 +114,146 @@ namespace xajh
         }
 
         /// <summary>
-        /// Injects and executes shellcode to call the game's internal 0x6ACCCC function.
-        /// This handles the __thiscall convention: ECX = Player, Param1 = Target.
+        /// Searches backwards from a known mid-function address to locate the
+        /// function's real entry point (the <c>push ebp; mov ebp, esp</c> prologue).
+        ///
+        /// The game is compiled with MSVC debug CRT which inserts stack-check
+        /// guards (chkesp).  Jumping into the middle of a function bypasses
+        /// the prologue, causing an ESP mismatch on return and triggering
+        /// the CRT "Debug Error — ESP not properly saved" dialog, which
+        /// terminates the process.
+        ///
+        /// xajhtoy.exe / zxxy.dll avoids this by always calling the function
+        /// from its real entry so the prologue and epilogue stay balanced.
+        /// </summary>
+        private IntPtr FindFunctionEntry(IntPtr midFuncAddr, int maxScanBack = 0x200)
+        {
+            byte[] buf = new byte[maxScanBack];
+            IntPtr scanStart = IntPtr.Add(midFuncAddr, -maxScanBack);
+            if (!MemoryHelper.ReadProcessMemory(_hProcess, scanStart,
+                    buf, buf.Length, out int read) || read < 3)
+                return IntPtr.Zero;
+
+            // Scan backwards from the known address looking for 55 8B EC
+            // (push ebp; mov ebp, esp) — standard MSVC function prologue.
+            // Take the LAST occurrence before midFuncAddr (closest match).
+            int bestOffset = -1;
+            for (int i = read - 3; i >= 0; i--)
+            {
+                if (buf[i] == 0x55 && buf[i + 1] == 0x8B && buf[i + 2] == 0xEC)
+                {
+                    bestOffset = i;
+                    break;
+                }
+            }
+
+            if (bestOffset < 0) return IntPtr.Zero;
+            return IntPtr.Add(scanStart, bestOffset);
+        }
+
+        /// <summary>
+        /// Injects shellcode that calls the face-target game function using
+        /// proper __thiscall calling convention:
+        ///   - ECX = player this-pointer
+        ///   - Single stack argument = target NPC pointer
+        ///   - Function called at its real entry point (not mid-function)
+        ///   - Callee cleans the stack argument (__thiscall)
+        ///
+        /// This is how xajhtoy.exe/zxxy.dll does it: the DLL lives inside
+        /// the game process and calls the function at its entry with the
+        /// correct convention, so the prologue/epilogue stay balanced and
+        /// the MSVC CRT stack-check (chkesp) never fires.
         /// </summary>
         private void ExecuteRemoteFace(IntPtr playerPtr, IntPtr targetPtr)
         {
             if (playerPtr == IntPtr.Zero || targetPtr == IntPtr.Zero) return;
             if (!CanRead(playerPtr, 0x108) || !CanRead(targetPtr, 4)) return;
-            // --- PROTECTIVE SHELLCODE ---
-            // 0x6ACCCC is in the middle of a prologued function and expects [ebp-4] = this.
-            // Build a tiny frame so thiscall state is valid before jumping there.
+
+            // 0x6ACCCC is a known code address inside the face-target function.
+            // Find the real entry point by scanning back for the MSVC prologue.
+            IntPtr knownAddr = new IntPtr(0x6ACCCC);
+            if (_funcEntryCache == IntPtr.Zero)
+            {
+                _funcEntryCache = FindFunctionEntry(knownAddr);
+                if (_funcEntryCache == IntPtr.Zero)
+                {
+                    Console.WriteLine("[!] Could not locate face-function entry; " +
+                                      "falling back to known address.");
+                    _funcEntryCache = knownAddr;
+                }
+                else
+                {
+                    Console.WriteLine($"[+] Face-function entry found at " +
+                                      $"0x{_funcEntryCache.ToInt64():X8} " +
+                                      $"(scanned back from 0x{knownAddr.ToInt64():X8})");
+                }
+            }
+
+            // Shellcode layout (x86):
+            //
+            //   pushad                 ; save all GP registers
+            //   pushfd                 ; save EFLAGS
+            //   mov ecx, <playerPtr>   ; __thiscall: ECX = this
+            //   push <targetPtr>       ; single stack argument (target NPC)
+            //   mov eax, <funcEntry>   ; address of the function entry
+            //   call eax               ; call — function does its own
+            //                          ;   push ebp / mov ebp,esp / sub esp,N
+            //                          ;   and cleans the 4-byte arg on ret
+            //   popfd                  ; restore EFLAGS
+            //   popad                  ; restore GP registers
+            //   ret 4                  ; stdcall return for CreateRemoteThread
+            //                          ;   (cleans the LPVOID lpParameter)
+            //
+            // The function's own prologue/epilogue are fully balanced, so
+            // ESP is preserved across the call and chkesp never fires.
+
             byte[] code = {
                 0x60,                               // pushad
-                0x55,                               // push ebp
-                0x8B, 0xEC,                         // mov ebp, esp
-                0x83, 0xEC, 0x50,                   // sub esp, 0x50
-                0xB8, 0,0,0,0,                      // mov eax, playerPtr  (patch bytes 8-11)
-                0x89, 0x45, 0xFC,                   // mov [ebp-4], eax
-                0x68, 0,0,0,0,                      // push targetPtr      (patch bytes 16-19)
-                0xB8, 0xCC,0xCC,0x6A,0x00,          // mov eax, 0x6ACCC0
+                0x9C,                               // pushfd
+                0xB9, 0,0,0,0,                      // mov ecx, playerPtr   [patch 3..6]
+                0x68, 0,0,0,0,                      // push targetPtr       [patch 8..11]
+                0xB8, 0,0,0,0,                      // mov eax, funcEntry   [patch 13..16]
                 0xFF, 0xD0,                         // call eax
-                0x8B, 0xE5,                         // mov esp, ebp
-                0x5D,                               // pop ebp
+                0x9D,                               // popfd
                 0x61,                               // popad
-                0xC2, 0x04, 0x00                    // ret 4 (LPTHREAD_START_ROUTINE stdcall)
+                0xC2, 0x04, 0x00                    // ret 4
             };
 
-            IntPtr allocCode = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)code.Length, 0x1000, 0x40);
+            Array.Copy(BitConverter.GetBytes(playerPtr.ToInt32()), 0, code, 3, 4);
+            Array.Copy(BitConverter.GetBytes(targetPtr.ToInt32()), 0, code, 8, 4);
+            Array.Copy(BitConverter.GetBytes(_funcEntryCache.ToInt32()), 0, code, 13, 4);
+
+            IntPtr allocCode = VirtualAllocEx(_hProcess, IntPtr.Zero,
+                (uint)code.Length, 0x1000, 0x40);
             if (allocCode == IntPtr.Zero) return;
-            //IntPtr allocData = VirtualAllocEx(_hProcess, IntPtr.Zero, 8, 0x1000, 0x04);
 
-            Array.Copy(BitConverter.GetBytes(playerPtr.ToInt32()), 0, code, 8, 4);
-            Array.Copy(BitConverter.GetBytes(targetPtr.ToInt32()), 0, code, 16, 4);
-
-            int written;
-            WriteProcessMemory(_hProcess, allocCode, code, (uint)code.Length, out written);
-            if (!WriteProcessMemory(_hProcess, allocCode, code, (uint)code.Length, out written) ||
-                written != code.Length)
+            if (!WriteProcessMemory(_hProcess, allocCode, code,
+                    (uint)code.Length, out int written) || written != code.Length)
             {
                 VirtualFreeEx(_hProcess, allocCode, 0, 0x8000);
                 return;
             }
 
-            // Create the thread
-            IntPtr hThread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, allocCode, IntPtr.Zero, 0, out _);
+            IntPtr hThread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0,
+                allocCode, IntPtr.Zero, 0, out _);
 
             if (hThread != IntPtr.Zero)
             {
-                // Avoid freeing shellcode while thread still executes it.
-                uint waitRc = WaitForSingleObject(hThread, INFINITE);
+                uint waitRc = WaitForSingleObject(hThread, 5000);
                 if (waitRc != WAIT_OBJECT_0)
                 {
-                    if (waitRc == WAIT_TIMEOUT)
-                        Console.WriteLine("[!] Remote face thread timed out; keeping code memory allocated.");
-                    else
-                        Console.WriteLine("[!] WaitForSingleObject failed for remote face thread.");
+                    Console.WriteLine("[!] Remote face thread did not complete in time.");
                     CloseHandle(hThread);
                     return;
-                 }
+                }
 
                 GetExitCodeThread(hThread, out uint ec);
                 if (ec == 0xC0000005)
-                    Console.WriteLine("[!] Remote face thread crashed with access violation.");
+                    Console.WriteLine("[!] Remote face thread: access violation.");
                 CloseHandle(hThread);
             }
 
-            // Clean up
             VirtualFreeEx(_hProcess, allocCode, 0, 0x8000);
-            VirtualFreeEx(_hProcess, IntPtr.Zero, 0, 0x8000);
         }
 
         private bool CanRead(IntPtr basePtr, int size)
