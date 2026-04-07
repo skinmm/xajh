@@ -5,35 +5,21 @@ using System.Linq;
 namespace xajh
 {
     /// <summary>
-    /// Faces the player toward NPCs by writing the rotation matrix directly
-    /// into the player object's memory.
+    /// Faces the player toward NPCs by writing two Y-axis rotation matrices
+    /// directly into the player object's memory.
     ///
-    /// Player object layout — 4x3 column-major transform matrix:
+    /// Layout confirmed from dump (yaw ≈ 1.95 rad before face, ≈ 1.06 after):
     ///
-    ///   +0x080  m00  cos(yaw)     Row0 of rotation
-    ///   +0x084  m01  0
-    ///   +0x088  m02  0
-    ///   +0x08C  m10  0            Row1 (Y-axis, unchanged for yaw-only)
-    ///   +0x090  m11  1
-    ///   +0x094  tx   X position
-    ///   +0x098  ty   Y position
-    ///   +0x09C  tz   Z position
-    ///   +0x0A0  ???  (not facing — unknown field)
-    ///   +0x0A4  m20  sin(yaw)     Row2 of rotation
-    ///   +0x0A8  m21  0
-    ///   +0x0AC  m22  -sin(yaw)    (negative for standard right-hand yaw)
-    ///   +0x0B0  m00' cos(yaw)     (duplicate / shadow copy)
+    ///   Matrix A (3x3 at +0x070):            Matrix B (3x3 at +0x0A0):
+    ///   +0x070  cos   +0x074 -sin  +0x078 0  +0x0A0  cos   +0x0A4  sin  +0x0A8 0
+    ///   +0x07C  sin   +0x080  cos  +0x084 0  +0x0AC -sin   +0x0B0  cos  +0x0B4 0
+    ///   +0x088  0     +0x08C  0    +0x090 1  +0x0B8  0     +0x0BC  0    +0x0C0 1
     ///
-    /// The game uses a Y-up, right-handed coordinate system.
-    /// Yaw rotation around Y axis:
-    ///   cos(θ) goes to +0x080 and +0x0B0
-    ///   sin(θ) goes to +0x0A4
-    ///  -sin(θ) goes to +0x0AC
+    ///   Position: +0x094 X, +0x098 Y, +0x09C Z  (between the two matrices)
     ///
-    /// Confirmed from dump:  original yaw ≈ 1.43 rad
-    ///   cos(1.43) ≈ 0.1411  →  +0x080 = 0.1411, +0x0B0 = 0.1411  ✓
-    ///   sin(1.43) ≈ 0.9900  →  +0x0A4 = 0.9900                   ✓
-    ///  -sin(1.43) ≈ -0.990  →  +0x0AC = -0.9900                  ✓
+    /// Matrix A is a standard 2D rotation [ cos -sin ; sin cos ]
+    /// Matrix B is its transpose (inverse) [ cos sin ; -sin cos ]
+    /// Both must be updated together or the game detects the inconsistency.
     /// </summary>
     public class CombatOverlay
     {
@@ -46,10 +32,6 @@ namespace xajh
             _moduleBase = moduleBase;
         }
 
-        /// <summary>
-        /// Turns the player to face the nearest NPC by writing the rotation
-        /// matrix elements (cos/sin of yaw).
-        /// </summary>
         public string FaceNearest(float px, float py, float pz, List<Npc> npcs)
         {
             int playerObj = GetPlayerObject();
@@ -68,22 +50,26 @@ namespace xajh
 
             var obj = new IntPtr((uint)playerObj);
 
-            float oldCos = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x80));
-            float oldYaw = (float)Math.Acos(Math.Max(-1f, Math.Min(1f, oldCos)));
+            float oldCosA = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x70));
+            float oldSinA = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x7C));
+            float oldYaw = (float)Math.Atan2(oldSinA, oldCosA);
 
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x80), cosY);     // m00
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xA4), sinY);     // m20
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xAC), -sinY);    // m22
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xB0), cosY);     // m00'
+            // Matrix A: standard rotation [ cos -sin ; sin cos ]
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x70), cosY);   // A.m00
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x74), -sinY);  // A.m01
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x7C), sinY);   // A.m10
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x80), cosY);   // A.m11
+
+            // Matrix B: transpose (inverse rotation) [ cos sin ; -sin cos ]
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xA0), cosY);   // B.m00
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xA4), sinY);   // B.m01
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xAC), -sinY);  // B.m10
+            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xB0), cosY);   // B.m11
 
             double dist = Math.Sqrt(dx * dx + dz * dz);
             return $"{nearest.Name} (dist={dist:F0}, yaw {oldYaw:F2}->{yaw:F2})";
         }
 
-        /// <summary>
-        /// Dumps floats from +0x070 to +0x0C0 for debugging.
-        /// Pauses the main loop — call this only when paused.
-        /// </summary>
         public void DumpPlayerFloats()
         {
             int playerObj = GetPlayerObject();
@@ -95,27 +81,33 @@ namespace xajh
 
             var obj = new IntPtr((uint)playerObj);
 
-            float m00 = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x80));
-            float m20 = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0xA4));
-            float curYaw = (float)Math.Atan2(m20, m00);
+            float cosA = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x70));
+            float sinA = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x7C));
+            float curYaw = (float)Math.Atan2(sinA, cosA);
 
-            Console.WriteLine($"\n── Player 0x{playerObj:X8} — rotation matrix + position ──");
-            Console.WriteLine($"  Current yaw: {curYaw:F4} rad ({curYaw * 180f / Math.PI:F1} deg)");
+            Console.WriteLine($"\n── Player 0x{playerObj:X8} ──");
+            Console.WriteLine($"  Yaw: {curYaw:F4} rad ({curYaw * 180f / Math.PI:F1} deg)");
             Console.WriteLine($"  {"Offset",-8} {"Value",12}  Note");
-            Console.WriteLine(new string('─', 60));
+            Console.WriteLine(new string('─', 65));
 
             for (int off = 0x70; off <= 0xC0; off += 4)
             {
                 float val = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, off));
                 string note = off switch
                 {
-                    0x80 => $"  ← cos(yaw) = {Math.Cos(curYaw):F4}",
+                    0x70 => "  ← A.cos(yaw)",
+                    0x74 => "  ← A.-sin(yaw)",
+                    0x7C => "  ← A.sin(yaw)",
+                    0x80 => "  ← A.cos(yaw)",
+                    0x90 => "  ← 1.0 (Y-axis)",
                     0x94 => "  ← X",
                     0x98 => "  ← Y",
                     0x9C => "  ← Z",
-                    0xA4 => $"  ← sin(yaw) = {Math.Sin(curYaw):F4}",
-                    0xAC => $"  ← -sin(yaw)",
-                    0xB0 => $"  ← cos(yaw) copy",
+                    0xA0 => "  ← B.cos(yaw)",
+                    0xA4 => "  ← B.sin(yaw)",
+                    0xAC => "  ← B.-sin(yaw)",
+                    0xB0 => "  ← B.cos(yaw)",
+                    0xC0 => "  ← 1.0 (Y-axis)",
                     _ => ""
                 };
 
