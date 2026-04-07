@@ -53,7 +53,7 @@ namespace Xajh
             // --- Step 3: List NPCs, press [F] to face nearest ---
             var npcReader = new NpcReader(hProcess, moduleBase);
             var playerReader = new PlayerReader(hProcess, moduleBase);
-            var combat = new CombatOverlay(hProcess, moduleBase, game.Id);
+            var combat = new CombatOverlay(hProcess, moduleBase);
 
             Console.WriteLine("=== XAJH NPC List ===");
             Console.WriteLine("[F] Face Nearest | [D] Dump Floats (pauses list) | [End] Exit\n");
@@ -79,14 +79,14 @@ namespace Xajh
                     else if (key == ConsoleKey.D)
                     {
                         Console.Clear();
-                        Console.WriteLine("[D] Wide dump — stand still, do NOT turn yet.");
+                        Console.WriteLine("[D] Camera scan — stand still, do NOT turn yet.");
                         Console.WriteLine("    Press any key to take snapshot 1 ...");
                         Console.ReadKey(true);
-                        var snap1 = combat.DumpPlayerWide();
-                        Console.WriteLine("    Now TURN your character in-game.");
+                        var snap1 = combat.DumpCameraWide();
+                        Console.WriteLine("    Now TURN your camera in-game (right-click drag).");
                         Console.WriteLine("    Press any key to take snapshot 2 ...");
                         Console.ReadKey(true);
-                        var snap2 = combat.DumpPlayerWide();
+                        var snap2 = combat.DumpCameraWide();
                         CombatOverlay.CompareDumps(snap1, snap2);
                         Console.WriteLine("    Press any key to resume NPC list ...");
                         Console.ReadKey(true);
