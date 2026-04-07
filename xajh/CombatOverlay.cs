@@ -1,35 +1,82 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 
 namespace xajh
 {
     /// <summary>
-    /// Faces the player toward NPCs by writing two Y-axis rotation matrices
-    /// directly into the player object's memory.
+    /// Calls the game's face-target function on the main thread by hijacking
+    /// EIP via SuspendThread / GetThreadContext / SetThreadContext.
     ///
-    /// Layout confirmed from dump (yaw ≈ 1.95 rad before face, ≈ 1.06 after):
-    ///
-    ///   Matrix A (3x3 at +0x070):            Matrix B (3x3 at +0x0A0):
-    ///   +0x070  cos   +0x074 -sin  +0x078 0  +0x0A0  cos   +0x0A4  sin  +0x0A8 0
-    ///   +0x07C  sin   +0x080  cos  +0x084 0  +0x0AC -sin   +0x0B0  cos  +0x0B4 0
-    ///   +0x088  0     +0x08C  0    +0x090 1  +0x0B8  0     +0x0BC  0    +0x0C0 1
-    ///
-    ///   Position: +0x094 X, +0x098 Y, +0x09C Z  (between the two matrices)
-    ///
-    /// Matrix A is a standard 2D rotation [ cos -sin ; sin cos ]
-    /// Matrix B is its transpose (inverse) [ cos sin ; -sin cos ]
-    /// Both must be updated together or the game detects the inconsistency.
+    /// Why this is necessary:
+    ///   - Writing rotation matrices: values stick but renderer ignores them
+    ///   - CreateRemoteThread: runs on wrong thread, game discards result
+    ///   - Main thread hijack: the function runs in the game's own loop context,
+    ///     exactly as if the player clicked — this is what zxxy.dll does
     /// </summary>
     public class CombatOverlay
     {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint SuspendThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint ResumeThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetThreadContext(IntPtr hThread, ref CONTEXT lpContext);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetThreadContext(IntPtr hThread, ref CONTEXT lpContext);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint dwFreeType);
+
+        [DllImport("kernel32.dll")]
+        static extern bool CloseHandle(IntPtr hObject);
+
+        const uint THREAD_SUSPEND_RESUME = 0x0002;
+        const uint THREAD_GET_CONTEXT = 0x0008;
+        const uint THREAD_SET_CONTEXT = 0x0010;
+        const uint THREAD_ALL = THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT;
+        const uint CONTEXT_FULL = 0x10007;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct CONTEXT
+        {
+            public uint ContextFlags;
+            // Debug registers
+            public uint Dr0, Dr1, Dr2, Dr3, Dr6, Dr7;
+            // Float save area (112 bytes)
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 112)]
+            public byte[] FloatSave;
+            // Segment registers
+            public uint SegGs, SegFs, SegEs, SegDs;
+            // GP registers
+            public uint Edi, Esi, Ebx, Edx, Ecx, Eax;
+            // Control registers
+            public uint Ebp, Eip, SegCs, EFlags, Esp, SegSs;
+            // Extended registers (512 bytes)
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 512)]
+            public byte[] ExtendedRegisters;
+        }
+
         private IntPtr _hProcess;
         private IntPtr _moduleBase;
+        private int _pid;
+        private IntPtr _funcEntry = IntPtr.Zero;
 
-        public CombatOverlay(IntPtr hProcess, IntPtr moduleBase)
+        public CombatOverlay(IntPtr hProcess, IntPtr moduleBase, int pid)
         {
             _hProcess = hProcess;
             _moduleBase = moduleBase;
+            _pid = pid;
         }
 
         public string FaceNearest(float px, float py, float pz, List<Npc> npcs)
@@ -42,64 +89,162 @@ namespace xajh
                 .FirstOrDefault();
             if (nearest == null) return null;
 
+            IntPtr targetPtr = nearest.NodeAddr != 0
+                ? new IntPtr(nearest.NodeAddr)
+                : new IntPtr(nearest.NpcObjAddr);
+
+            if (targetPtr == IntPtr.Zero) return null;
+
+            if (_funcEntry == IntPtr.Zero)
+            {
+                _funcEntry = FindFunctionEntry(new IntPtr(0x6ACCCC));
+                if (_funcEntry == IntPtr.Zero)
+                    _funcEntry = new IntPtr(0x6ACCCC);
+                Console.WriteLine($"[+] Face function at 0x{_funcEntry.ToInt64():X8}");
+            }
+
+            bool ok = ExecuteOnMainThread(new IntPtr(playerObj), targetPtr);
+
             float dx = nearest.X - px;
             float dz = nearest.Z - pz;
-            float yaw = (float)Math.Atan2(dx, dz);
-            float cosY = (float)Math.Cos(yaw);
-            float sinY = (float)Math.Sin(yaw);
-
-            var obj = new IntPtr((uint)playerObj);
-
-            float oldCos = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x10));
-            float oldSin = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x1C));
-            float oldYaw = (float)Math.Atan2(oldSin, oldCos);
-
-            WriteYawToAllMatrices(obj, cosY, sinY);
-
             double dist = Math.Sqrt(dx * dx + dz * dz);
-            return $"{nearest.Name} (dist={dist:F0}, yaw {oldYaw:F2}->{yaw:F2})";
+            string status = ok ? "OK" : "FAIL";
+            return $"{nearest.Name} (dist={dist:F0}) [{status}]";
         }
 
         /// <summary>
-        /// Writes cos/sin yaw to all four rotation matrix copies in the
-        /// player object, plus the partial copy at +0x0E0.
-        ///
-        /// Layout (confirmed from wide dump diff):
-        ///   Set 1 (+0x010): primary forward  [cos -sin ; sin cos]
-        ///   Set 2 (+0x040): primary inverse  [cos sin ; -sin cos]
-        ///   Set 3 (+0x070): copy of Set 1
-        ///   Set 4 (+0x0A0): copy of Set 2
-        ///   +0x0E0/+0x0E4:  partial (sin, cos)
+        /// Hijacks the game's main thread to execute the face function:
+        ///   1. Suspend the main thread
+        ///   2. Save its context (registers + EIP)
+        ///   3. Write shellcode that calls face(player, target) then spins on a flag
+        ///   4. Set EIP to shellcode, resume thread
+        ///   5. Wait for the flag, then restore original context and resume
         /// </summary>
-        private void WriteYawToAllMatrices(IntPtr obj, float cosY, float sinY)
+        private bool ExecuteOnMainThread(IntPtr playerPtr, IntPtr targetPtr)
         {
-            // Set 1 (+0x010): PRIMARY forward rotation — game reads this
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x10), cosY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x14), -sinY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x1C), sinY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x20), cosY);
+            var proc = System.Diagnostics.Process.GetProcessById(_pid);
+            if (proc.Threads.Count == 0) return false;
 
-            // Set 2 (+0x040): PRIMARY inverse rotation
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x40), cosY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x44), sinY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x4C), -sinY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x50), cosY);
+            uint mainTid = (uint)proc.Threads[0].Id;
+            IntPtr hThread = OpenThread(THREAD_ALL, false, mainTid);
+            if (hThread == IntPtr.Zero) return false;
 
-            // Set 3 (+0x070): copy forward
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x70), cosY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x74), -sinY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x7C), sinY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0x80), cosY);
+            try
+            {
+                if (SuspendThread(hThread) == 0xFFFFFFFF) return false;
 
-            // Set 4 (+0x0A0): copy inverse
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xA0), cosY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xA4), sinY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xAC), -sinY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xB0), cosY);
+                var ctx = new CONTEXT
+                {
+                    ContextFlags = CONTEXT_FULL,
+                    FloatSave = new byte[112],
+                    ExtendedRegisters = new byte[512]
+                };
 
-            // Partial at +0x0E0
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xE0), sinY);
-            MemoryHelper.WriteFloat(_hProcess, IntPtr.Add(obj, 0xE4), cosY);
+                if (!GetThreadContext(hThread, ref ctx))
+                {
+                    ResumeThread(hThread);
+                    return false;
+                }
+
+                uint savedEip = ctx.Eip;
+                uint savedEcx = ctx.Ecx;
+                uint savedEax = ctx.Eax;
+                uint savedEsp = ctx.Esp;
+
+                // Shellcode: call face function then loop on a "done" flag.
+                //
+                //   mov ecx, <playerPtr>         ; __thiscall this
+                //   push <targetPtr>             ; argument
+                //   mov eax, <funcEntry>
+                //   call eax                     ; face function
+                //   mov byte [<flagAddr>], 1     ; signal completion
+                // spin:
+                //   pause
+                //   jmp spin                     ; spin until we restore context
+                //
+                // We use a flag so we know the call completed before restoring.
+
+                byte[] code = {
+                    0xB9, 0,0,0,0,                  // +0x00: mov ecx, playerPtr  [1..4]
+                    0x68, 0,0,0,0,                  // +0x05: push targetPtr      [6..9]
+                    0xB8, 0,0,0,0,                  // +0x0A: mov eax, funcEntry  [11..14]
+                    0xFF, 0xD0,                     // +0x0F: call eax
+                    0xC6, 0x05, 0,0,0,0, 0x01,      // +0x11: mov byte [flagAddr], 1  [19..22]
+                    0xF3, 0x90,                     // +0x18: pause
+                    0xEB, 0xFC                      // +0x1A: jmp -4 (back to pause)
+                };
+
+                IntPtr codeMem = VirtualAllocEx(_hProcess, IntPtr.Zero,
+                    (uint)(code.Length + 4), 0x3000, 0x40);
+                if (codeMem == IntPtr.Zero) { ResumeThread(hThread); return false; }
+
+                IntPtr flagAddr = IntPtr.Add(codeMem, code.Length);
+
+                Array.Copy(BitConverter.GetBytes(playerPtr.ToInt32()), 0, code, 1, 4);
+                Array.Copy(BitConverter.GetBytes(targetPtr.ToInt32()), 0, code, 6, 4);
+                Array.Copy(BitConverter.GetBytes(_funcEntry.ToInt32()), 0, code, 11, 4);
+                Array.Copy(BitConverter.GetBytes(flagAddr.ToInt32()), 0, code, 19, 4);
+
+                // Write shellcode + zero flag byte
+                byte[] codeAndFlag = new byte[code.Length + 4];
+                Array.Copy(code, codeAndFlag, code.Length);
+                MemoryHelper.WriteProcessMemory(_hProcess, codeMem,
+                    codeAndFlag, codeAndFlag.Length, out _);
+
+                // Redirect main thread to our shellcode
+                ctx.Eip = (uint)codeMem.ToInt32();
+                // Push a fake return address on the stack so the call doesn't corrupt
+                // the real stack — point it at our spin loop so if the function returns
+                // via ret it lands in the spin.
+                ctx.Esp -= 4;
+                byte[] retAddr = BitConverter.GetBytes((uint)codeMem.ToInt32() + 0x18);
+                MemoryHelper.WriteProcessMemory(_hProcess, new IntPtr(ctx.Esp),
+                    retAddr, 4, out _);
+
+                SetThreadContext(hThread, ref ctx);
+                ResumeThread(hThread);
+
+                // Wait for the face function to complete (flag byte becomes 1)
+                byte[] flagBuf = new byte[1];
+                for (int i = 0; i < 500; i++)
+                {
+                    System.Threading.Thread.Sleep(10);
+                    MemoryHelper.ReadProcessMemory(_hProcess, flagAddr, flagBuf, 1, out _);
+                    if (flagBuf[0] == 1) break;
+                }
+
+                // Restore original context: suspend again, put registers back
+                SuspendThread(hThread);
+                ctx.Eip = savedEip;
+                ctx.Ecx = savedEcx;
+                ctx.Eax = savedEax;
+                ctx.Esp = savedEsp;
+                SetThreadContext(hThread, ref ctx);
+                ResumeThread(hThread);
+
+                VirtualFreeEx(_hProcess, codeMem, 0, 0x8000);
+                return flagBuf[0] == 1;
+            }
+            finally
+            {
+                CloseHandle(hThread);
+            }
+        }
+
+        private IntPtr FindFunctionEntry(IntPtr midFuncAddr, int maxScanBack = 0x200)
+        {
+            byte[] buf = new byte[maxScanBack];
+            IntPtr scanStart = IntPtr.Add(midFuncAddr, -maxScanBack);
+            if (!MemoryHelper.ReadProcessMemory(_hProcess, scanStart,
+                    buf, buf.Length, out int read) || read < 3)
+                return IntPtr.Zero;
+
+            for (int i = read - 3; i >= 0; i--)
+            {
+                if (buf[i] == 0x55 && buf[i + 1] == 0x8B && buf[i + 2] == 0xEC)
+                    return IntPtr.Add(scanStart, i);
+            }
+            return IntPtr.Zero;
         }
 
         /// <summary>

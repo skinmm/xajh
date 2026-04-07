@@ -53,7 +53,7 @@ namespace Xajh
             // --- Step 3: List NPCs, press [F] to face nearest ---
             var npcReader = new NpcReader(hProcess, moduleBase);
             var playerReader = new PlayerReader(hProcess, moduleBase);
-            var combat = new CombatOverlay(hProcess, moduleBase);
+            var combat = new CombatOverlay(hProcess, moduleBase, game.Id);
 
             Console.WriteLine("=== XAJH NPC List ===");
             Console.WriteLine("[F] Face Nearest | [D] Dump Floats (pauses list) | [End] Exit\n");
