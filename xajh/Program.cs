@@ -78,11 +78,17 @@ namespace Xajh
                     }
                     else if (key == ConsoleKey.D)
                     {
-                        combat.DumpPlayerFloats();
-                        Console.WriteLine("  Turn your character in-game, press any key to dump again.");
+                        Console.Clear();
+                        Console.WriteLine("[D] Wide dump — stand still, do NOT turn yet.");
+                        Console.WriteLine("    Press any key to take snapshot 1 ...");
                         Console.ReadKey(true);
-                        combat.DumpPlayerFloats();
-                        Console.WriteLine("  Press any key to resume NPC list ...");
+                        var snap1 = combat.DumpPlayerWide();
+                        Console.WriteLine("    Now TURN your character in-game.");
+                        Console.WriteLine("    Press any key to take snapshot 2 ...");
+                        Console.ReadKey(true);
+                        var snap2 = combat.DumpPlayerWide();
+                        CombatOverlay.CompareDumps(snap1, snap2);
+                        Console.WriteLine("    Press any key to resume NPC list ...");
                         Console.ReadKey(true);
                     }
                 }

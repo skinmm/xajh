@@ -70,51 +70,82 @@ namespace xajh
             return $"{nearest.Name} (dist={dist:F0}, yaw {oldYaw:F2}->{yaw:F2})";
         }
 
-        public void DumpPlayerFloats()
+        /// <summary>
+        /// Wide dump: reads +0x000 to +0x400 of the player object, prints every
+        /// DWORD as both float and int.  Highlights values in the yaw range
+        /// (-π to +π) so we can find the source yaw field that the game uses to
+        /// recalculate the rotation matrices each frame.
+        ///
+        /// Usage: press [D] to dump, turn in-game, press key to dump again.
+        /// Compare both dumps — the float that changed AND is in [-3.15, 3.15]
+        /// range is the source yaw field.
+        /// </summary>
+        public float[] DumpPlayerWide()
         {
             int playerObj = GetPlayerObject();
             if (playerObj == 0)
             {
                 Console.WriteLine("[!] Cannot read player object.");
-                return;
+                return null;
             }
 
             var obj = new IntPtr((uint)playerObj);
+            const int dumpLen = 0x400;
+            var buf = new byte[dumpLen];
+            MemoryHelper.ReadProcessMemory(_hProcess, obj, buf, dumpLen, out _);
 
-            float cosA = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x70));
-            float sinA = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, 0x7C));
+            float cosA = BitConverter.ToSingle(buf, 0x70);
+            float sinA = BitConverter.ToSingle(buf, 0x7C);
             float curYaw = (float)Math.Atan2(sinA, cosA);
 
-            Console.WriteLine($"\n── Player 0x{playerObj:X8} ──");
-            Console.WriteLine($"  Yaw: {curYaw:F4} rad ({curYaw * 180f / Math.PI:F1} deg)");
-            Console.WriteLine($"  {"Offset",-8} {"Value",12}  Note");
+            Console.WriteLine($"\n── Player 0x{playerObj:X8} — wide dump (0x000..0x{dumpLen:X}) ──");
+            Console.WriteLine($"  Matrix yaw: {curYaw:F4} rad ({curYaw * 180f / Math.PI:F1} deg)");
+            Console.WriteLine($"  {"Off",-7} {"float",12} {"int",12}  Note");
             Console.WriteLine(new string('─', 65));
 
-            for (int off = 0x70; off <= 0xC0; off += 4)
+            var floats = new float[dumpLen / 4];
+            for (int off = 0; off < dumpLen; off += 4)
             {
-                float val = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(obj, off));
-                string note = off switch
-                {
-                    0x70 => "  ← A.cos(yaw)",
-                    0x74 => "  ← A.-sin(yaw)",
-                    0x7C => "  ← A.sin(yaw)",
-                    0x80 => "  ← A.cos(yaw)",
-                    0x90 => "  ← 1.0 (Y-axis)",
-                    0x94 => "  ← X",
-                    0x98 => "  ← Y",
-                    0x9C => "  ← Z",
-                    0xA0 => "  ← B.cos(yaw)",
-                    0xA4 => "  ← B.sin(yaw)",
-                    0xAC => "  ← B.-sin(yaw)",
-                    0xB0 => "  ← B.cos(yaw)",
-                    0xC0 => "  ← 1.0 (Y-axis)",
-                    _ => ""
-                };
+                float fv = BitConverter.ToSingle(buf, off);
+                int iv = BitConverter.ToInt32(buf, off);
+                floats[off / 4] = fv;
 
-                if (!float.IsNaN(val) && !float.IsInfinity(val))
-                    Console.WriteLine($"  +0x{off:X3}   {val,12:F4}{note}");
-                else
-                    Console.WriteLine($"  +0x{off:X3}   {"(invalid)",12}{note}");
+                string note = "";
+                if (off == 0x94) note = "  ← X";
+                else if (off == 0x98) note = "  ← Y";
+                else if (off == 0x9C) note = "  ← Z";
+                else if (off == 0x70) note = "  ← A.cos";
+                else if (off == 0x7C) note = "  ← A.sin";
+                else if (!float.IsNaN(fv) && !float.IsInfinity(fv) &&
+                         Math.Abs(fv) > 0.01f && Math.Abs(fv) <= Math.PI + 0.1f)
+                {
+                    note = "  ← YAW?";
+                }
+
+                if (!float.IsNaN(fv) && !float.IsInfinity(fv))
+                    Console.WriteLine($"  +0x{off:X3}  {fv,12:F4} {iv,12}{note}");
+            }
+            Console.WriteLine();
+            return floats;
+        }
+
+        /// <summary>
+        /// Compares two wide dumps and prints offsets where the float value changed.
+        /// </summary>
+        public static void CompareDumps(float[] before, float[] after)
+        {
+            if (before == null || after == null) return;
+            Console.WriteLine("── Changed floats ──");
+            Console.WriteLine($"  {"Off",-7} {"Before",12} {"After",12}");
+            Console.WriteLine(new string('─', 40));
+            int count = Math.Min(before.Length, after.Length);
+            for (int i = 0; i < count; i++)
+            {
+                if (Math.Abs(before[i] - after[i]) > 0.0001f)
+                {
+                    int off = i * 4;
+                    Console.WriteLine($"  +0x{off:X3}  {before[i],12:F4} {after[i],12:F4}");
+                }
             }
             Console.WriteLine();
         }
