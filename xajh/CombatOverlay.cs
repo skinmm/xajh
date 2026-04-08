@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 
 namespace xajh
 {
@@ -134,69 +135,124 @@ namespace xajh
         }
 
         /// <summary>
-        /// Full memory scan for the camera yaw address (Cheat Engine approach):
-        ///   1. Read the player's current facing yaw from rotation matrix
-        ///   2. Scan ALL writable memory for that float value
-        ///   3. User turns camera in-game
-        ///   4. Read new yaw, filter candidates to those that changed to match
-        ///   5. Repeat until 1-5 addresses remain — one is the camera yaw
+        /// Full memory scan for the camera yaw address.
+        ///
+        /// The camera yaw may use a different zero-direction or range than the
+        /// player's rotation matrix, so we can't scan for the player's yaw value.
+        /// Instead:
+        ///   1. Scan all writable memory for ANY float in the angle range [-4, 4]
+        ///   2. Snapshot all their values
+        ///   3. User turns camera
+        ///   4. Filter to addresses whose value CHANGED (the camera yaw moved)
+        ///   5. Exclude addresses inside the player object
+        ///   6. Repeat until ≤10 candidates remain
         /// </summary>
         public void ScanCameraYaw()
         {
-            float yaw1 = GetCurrentCameraYaw();
-            Console.WriteLine($"[*] Current yaw: {yaw1:F4} rad ({yaw1 * 180f / Math.PI:F1} deg)");
-            Console.WriteLine("[*] Scanning all memory for this float ...");
+            Console.WriteLine("[*] Step 1: Stand still. Scanning all angle-range floats ...");
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var candidates = MemoryHelper.ScanForFloat(_hProcess, yaw1, 0.02f);
+            var candidates = ScanAngleFloats();
             sw.Stop();
-            Console.WriteLine($"[*] Found {candidates.Count} addresses in {sw.ElapsedMilliseconds}ms");
 
-            if (candidates.Count == 0) { Console.WriteLine("[!] No matches."); return; }
-
-            // Exclude addresses inside the player object (we know those aren't camera)
             int playerObj = GetPlayerObject();
             if (playerObj != 0)
             {
-                candidates = candidates.Where(a =>
-                    a.ToInt32() < playerObj || a.ToInt32() > playerObj + 0x400).ToList();
-                Console.WriteLine($"[*] After excluding player object: {candidates.Count}");
+                candidates = candidates.Where(c =>
+                    c.addr.ToInt32() < playerObj || c.addr.ToInt32() > playerObj + 0x400).ToList();
             }
 
-            // Filter loop
-            while (candidates.Count > 5)
+            Console.WriteLine($"[*] Found {candidates.Count} angle-range addresses in {sw.ElapsedMilliseconds}ms");
+
+            int round = 0;
+            while (candidates.Count > 10)
             {
-                Console.WriteLine($"\n[*] {candidates.Count} candidates remaining.");
+                round++;
+                Console.WriteLine($"\n[*] Round {round}: {candidates.Count} candidates.");
                 Console.WriteLine("[*] TURN your camera in-game, then press any key ...");
                 Console.ReadKey(true);
 
-                float yaw2 = GetCurrentCameraYaw();
-                Console.WriteLine($"[*] New yaw: {yaw2:F4} rad ({yaw2 * 180f / Math.PI:F1} deg)");
-
-                if (Math.Abs(yaw1 - yaw2) < 0.05f)
+                // Keep only addresses whose value changed
+                var filtered = new List<(IntPtr addr, float oldVal)>();
+                foreach (var (addr, oldVal) in candidates)
                 {
-                    Console.WriteLine("[!] Yaw didn't change enough. Turn more and try again.");
-                    continue;
+                    float newVal = MemoryHelper.ReadFloat(_hProcess, addr);
+                    if (Math.Abs(newVal - oldVal) > 0.02f &&
+                        !float.IsNaN(newVal) && !float.IsInfinity(newVal) &&
+                        Math.Abs(newVal) <= 4f)
+                    {
+                        filtered.Add((addr, newVal));
+                    }
                 }
 
-                candidates = MemoryHelper.FilterByFloat(_hProcess, candidates, yaw2, 0.05f);
-                Console.WriteLine($"[*] After filter: {candidates.Count}");
-                yaw1 = yaw2;
+                Console.WriteLine($"[*] Changed: {filtered.Count} (from {candidates.Count})");
+                candidates = filtered;
+
+                if (filtered.Count == 0)
+                {
+                    Console.WriteLine("[!] No addresses changed. Make sure you turned the camera.");
+                    break;
+                }
             }
 
             Console.WriteLine($"\n── Final candidates ({candidates.Count}) ──");
-            foreach (var addr in candidates)
+            foreach (var (addr, val) in candidates)
             {
-                float val = MemoryHelper.ReadFloat(_hProcess, addr);
-                Console.WriteLine($"  0x{addr.ToInt64():X8}  = {val:F4}");
+                float cur = MemoryHelper.ReadFloat(_hProcess, addr);
+                Console.WriteLine($"  0x{addr.ToInt64():X8}  = {cur:F4}");
             }
 
             if (candidates.Count > 0)
             {
-                _camYawAddr = candidates[0];
+                _camYawAddr = candidates[0].addr;
                 Console.WriteLine($"\n[+] Using 0x{_camYawAddr.ToInt64():X8} as camera yaw address.");
                 Console.WriteLine("[*] Press [F] to test facing.");
             }
+        }
+
+        /// <summary>
+        /// Scans all writable memory for floats in the angle range [-4, 4].
+        /// Returns the address and current value of each match.
+        /// </summary>
+        private List<(IntPtr addr, float val)> ScanAngleFloats()
+        {
+            var results = new List<(IntPtr, float)>();
+            IntPtr address = IntPtr.Zero;
+
+            while (true)
+            {
+                if (!MemoryHelper.VirtualQueryEx(_hProcess, address,
+                        out var mbi, (uint)Marshal.SizeOf<MemoryHelper.MEMORY_BASIC_INFORMATION>()))
+                    break;
+
+                bool writable = mbi.State == MemoryHelper.MEM_COMMIT &&
+                                (mbi.Protect == MemoryHelper.PAGE_READWRITE ||
+                                 mbi.Protect == MemoryHelper.PAGE_EXECUTE_READWRITE);
+
+                if (writable)
+                {
+                    long regionSize = mbi.RegionSize.ToInt64();
+                    var buf = new byte[regionSize];
+                    MemoryHelper.ReadProcessMemory(_hProcess, mbi.BaseAddress,
+                        buf, (int)regionSize, out int bytesRead);
+
+                    for (int i = 0; i <= bytesRead - 4; i += 4)
+                    {
+                        float fv = BitConverter.ToSingle(buf, i);
+                        if (!float.IsNaN(fv) && !float.IsInfinity(fv) &&
+                            Math.Abs(fv) > 0.1f && Math.Abs(fv) <= 4f)
+                        {
+                            results.Add((IntPtr.Add(mbi.BaseAddress, i), fv));
+                        }
+                    }
+                }
+
+                long next = address.ToInt64() + mbi.RegionSize.ToInt64();
+                if (next <= 0 || next >= long.MaxValue) break;
+                address = new IntPtr(next);
+            }
+
+            return results;
         }
 
         private int GetPlayerObject()
