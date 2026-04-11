@@ -28,20 +28,86 @@ namespace Xajh
         {
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
+            (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
+            {
+                int playerMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                int npcMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D451C));
+                return (playerMgr != 0, npcMgr != 0);
+            }
+
+            (Process game, IntPtr moduleBase, IntPtr hProcess) SelectGameProcess(Process[] procs)
+            {
+                Process best = null;
+                IntPtr bestModuleBase = IntPtr.Zero;
+                IntPtr bestHandle = IntPtr.Zero;
+                int bestScore = int.MinValue;
+
+                foreach (var p in procs)
+                {
+                    IntPtr candidateBase = IntPtr.Zero;
+                    IntPtr candidateHandle = IntPtr.Zero;
+                    try
+                    {
+                        if (p.HasExited) continue;
+                        p.Refresh();
+                        candidateBase = p.MainModule.BaseAddress;
+                        candidateHandle = MemoryHelper.OpenProcess(
+                            MemoryHelper.PROCESS_ALL_ACCESS, false, p.Id);
+                        if (candidateHandle == IntPtr.Zero) continue;
+
+                        int score = 0;
+                        var (hasPlayerMgr, hasNpcMgr) = ProbeStatics(candidateHandle, candidateBase);
+                        if (hasPlayerMgr) score += 6;
+                        if (hasNpcMgr) score += 2;
+                        if (p.MainWindowHandle != IntPtr.Zero) score += 2;
+                        if (p.WorkingSet64 > 100L * 1024L * 1024L) score += 1;
+
+                        if (score > bestScore)
+                        {
+                            if (bestHandle != IntPtr.Zero) MemoryHelper.CloseHandle(bestHandle);
+                            best = p;
+                            bestModuleBase = candidateBase;
+                            bestHandle = candidateHandle;
+                            bestScore = score;
+                            candidateHandle = IntPtr.Zero;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                    finally
+                    {
+                        if (candidateHandle != IntPtr.Zero)
+                            MemoryHelper.CloseHandle(candidateHandle);
+                    }
+                }
+
+                return (best, bestModuleBase, bestHandle);
+            }
+
             Console.WriteLine("[*] Waiting for game process (vrchat1) ...");
             Process game = null;
+            IntPtr moduleBase = IntPtr.Zero;
+            IntPtr hProcess = IntPtr.Zero;
             for (int i = 0; i < 120; i++)
             {
                 var procs = Process.GetProcessesByName("vrchat1");
-                if (procs.Length > 0) { game = procs[0]; break; }
+                if (procs.Length > 0)
+                {
+                    var picked = SelectGameProcess(procs);
+                    if (picked.game != null)
+                    {
+                        game = picked.game;
+                        moduleBase = picked.moduleBase;
+                        hProcess = picked.hProcess;
+                        Console.WriteLine($"[+] Attached PID={game.Id} Base=0x{moduleBase.ToInt64():X8}");
+                        break;
+                    }
+                }
                 Thread.Sleep(500);
             }
 
             if (game == null) { Console.WriteLine("[!] Game not found."); Console.ReadKey(); return; }
-
-            IntPtr moduleBase = game.MainModule.BaseAddress;
-            IntPtr hProcess = MemoryHelper.OpenProcess(
-                MemoryHelper.PROCESS_ALL_ACCESS, false, game.Id);
 
             if (hProcess == IntPtr.Zero)
             {
@@ -117,21 +183,26 @@ namespace Xajh
                 return nearby;
             }
 
-            string AimNearest()
+            string AimNearest(bool verbose = true)
             {
                 var (px, py, pz) = playerReader.Get();
                 var nearby = GetNearbyNpcs();
 
-                // Always print the list so we can debug distances
-                Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
-                Console.WriteLine($"  {"#",2}  {"Name",-20} {"xy",7} {"3d",7}  {"NpcX",9} {"NpcY",9} {"NpcZ",9}   {"dX",8} {"dY",8} {"dZ",8}");
-                for (int i = 0; i < nearby.Count; i++)
+                if (verbose)
                 {
-                    var (n, dxy, d3d) = nearby[i];
-                    Console.WriteLine($"  {i + 1,2}. {n.Name,-20} {dxy,7:F0} {d3d,7:F0}  {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}   {n.X - px,8:F1} {n.Y - py,8:F1} {n.Z - pz,8:F1}");
+                    // Full list for debugging when pressing [X]
+                    Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
+                    Console.WriteLine($"  {"#",2}  {"Name",-20} {"xy",7} {"3d",7}  {"NpcX",9} {"NpcY",9} {"NpcZ",9}   {"dX",8} {"dY",8} {"dZ",8}");
+                    for (int i = 0; i < nearby.Count; i++)
+                    {
+                        var (n, dxy, d3d) = nearby[i];
+                        Console.WriteLine($"  {i + 1,2}. {n.Name,-20} {dxy,7:F0} {d3d,7:F0}  {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}   {n.X - px,8:F1} {n.Y - py,8:F1} {n.Z - pz,8:F1}");
+                    }
+                    if (nearby.Count == 0) { return $"[!] No NPC within {aimRadius:F0}"; }
+                    Console.WriteLine();
                 }
-                if (nearby.Count == 0) { return $"[!] No NPC within {aimRadius:F0}"; }
-                Console.WriteLine();
+                else if (nearby.Count == 0)
+                    return $"[!] No NPC within {aimRadius:F0}";
 
                 var (target, distXY, _) = nearby[0];
                 string r = turn.FaceTarget(() => playerReader.Get(), target.X, target.Y);
@@ -315,7 +386,7 @@ namespace Xajh
 
                 if (autoFace)
                 {
-                    Console.WriteLine($"[AUTO] {AimNearest()}");
+                    Console.WriteLine($"[AUTO] {AimNearest(verbose: false)}");
                     Thread.Sleep(800);   // throttle auto-aim
                 }
                 else

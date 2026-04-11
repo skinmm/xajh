@@ -104,6 +104,12 @@ namespace xajh
         public string FaceTarget(Func<(float x, float y, float z)> readPos,
                                  float tx, float ty)
         {
+            // Auto-aim runs on a timer while the console often has focus; many clients
+            // only apply keyboard/mouse look when the game window is active.
+            if (_gameHwnd != IntPtr.Zero)
+                SetForegroundWindow(_gameHwnd);
+            Thread.Sleep(80);
+
             float curYaw = MeasureYaw(readPos);
             if (float.IsNaN(curYaw))
                 return "[!] Auto-run produced no motion. Key blocked or path obstructed?";
