@@ -28,20 +28,86 @@ namespace Xajh
         {
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
+            (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
+            {
+                int playerMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                int npcMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D451C));
+                return (playerMgr != 0, npcMgr != 0);
+            }
+
+            (Process game, IntPtr moduleBase, IntPtr hProcess) SelectGameProcess(Process[] procs)
+            {
+                Process best = null;
+                IntPtr bestModuleBase = IntPtr.Zero;
+                IntPtr bestHandle = IntPtr.Zero;
+                int bestScore = int.MinValue;
+
+                foreach (var p in procs)
+                {
+                    IntPtr candidateBase = IntPtr.Zero;
+                    IntPtr candidateHandle = IntPtr.Zero;
+                    try
+                    {
+                        if (p.HasExited) continue;
+                        p.Refresh();
+                        candidateBase = p.MainModule.BaseAddress;
+                        candidateHandle = MemoryHelper.OpenProcess(
+                            MemoryHelper.PROCESS_ALL_ACCESS, false, p.Id);
+                        if (candidateHandle == IntPtr.Zero) continue;
+
+                        int score = 0;
+                        var (hasPlayerMgr, hasNpcMgr) = ProbeStatics(candidateHandle, candidateBase);
+                        if (hasPlayerMgr) score += 6;
+                        if (hasNpcMgr) score += 2;
+                        if (p.MainWindowHandle != IntPtr.Zero) score += 2;
+                        if (p.WorkingSet64 > 100L * 1024L * 1024L) score += 1;
+
+                        if (score > bestScore)
+                        {
+                            if (bestHandle != IntPtr.Zero) MemoryHelper.CloseHandle(bestHandle);
+                            best = p;
+                            bestModuleBase = candidateBase;
+                            bestHandle = candidateHandle;
+                            bestScore = score;
+                            candidateHandle = IntPtr.Zero;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                    finally
+                    {
+                        if (candidateHandle != IntPtr.Zero)
+                            MemoryHelper.CloseHandle(candidateHandle);
+                    }
+                }
+
+                return (best, bestModuleBase, bestHandle);
+            }
+
             Console.WriteLine("[*] Waiting for game process (vrchat1) ...");
             Process game = null;
+            IntPtr moduleBase = IntPtr.Zero;
+            IntPtr hProcess = IntPtr.Zero;
             for (int i = 0; i < 120; i++)
             {
                 var procs = Process.GetProcessesByName("vrchat1");
-                if (procs.Length > 0) { game = procs[0]; break; }
+                if (procs.Length > 0)
+                {
+                    var picked = SelectGameProcess(procs);
+                    if (picked.game != null)
+                    {
+                        game = picked.game;
+                        moduleBase = picked.moduleBase;
+                        hProcess = picked.hProcess;
+                        Console.WriteLine($"[+] Attached PID={game.Id} Base=0x{moduleBase.ToInt64():X8}");
+                        break;
+                    }
+                }
                 Thread.Sleep(500);
             }
 
             if (game == null) { Console.WriteLine("[!] Game not found."); Console.ReadKey(); return; }
-
-            IntPtr moduleBase = game.MainModule.BaseAddress;
-            IntPtr hProcess = MemoryHelper.OpenProcess(
-                MemoryHelper.PROCESS_ALL_ACCESS, false, game.Id);
 
             if (hProcess == IntPtr.Zero)
             {
