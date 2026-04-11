@@ -4,23 +4,17 @@ namespace xajh
 {
     class PlayerReader
     {
-        // Optional X/Y from a global mirror — set by the [O] scanner (absolute address
-        // in the target process). Default IntPtr.Zero: do not read a bogus hardcoded
-        // pointer (ASLR breaks fixed addresses like 0x0B201ABC).
-        //
-        // World position is read from the live player object: matrix block translations
-        // at block+0x24 (CombatOverlay [P]). Blocks at +0x10, +0x40, +0x70, +0xA0
-        // → translations +0x34, +0x64, +0x94, +0xC4. +0x94 matches npc_obj when that
-        // block holds world coords; we try +0x70 first (often the active root).
+        // Optional X/Y from [O] scanner (absolute VA in the game process).
+        // Default IntPtr.Zero — never use a stale hardcoded VA (ASLR).
         const long MgrOffset = 0x9D4518;
         public static IntPtr GlobalPosAddr = IntPtr.Zero;
 
         const int OffListPlayer = 0x4C;
-        static readonly int[] MatrixBlockStarts = { 0x70, 0x10, 0x40, 0xA0 };
+        /// <summary>translation = rotation_block + 0x24 (3×3 floats then XYZ)</summary>
         const int TransFromBlock = 0x24;
 
-        /// <summary>Last matrix block start that produced valid coords (-1 = none).</summary>
-        static int s_cachedBlockStart = -1;
+        /// <summary>Cached translation offset from player object base (-1 = none).</summary>
+        static int s_cachedTransOffset = -1;
 
         readonly IntPtr _h, _m;
         float _cx, _cy, _cz;
@@ -37,59 +31,155 @@ namespace xajh
             return MemoryHelper.ReadInt32(h, IntPtr.Add(new IntPtr((uint)fr), OffListPlayer));
         }
 
-        static bool IsSaneWorldTriplet(float x, float y, float z)
-        {
-            if (float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z)) return false;
-            if (float.IsInfinity(x) || float.IsInfinity(y) || float.IsInfinity(z)) return false;
-            if (Math.Abs(x) > 100_000f || Math.Abs(y) > 100_000f || Math.Abs(z) > 100_000f) return false;
-            if (x == 0f && y == 0f && z == 0f) return false;
-            return true;
-        }
+        /// <summary>
+        /// World-ish float: finite, not absurd. Allows origin (0) and small maps (|v| &lt; 1).
+        /// </summary>
+        static bool IsPlausibleCoord(float v) =>
+            !float.IsNaN(v) && !float.IsInfinity(v) && Math.Abs(v) < 500_000f;
 
-        static bool TryReadTranslationAt(IntPtr h, int obj, int blockStart, out float x, out float y, out float z)
+        static bool IsPlausibleVec3(float x, float y, float z) =>
+            IsPlausibleCoord(x) && IsPlausibleCoord(y) && IsPlausibleCoord(z);
+
+        static bool TryReadVec3(IntPtr h, int objAddr, int byteOffset, out float x, out float y, out float z)
         {
             x = y = z = 0f;
-            if (obj == 0) return false;
-            int tOff = blockStart + TransFromBlock;
-            if (tOff < 0 || tOff + 12 > 0x800) return false;
-            var p = new IntPtr((uint)obj);
+            if (objAddr == 0 || byteOffset < 0 || byteOffset + 12 > 0x800) return false;
+            var p = new IntPtr(objAddr);
             try
             {
-                x = MemoryHelper.ReadFloat(h, IntPtr.Add(p, tOff));
-                y = MemoryHelper.ReadFloat(h, IntPtr.Add(p, tOff + 4));
-                z = MemoryHelper.ReadFloat(h, IntPtr.Add(p, tOff + 8));
+                x = MemoryHelper.ReadFloat(h, IntPtr.Add(p, byteOffset));
+                y = MemoryHelper.ReadFloat(h, IntPtr.Add(p, byteOffset + 4));
+                z = MemoryHelper.ReadFloat(h, IntPtr.Add(p, byteOffset + 8));
             }
             catch { return false; }
-            return IsSaneWorldTriplet(x, y, z);
+            return IsPlausibleVec3(x, y, z);
         }
 
-        static bool TryReadWorldFromPlayerMatrices(IntPtr h, int playerObj, out float x, out float y, out float z)
+        /// <summary>
+        /// Try known matrix layout and a 0x30 stride sweep (extra blocks if layout shifted).
+        /// </summary>
+        static bool TryTranslationsFromMatrices(IntPtr h, int playerObj, out float x, out float y, out float z, out int transOff)
         {
             x = y = z = 0f;
-            if (playerObj == 0) return false;
-
-            if (s_cachedBlockStart >= 0 &&
-                TryReadTranslationAt(h, playerObj, s_cachedBlockStart, out x, out y, out z))
-                return true;
-
-            s_cachedBlockStart = -1;
-            foreach (int block in MatrixBlockStarts)
+            transOff = -1;
+            int[] preferred = { 0x70, 0x10, 0x40, 0xA0 };
+            foreach (int block in preferred)
             {
-                if (TryReadTranslationAt(h, playerObj, block, out x, out y, out z))
+                int t = block + TransFromBlock;
+                if (TryReadVec3(h, playerObj, t, out x, out y, out z))
                 {
-                    s_cachedBlockStart = block;
+                    transOff = t;
+                    return true;
+                }
+            }
+            for (int block = 0x10; block + TransFromBlock + 12 <= 0x300; block += 0x30)
+            {
+                int t = block + TransFromBlock;
+                if (Array.IndexOf(preferred, block) >= 0) continue;
+                if (TryReadVec3(h, playerObj, t, out x, out y, out z))
+                {
+                    transOff = t;
                     return true;
                 }
             }
             return false;
         }
 
-        static bool GlobalXYLooksWrong(float x, float y)
+        /// <summary>
+        /// npc_obj-style layout at +0x94 (sometimes valid on player root).
+        /// </summary>
+        static bool TryNpcStylePos(IntPtr h, int playerObj, out float x, out float y, out float z) =>
+            TryReadVec3(h, playerObj, 0x94, out x, out y, out z);
+
+        /// <summary>
+        /// Last resort: find any plausible XYZ triplet in the first 0x300 bytes.
+        /// Skips offsets that often hold pointers (heuristic: int in user-mode heap range).
+        /// </summary>
+        static bool TryScanStructForVec3(IntPtr h, int playerObj, out float x, out float y, out float z, out int vecOff)
         {
-            if (float.IsNaN(x) || float.IsNaN(y)) return true;
-            if (float.IsInfinity(x) || float.IsInfinity(y)) return true;
-            if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f) return true;
-            if (Math.Abs(x) < 0.01f && Math.Abs(y) < 0.01f) return true;
+            x = y = z = 0f;
+            vecOff = -1;
+            const int Len = 0x300;
+            var buf = new byte[Len];
+            if (!MemoryHelper.ReadProcessMemory(h, new IntPtr(playerObj), buf, Len, out int rd) || rd < 12)
+                return false;
+
+            int bestOff = -1;
+            float bx = 0, by = 0, bz = 0;
+            int bestScore = -1;
+
+            for (int off = 0; off + 12 <= rd; off += 4)
+            {
+                float tx = BitConverter.ToSingle(buf, off);
+                float ty = BitConverter.ToSingle(buf, off + 4);
+                float tz = BitConverter.ToSingle(buf, off + 8);
+                if (!IsPlausibleVec3(tx, ty, tz)) continue;
+
+                int i0 = BitConverter.ToInt32(buf, off);
+                bool p0 = i0 > 0x0100_0000 && i0 < 0x7FFF_FFFF;
+                int i1 = BitConverter.ToInt32(buf, off + 4);
+                bool p1 = i1 > 0x0100_0000 && i1 < 0x7FFF_FFFF;
+                int i2 = BitConverter.ToInt32(buf, off + 8);
+                bool p2 = i2 > 0x0100_0000 && i2 < 0x7FFF_FFFF;
+                if (p0 && p1 && p2) continue;
+
+                int score = 0;
+                if (Math.Abs(tx) > 0.05f || Math.Abs(ty) > 0.05f) score += 2;
+                if (Math.Abs(tz) > 0.05f) score += 1;
+                if ((off - 0x34) % 0x30 == 0 && off >= 0x34) score += 3;
+                if (off == 0x94) score += 2;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestOff = off;
+                    bx = tx; by = ty; bz = tz;
+                }
+            }
+
+            if (bestOff < 0) return false;
+            vecOff = bestOff;
+            x = bx; y = by; z = bz;
+            return true;
+        }
+
+        static bool TryResolveWorldFromPlayer(IntPtr h, int playerObj, out float x, out float y, out float z)
+        {
+            x = y = z = 0f;
+            if (playerObj == 0) return false;
+
+            if (s_cachedTransOffset >= 0 &&
+                TryReadVec3(h, playerObj, s_cachedTransOffset, out x, out y, out z))
+                return true;
+
+            s_cachedTransOffset = -1;
+
+            if (TryTranslationsFromMatrices(h, playerObj, out x, out y, out z, out int tOff))
+            {
+                s_cachedTransOffset = tOff;
+                return true;
+            }
+
+            if (TryNpcStylePos(h, playerObj, out x, out y, out z))
+            {
+                s_cachedTransOffset = 0x94;
+                return true;
+            }
+
+            if (TryScanStructForVec3(h, playerObj, out x, out y, out z, out int vecOff))
+            {
+                s_cachedTransOffset = vecOff;
+                return true;
+            }
+
+            return false;
+        }
+
+        static bool GlobalXYLooksWrong(float gx, float gy)
+        {
+            if (float.IsNaN(gx) || float.IsNaN(gy)) return true;
+            if (float.IsInfinity(gx) || float.IsInfinity(gy)) return true;
+            if (Math.Abs(gx) > 1_000_000f || Math.Abs(gy) > 1_000_000f) return true;
             return false;
         }
 
@@ -98,10 +188,10 @@ namespace xajh
             try
             {
                 int playerObj = ResolvePlayerObject(_h, _m);
-                bool haveMatrix = playerObj != 0 &&
-                    TryReadWorldFromPlayerMatrices(_h, playerObj, out float x, out float y, out float z);
+                if (playerObj == 0)
+                    return Cached();
 
-                if (!haveMatrix)
+                if (!TryResolveWorldFromPlayer(_h, playerObj, out float x, out float y, out float z))
                     return Cached();
 
                 if (GlobalPosAddr != IntPtr.Zero)
@@ -115,9 +205,8 @@ namespace xajh
                     }
                 }
 
-                if (float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z)) return Cached();
-                if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f) return Cached();
-                if (x == 0f && y == 0f && z == 0f) return Cached();
+                if (!IsPlausibleVec3(x, y, z))
+                    return Cached();
 
                 _cx = x; _cy = y; _cz = z; _hasCache = true;
                 return (x, y, z);
