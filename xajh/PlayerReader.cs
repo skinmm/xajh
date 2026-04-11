@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 
 namespace xajh
 {
@@ -56,33 +57,61 @@ namespace xajh
         }
 
         /// <summary>
-        /// Try known matrix layout and a 0x30 stride sweep (extra blocks if layout shifted).
+        /// The player struct holds several matrix translations; two pairs often duplicate
+        /// (e.g. +0x034/+0x094 = world, +0x064/+0x0C4 = another basis). Taking the first
+        /// plausible triplet picks the wrong pair. Vote: same (x,y,z) at multiple offsets wins.
+        /// Tie-break: higher Z (ground height), then lower offset (+0x034 before +0x0C4).
         /// </summary>
         static bool TryTranslationsFromMatrices(IntPtr h, int playerObj, out float x, out float y, out float z, out int transOff)
         {
             x = y = z = 0f;
             transOff = -1;
-            int[] preferred = { 0x70, 0x10, 0x40, 0xA0 };
-            foreach (int block in preferred)
-            {
-                int t = block + TransFromBlock;
-                if (TryReadVec3(h, playerObj, t, out x, out y, out z))
-                {
-                    transOff = t;
-                    return true;
-                }
-            }
+
+            var tallies = new Dictionary<(uint Xb, uint Yb, uint Zb), (int Count, int MinOff, float X, float Y, float Z)>();
+
             for (int block = 0x10; block + TransFromBlock + 12 <= 0x300; block += 0x30)
             {
                 int t = block + TransFromBlock;
-                if (Array.IndexOf(preferred, block) >= 0) continue;
-                if (TryReadVec3(h, playerObj, t, out x, out y, out z))
+                if (!TryReadVec3(h, playerObj, t, out float tx, out float ty, out float tz))
+                    continue;
+
+                var key = (
+                    BitConverter.SingleToUInt32Bits(tx),
+                    BitConverter.SingleToUInt32Bits(ty),
+                    BitConverter.SingleToUInt32Bits(tz));
+
+                if (tallies.TryGetValue(key, out var rec))
+                    tallies[key] = (rec.Count + 1, Math.Min(rec.MinOff, t), rec.X, rec.Y, rec.Z);
+                else
+                    tallies[key] = (1, t, tx, ty, tz);
+            }
+
+            if (tallies.Count == 0)
+                return false;
+
+            int bestCount = -1;
+            float bestZ = float.NegativeInfinity;
+            int bestMinOff = int.MaxValue;
+            float bx = 0, by = 0, bz = 0;
+            int bOff = -1;
+
+            foreach (var kv in tallies)
+            {
+                var (cnt, minOff, vx, vy, vz) = kv.Value;
+                if (cnt > bestCount
+                    || (cnt == bestCount && vz > bestZ)
+                    || (cnt == bestCount && Math.Abs(vz - bestZ) < 1e-4f && minOff < bestMinOff))
                 {
-                    transOff = t;
-                    return true;
+                    bestCount = cnt;
+                    bestZ = vz;
+                    bestMinOff = minOff;
+                    bx = vx; by = vy; bz = vz;
+                    bOff = minOff;
                 }
             }
-            return false;
+
+            x = bx; y = by; z = bz; transOff = bOff;
+            return true;
         }
 
         /// <summary>
