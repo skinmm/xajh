@@ -93,7 +93,9 @@ namespace xajh
             var (px, py, _) = readPos();
             float dx = tx - px;
             float dy = ty - py;
-            float targetYaw = (float)Math.Atan2(dx, dy);
+            // Matrix yaw is opposite of world-vector yaw in this client, so
+            // add PI to align "face target" with actual model orientation.
+            float targetYaw = (float)Math.Atan2(dx, dy) + (float)Math.PI;
 
             float delta = targetYaw - curYaw;
             while (delta > Math.PI) delta -= 2f * (float)Math.PI;
