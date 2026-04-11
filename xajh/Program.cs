@@ -117,21 +117,26 @@ namespace Xajh
                 return nearby;
             }
 
-            string AimNearest()
+            string AimNearest(bool verbose = true)
             {
                 var (px, py, pz) = playerReader.Get();
                 var nearby = GetNearbyNpcs();
 
-                // Always print the list so we can debug distances
-                Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
-                Console.WriteLine($"  {"#",2}  {"Name",-20} {"xy",7} {"3d",7}  {"NpcX",9} {"NpcY",9} {"NpcZ",9}   {"dX",8} {"dY",8} {"dZ",8}");
-                for (int i = 0; i < nearby.Count; i++)
+                if (verbose)
                 {
-                    var (n, dxy, d3d) = nearby[i];
-                    Console.WriteLine($"  {i + 1,2}. {n.Name,-20} {dxy,7:F0} {d3d,7:F0}  {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}   {n.X - px,8:F1} {n.Y - py,8:F1} {n.Z - pz,8:F1}");
+                    // Full list for debugging when pressing [X]
+                    Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
+                    Console.WriteLine($"  {"#",2}  {"Name",-20} {"xy",7} {"3d",7}  {"NpcX",9} {"NpcY",9} {"NpcZ",9}   {"dX",8} {"dY",8} {"dZ",8}");
+                    for (int i = 0; i < nearby.Count; i++)
+                    {
+                        var (n, dxy, d3d) = nearby[i];
+                        Console.WriteLine($"  {i + 1,2}. {n.Name,-20} {dxy,7:F0} {d3d,7:F0}  {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}   {n.X - px,8:F1} {n.Y - py,8:F1} {n.Z - pz,8:F1}");
+                    }
+                    if (nearby.Count == 0) { return $"[!] No NPC within {aimRadius:F0}"; }
+                    Console.WriteLine();
                 }
-                if (nearby.Count == 0) { return $"[!] No NPC within {aimRadius:F0}"; }
-                Console.WriteLine();
+                else if (nearby.Count == 0)
+                    return $"[!] No NPC within {aimRadius:F0}";
 
                 var (target, distXY, _) = nearby[0];
                 string r = turn.FaceTarget(() => playerReader.Get(), target.X, target.Y);
@@ -315,7 +320,7 @@ namespace Xajh
 
                 if (autoFace)
                 {
-                    Console.WriteLine($"[AUTO] {AimNearest()}");
+                    Console.WriteLine($"[AUTO] {AimNearest(verbose: false)}");
                     Thread.Sleep(800);   // throttle auto-aim
                 }
                 else
