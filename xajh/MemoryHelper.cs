@@ -223,5 +223,55 @@ namespace xajh
             }
             return results;
         }
+
+        /// <summary>Scan all writable memory for a float value with tolerance.</summary>
+        public static List<IntPtr> ScanForFloat(IntPtr hProcess, float value, float tolerance = 0.01f)
+        {
+            var results = new List<IntPtr>();
+            IntPtr address = IntPtr.Zero;
+
+            while (true)
+            {
+                if (!VirtualQueryEx(hProcess, address, out var mbi, (uint)Marshal.SizeOf<MEMORY_BASIC_INFORMATION>()))
+                    break;
+
+                bool writable = mbi.State == MEM_COMMIT &&
+                                (mbi.Protect == PAGE_READWRITE ||
+                                 mbi.Protect == PAGE_EXECUTE_READWRITE);
+
+                if (writable)
+                {
+                    long regionSize = mbi.RegionSize.ToInt64();
+                    byte[] buf = new byte[regionSize];
+                    ReadProcessMemory(hProcess, mbi.BaseAddress, buf, (int)regionSize, out int bytesRead);
+
+                    for (int i = 0; i <= bytesRead - 4; i += 4)
+                    {
+                        float fv = BitConverter.ToSingle(buf, i);
+                        if (Math.Abs(fv - value) <= tolerance)
+                            results.Add(IntPtr.Add(mbi.BaseAddress, i));
+                    }
+                }
+
+                long next = address.ToInt64() + mbi.RegionSize.ToInt64();
+                if (next <= 0 || next >= long.MaxValue) break;
+                address = new IntPtr(next);
+            }
+
+            return results;
+        }
+
+        /// <summary>Filter candidates to those still matching a float value.</summary>
+        public static List<IntPtr> FilterByFloat(IntPtr hProcess, List<IntPtr> candidates, float value, float tolerance = 0.01f)
+        {
+            var results = new List<IntPtr>();
+            foreach (var addr in candidates)
+            {
+                float val = ReadFloat(hProcess, addr);
+                if (Math.Abs(val - value) <= tolerance)
+                    results.Add(addr);
+            }
+            return results;
+        }
     }
 }
