@@ -138,7 +138,7 @@ namespace Xajh
                 catch { return IntPtr.Zero; }
             }
 
-            var turn = new TurnHelper(hProcess, GetGameHwnd());
+            var turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
 
             Console.WriteLine("=== XAJH Combat Overlay ===");
             Console.WriteLine("[X] Aim nearest NPC    [A] Auto-aim toggle    [C] Reset calibration");
@@ -304,7 +304,7 @@ namespace Xajh
                             Console.WriteLine($"    0x{h.ToInt64():X}  {rc.Right - rc.Left}x{rc.Bottom - rc.Top}  class={sb}");
                         }
                         Console.WriteLine($"[W] Picked largest: 0x{best.ToInt64():X} ({bestArea}px²)");
-                        turn = new TurnHelper(hProcess, best);
+                        turn = new TurnHelper(hProcess, moduleBase, best);
                     }
                     else if (key == ConsoleKey.P)
                     {
