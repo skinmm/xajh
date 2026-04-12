@@ -398,7 +398,7 @@ namespace Xajh
                     }
                     else
                     {
-                        if (!PlayerReader.IsGlobalPosLocked)
+                        if (!PlayerReader.IsGlobalPosLocked())
                             AutoDetectGlobalMirror();
                         Thread.Sleep(50);
                     }
