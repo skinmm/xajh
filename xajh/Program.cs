@@ -32,15 +32,18 @@ namespace Xajh
             int[] directMgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C, 0x9D4524, 0x9D450C };
             int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
             int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
-            int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4 };
+            int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0xA4, 0xB4, 0xD4, 0xE4, 0x104, 0x114 };
+            int[] directPtrOffsets = { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C };
+            int[] directSubPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30 };
             int preferredDirectMgr = 0x9D4518;
             int preferredDirectList = 0x08;
             int preferredDirectObj = 0x4C;
+            int preferredDirectLink = -1; // -1 = root object, otherwise pointer field offset
             int preferredDirectPos = 0x94;
             bool hasDirectCache = false;
             float directCx = 0f, directCy = 0f;
             int preferredDirectStaticReads = 0;
-            var directLastByKey = new Dictionary<(int mgr, int list, int obj, int pos), (float x, float y)>();
+            var directLastByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), (float x, float y)>();
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
@@ -73,7 +76,7 @@ namespace Xajh
                 out float x, out float y, out float z, out string source)
             {
                 x = 0f; y = 0f; z = 0f; source = "direct:none";
-                var samples = new List<(int mo, int lo, int oo, int po, float x, float y, float z)>();
+                var samples = new List<(int mo, int lo, int oo, int link, int po, float x, float y, float z)>();
 
                 var mgrOrder = new List<int> { preferredDirectMgr };
                 foreach (int mo in directMgrOffsets)
@@ -95,11 +98,29 @@ namespace Xajh
                             if (raw == 0) continue;
                             var pobj = Ptr32(raw);
 
+                            // Root object position candidates.
                             foreach (int po in directPosOffsets)
                             {
                                 if (!TryReadStablePos(hProcess, pobj, po, out float px, out float py, out float pz))
                                     continue;
-                                samples.Add((mo, lo, oo, po, px, py, pz));
+                                samples.Add((mo, lo, oo, -1, po, px, py, pz));
+                            }
+
+                            // One-level pointer-linked sub-objects; many maps keep moving
+                            // world coords in a linked child object while root looks static.
+                            foreach (int linkOff in directPtrOffsets)
+                            {
+                                int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, linkOff));
+                                if (subRaw == 0 || subRaw == raw) continue;
+                                if (subRaw < 0x00100000) continue;
+
+                                var subObj = Ptr32(subRaw);
+                                foreach (int po in directSubPosOffsets)
+                                {
+                                    if (!TryReadStablePos(hProcess, subObj, po, out float px, out float py, out float pz))
+                                        continue;
+                                    samples.Add((mo, lo, oo, linkOff, po, px, py, pz));
+                                }
                             }
                         }
                     }
@@ -114,15 +135,17 @@ namespace Xajh
                     bool isPref = s.mo == preferredDirectMgr &&
                                   s.lo == preferredDirectList &&
                                   s.oo == preferredDirectObj &&
+                                  s.link == preferredDirectLink &&
                                   s.po == preferredDirectPos;
 
                     if (isPref && hasDirectCache)
                     {
                         double d = Math.Sqrt(Math.Pow(s.x - directCx, 2) + Math.Pow(s.y - directCy, 2));
                         if (d < 0.01) preferredLooksStatic = true;
+                        if (!isPref && d > 0.2 && d <= 3000.0) anyAltMoved = true;
                     }
 
-                    if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.po), out var last))
+                    if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.link, s.po), out var last))
                     {
                         double dSelf = Math.Sqrt(Math.Pow(s.x - last.x, 2) + Math.Pow(s.y - last.y, 2));
                         if (isPref && dSelf < 0.01) preferredLooksStatic = true;
@@ -136,22 +159,25 @@ namespace Xajh
                     preferredDirectStaticReads = 0;
 
                 float bestScore = float.MinValue;
-                int bestMgr = 0, bestList = 0, bestObj = 0, bestPos = 0;
+                int bestMgr = 0, bestList = 0, bestObj = 0, bestLink = -1, bestPos = 0;
                 foreach (var s in samples)
                 {
                     bool isPref = s.mo == preferredDirectMgr &&
                                   s.lo == preferredDirectList &&
                                   s.oo == preferredDirectObj &&
+                                  s.link == preferredDirectLink &&
                                   s.po == preferredDirectPos;
 
                     float score = 0f;
                     if (s.mo == preferredDirectMgr) score += 2f;
                     if (s.lo == preferredDirectList) score += 1f;
                     if (s.oo == preferredDirectObj) score += 1f;
+                    if (s.link == preferredDirectLink) score += 1f;
                     if (s.po == preferredDirectPos) score += 2f;
                     if (s.lo == 0x08) score += 1f;
                     if (s.oo == 0x4C) score += 1f;
-                    if (s.po == 0x94) score += 1f;
+                    if (s.link == -1 && s.po == 0x94) score += 0.5f;
+                    if (s.link != -1) score += 0.5f;
 
                     if (hasDirectCache)
                     {
@@ -162,33 +188,37 @@ namespace Xajh
                         else score -= 4f;
                     }
 
-                    if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.po), out var last))
+                    if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.link, s.po), out var last))
                     {
                         double dSelf = Math.Sqrt(Math.Pow(s.x - last.x, 2) + Math.Pow(s.y - last.y, 2));
-                        if (dSelf > 0.2 && dSelf <= 3000f) score += 2f;
-                        else if (dSelf < 0.01) score -= 0.5f;
+                        if (dSelf > 0.2 && dSelf <= 3000f) score += 3f;
+                        else if (dSelf < 0.01) score -= 1f;
                     }
 
                     if (isPref && preferredDirectStaticReads >= 2)
-                        score -= 8f;
+                        score -= 10f;
+                    if (!isPref && preferredDirectStaticReads >= 2)
+                        score += 2f;
 
                     if (score > bestScore)
                     {
                         bestScore = score;
                         x = s.x; y = s.y; z = s.z;
-                        bestMgr = s.mo; bestList = s.lo; bestObj = s.oo; bestPos = s.po;
+                        bestMgr = s.mo; bestList = s.lo; bestObj = s.oo; bestLink = s.link; bestPos = s.po;
                     }
                 }
 
                 foreach (var s in samples)
-                    directLastByKey[(s.mo, s.lo, s.oo, s.po)] = (s.x, s.y);
+                    directLastByKey[(s.mo, s.lo, s.oo, s.link, s.po)] = (s.x, s.y);
 
                 preferredDirectMgr = bestMgr;
                 preferredDirectList = bestList;
                 preferredDirectObj = bestObj;
+                preferredDirectLink = bestLink;
                 preferredDirectPos = bestPos;
                 directCx = x; directCy = y; hasDirectCache = true;
-                source = $"direct(mgr=0x{bestMgr:X},list=0x{bestList:X2},obj=0x{bestObj:X2},pos=0x{bestPos:X2},st={preferredDirectStaticReads})";
+                string linkTag = bestLink == -1 ? "root" : $"sub+0x{bestLink:X2}";
+                source = $"direct(mgr=0x{bestMgr:X},list=0x{bestList:X2},obj=0x{bestObj:X2},ln={linkTag},pos=0x{bestPos:X2},st={preferredDirectStaticReads})";
                 return true;
             }
 
