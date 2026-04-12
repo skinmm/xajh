@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 
 namespace xajh
 {
@@ -38,6 +39,8 @@ namespace xajh
         }
 
         public static void SetGlobalPosLocked(bool locked) => _globalPosLocked = locked;
+
+        public static bool IsGlobalPosLocked() => _globalPosLocked;
 
         public string UpdateLocationReference(float locX, float locY)
         {
@@ -103,6 +106,69 @@ namespace xajh
         {
             _hasLocReference = false;
             _xySourceMode = XySourceMode.Auto;
+        }
+
+        public void PreferGlobalSource()
+        {
+            _hasLocReference = false;
+            _xySourceMode = XySourceMode.Global;
+        }
+
+        readonly List<IntPtr> _autoMirrorCandidates = new List<IntPtr>();
+        int _nextAutoLockTick;
+        int _autoScanRound;
+
+        public bool TryAutoLockGlobalMirror(out string status)
+        {
+            status = null;
+            if (_globalPosLocked) return true;
+
+            int now = Environment.TickCount;
+            if (now < _nextAutoLockTick) return false;
+
+            if (!TryReadPlayerObjectPos(out float ox, out float oy, out _))
+            {
+                _nextAutoLockTick = now + 1200;
+                return false;
+            }
+
+            if (_autoMirrorCandidates.Count == 0)
+            {
+                _autoScanRound++;
+                status = $"[*] Auto-loc scan {_autoScanRound}: find mirror for ({ox:F0}, {oy:F0})";
+                var hits = MemoryHelper.ScanForFloat(_h, ox, 5f);
+                foreach (var addr in hits)
+                {
+                    float y = MemoryHelper.ReadFloat(_h, IntPtr.Add(addr, 4));
+                    if (Math.Abs(y - oy) < 5f)
+                        _autoMirrorCandidates.Add(addr);
+                }
+            }
+            else
+            {
+                var keep = new List<IntPtr>();
+                foreach (var addr in _autoMirrorCandidates)
+                {
+                    float x = MemoryHelper.ReadFloat(_h, addr);
+                    float y = MemoryHelper.ReadFloat(_h, IntPtr.Add(addr, 4));
+                    if (Math.Abs(x - ox) < 6f && Math.Abs(y - oy) < 6f)
+                        keep.Add(addr);
+                }
+                _autoMirrorCandidates.Clear();
+                _autoMirrorCandidates.AddRange(keep);
+            }
+
+            if (_autoMirrorCandidates.Count > 0)
+            {
+                SetGlobalPosAddr(_autoMirrorCandidates[0], locked: true);
+                PreferGlobalSource();
+                status = $"[+] Auto-locked global XY mirror @ 0x{_autoMirrorCandidates[0].ToInt64():X8} ({_autoMirrorCandidates.Count} aliases)";
+                return true;
+            }
+
+            status = $"[!] Auto-loc scan {_autoScanRound} found no candidates; retrying";
+            _nextAutoLockTick = now + 2000;
+            return false;
         }
 
         public (float x, float y, float z) Get()

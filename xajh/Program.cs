@@ -175,17 +175,55 @@ namespace Xajh
 
             bool autoFace = false;
             float aimRadius = 300f;
-            var posCandidates = new List<IntPtr>();
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
-            Console.WriteLine("[*] Global XY mirror unlocked. Use [O] with /loc to calibrate+lock.");
+            Console.WriteLine("[*] Auto-locating stable player XY mirror...");
 
-            int GetPlayerObj()
+            var mirrorCandidates = new List<IntPtr>();
+            bool AutoDetectGlobalMirror()
             {
-                int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
-                if (mgr == 0) return 0;
-                int list = MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)(mgr + 8)));
-                if (list == 0) return 0;
-                return MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)(list + 0x4C)));
+                try
+                {
+                    var (px, py, _) = playerReader.Get();
+                    if (Math.Abs(px) < 1f && Math.Abs(py) < 1f) return false;
+
+                    if (mirrorCandidates.Count == 0)
+                    {
+                        var hits = MemoryHelper.ScanForFloat(hProcess, px, 5f);
+                        foreach (var addr in hits)
+                        {
+                            float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
+                            if (Math.Abs(y - py) < 5f) mirrorCandidates.Add(addr);
+                        }
+                    }
+                    else
+                    {
+                        var narrowed = new List<IntPtr>();
+                        foreach (var addr in mirrorCandidates)
+                        {
+                            float x = MemoryHelper.ReadFloat(hProcess, addr);
+                            float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
+                            if (Math.Abs(x - px) < 5f && Math.Abs(y - py) < 5f)
+                                narrowed.Add(addr);
+                        }
+                        mirrorCandidates = narrowed;
+                    }
+
+                    if (mirrorCandidates.Count > 0)
+                    {
+                        // Mirrors are aliases; first one is enough.
+                        PlayerReader.SetGlobalPosAddr(mirrorCandidates[0], locked: true);
+                        playerReader.PreferGlobalSource();
+                        Console.WriteLine($"[+] Auto-locked global XY mirror @ 0x{mirrorCandidates[0].ToInt64():X8} ({mirrorCandidates.Count} aliases)");
+                        return true;
+                    }
+                }
+                catch { }
+                return false;
+            }
+
+            if (!AutoDetectGlobalMirror())
+            {
+                Console.WriteLine("[*] Initial mirror scan had no lock. Move a little; auto-scan will retry.");
             }
 
             // Get NPCs within radius, sorted by HORIZONTAL (XY) distance
@@ -346,82 +384,6 @@ namespace Xajh
                         {
                             combat.DumpPlayerObject();
                         }
-                        else if (key == ConsoleKey.O)
-                        {
-                            Console.Write("Enter your /loc X> ");
-                            if (!float.TryParse(Console.ReadLine()?.Trim(), out float locX)) { Console.WriteLine("[!] bad"); continue; }
-                            Console.Write("Enter your /loc Y> ");
-                            if (!float.TryParse(Console.ReadLine()?.Trim(), out float locY)) { Console.WriteLine("[!] bad"); continue; }
-                            Console.WriteLine($"[*] {playerReader.UpdateLocationReference(locX, locY)}");
-
-                            if (posCandidates.Count == 0)
-                            {
-                                // First pass: full scan
-                                Console.WriteLine($"\n[*] Pass 1: global scan for ({locX:F0}, {locY:F0}) ...");
-                                var hits = MemoryHelper.ScanForFloat(hProcess, locX, 5f);
-                                foreach (var addr in hits)
-                                {
-                                    float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                                    if (Math.Abs(y - locY) < 5f) posCandidates.Add(addr);
-                                }
-                                Console.WriteLine($"[*] {posCandidates.Count} candidates. Walk to NEW spot and [O] again to narrow,");
-                                Console.WriteLine($"[*] or just use the first one now: 0x{(posCandidates.Count > 0 ? posCandidates[0].ToInt64() : 0):X8}");
-                                if (posCandidates.Count > 0)
-                                {
-                                    // /loc mirrors often exist at many alias addresses.
-                                    // Any alias is fine once /loc matched; lock immediately.
-                                    PlayerReader.SetGlobalPosAddr(posCandidates[0], locked: true);
-                                    if (posCandidates.Count == 1)
-                                        Console.WriteLine($"[+] LOCKED global mirror @ 0x{posCandidates[0].ToInt64():X8}");
-                                    else
-                                        Console.WriteLine($"[+] {posCandidates.Count} aliases detected, locked first: 0x{posCandidates[0].ToInt64():X8}");
-                                }
-                            }
-                            else
-                            {
-                                // Pass 2+: filter existing candidates
-                                Console.WriteLine($"\n[*] Pass 2: filtering {posCandidates.Count} candidates against ({locX:F0}, {locY:F0}) ...");
-                                var keep = new List<IntPtr>();
-                                foreach (var addr in posCandidates)
-                                {
-                                    float x = MemoryHelper.ReadFloat(hProcess, addr);
-                                    float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                                    if (Math.Abs(x - locX) < 5f && Math.Abs(y - locY) < 5f)
-                                        keep.Add(addr);
-                                }
-                                posCandidates = keep;
-                                Console.WriteLine($"[*] {posCandidates.Count} survived");
-                                foreach (var addr in posCandidates)
-                                {
-                                    float x = MemoryHelper.ReadFloat(hProcess, addr);
-                                    float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                                    Console.WriteLine($"  ✓ 0x{addr.ToInt64():X8}  ({x:F1}, {y:F1})");
-                                }
-                                if (posCandidates.Count > 0)
-                                {
-                                    PlayerReader.SetGlobalPosAddr(posCandidates[0], locked: true);
-                                    if (posCandidates.Count == 1)
-                                    {
-                                        Console.WriteLine($"\n[+] LOCKED player position @ 0x{posCandidates[0].ToInt64():X8}");
-                                        Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
-                                    }
-                                    else
-                                    {
-                                        Console.WriteLine($"\n[+] {posCandidates.Count} aliases remain, using first: 0x{posCandidates[0].ToInt64():X8}");
-                                        Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
-                                    }
-                                }
-                                else
-                                    Console.WriteLine("[!] All filtered out — press [K] to reset, try again.");
-                            }
-                        }
-                        else if (key == ConsoleKey.K)
-                        {
-                            posCandidates.Clear();
-                            PlayerReader.SetGlobalPosLocked(false);
-                            playerReader.ClearLocationReference();
-                            Console.WriteLine("[K] Position candidates cleared");
-                        }
                         else if (key == ConsoleKey.A)
                         {
                             autoFace = !autoFace;
@@ -436,6 +398,8 @@ namespace Xajh
                     }
                     else
                     {
+                        if (!PlayerReader.IsGlobalPosLocked)
+                            AutoDetectGlobalMirror();
                         Thread.Sleep(50);
                     }
                 }
