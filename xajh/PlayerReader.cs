@@ -28,10 +28,30 @@ namespace xajh
                 bool haveGlobal = TryReadGlobalMirror(out float gx, out float gy);
 
                 float x, y, z;
-                if (haveObjPos)
+                if (haveGlobal && haveObjPos)
                 {
-                    x = objX;
-                    y = objY;
+                    bool useObjXY = false;
+                    if (_hasCache)
+                    {
+                        double dGlobal = Math.Sqrt(Math.Pow(gx - _cx, 2) + Math.Pow(gy - _cy, 2));
+                        double dObj = Math.Sqrt(Math.Pow(objX - _cx, 2) + Math.Pow(objY - _cy, 2));
+                        // If global jumps wildly while object position stays smooth,
+                        // trust object XY for this tick (global mirror may be stale).
+                        if (dGlobal > 300f && dObj < 80f)
+                            useObjXY = true;
+                    }
+
+                    if (useObjXY)
+                    {
+                        x = objX;
+                        y = objY;
+                    }
+                    else
+                    {
+                        // Global mirror XY is the most stable source when valid.
+                        x = gx;
+                        y = gy;
+                    }
                     z = objZ;
                 }
                 else if (haveGlobal)
@@ -39,6 +59,12 @@ namespace xajh
                     x = gx;
                     y = gy;
                     z = _hasCache ? _cz : 0f;
+                }
+                else if (haveObjPos)
+                {
+                    x = objX;
+                    y = objY;
+                    z = objZ;
                 }
                 else
                 {
@@ -82,7 +108,7 @@ namespace xajh
                 if (!IsCoordinatePlausible(cx, cy, cz)) continue;
 
                 float score = 0f;
-                if (off == _preferredPosOffset) score += 0.7f;
+                if ((_hasCache || haveGlobal) && off == _preferredPosOffset) score += 0.7f;
 
                 if (_hasCache)
                 {
