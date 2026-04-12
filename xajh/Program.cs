@@ -170,6 +170,28 @@ namespace Xajh
 
                 if (samples.Count == 0) return false;
 
+                // If movement calibration locked a candidate, use it directly when present.
+                if (directCalibLock.HasValue)
+                {
+                    var lk = directCalibLock.Value;
+                    foreach (var s in samples)
+                    {
+                        if (s.mo != lk.mgr || s.lo != lk.list || s.oo != lk.obj || s.link != lk.link || s.po != lk.pos)
+                            continue;
+
+                        x = s.x; y = s.y; z = s.z;
+                        preferredDirectMgr = s.mo;
+                        preferredDirectList = s.lo;
+                        preferredDirectObj = s.oo;
+                        preferredDirectLink = s.link;
+                        preferredDirectPos = s.po;
+                        directCx = x; directCy = y; hasDirectCache = true;
+                        string lockTag = s.link == -1 ? "root" : $"sub+0x{s.link:X2}";
+                        source = $"direct(mgr=0x{s.mo:X},list=0x{s.lo:X2},obj=0x{s.oo:X2},ln={lockTag},pos=0x{s.po:X2},pref-lock)";
+                        return true;
+                    }
+                }
+
                 bool preferredLooksStatic = false;
                 bool anyAltMoved = false;
                 foreach (var s in samples)
