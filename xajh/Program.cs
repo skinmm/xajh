@@ -176,20 +176,6 @@ namespace Xajh
             bool autoFace = false;
             float aimRadius = 300f;
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
-            Console.WriteLine("[*] Auto-locating stable player XY mirror...");
-
-            bool AutoDetectGlobalMirror()
-            {
-                bool locked = playerReader.TryAutoLockGlobalMirror(out string status);
-                if (!string.IsNullOrEmpty(status))
-                    Console.WriteLine(status);
-                return locked;
-            }
-
-            if (!AutoDetectGlobalMirror())
-            {
-                Console.WriteLine("[*] Initial mirror scan had no lock. Move a little; auto-scan will retry.");
-            }
 
             // Get NPCs within radius, sorted by HORIZONTAL (XY) distance
             // In this game: X,Y = ground plane, Z = height
@@ -363,8 +349,6 @@ namespace Xajh
                     }
                     else
                     {
-                        if (!PlayerReader.IsGlobalPosLocked())
-                            AutoDetectGlobalMirror();
                         Thread.Sleep(50);
                     }
                 }

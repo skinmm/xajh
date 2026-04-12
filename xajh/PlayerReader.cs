@@ -29,6 +29,7 @@ namespace xajh
         float _cx, _cy, _cz;
         bool _hasCache;
         int _preferredPosOffset = 0x94;
+        IntPtr _preferredPlayerObj = IntPtr.Zero;
         bool _hasLocReference;
         float _locRefX, _locRefY;
         XySourceMode _xySourceMode = XySourceMode.Auto;
@@ -241,57 +242,48 @@ namespace xajh
         {
             x = 0f; y = 0f; z = 0f;
             if (!TryGetPlayerObject(out IntPtr p)) return false;
-            bool haveGlobal = TryReadGlobalMirror(out float gx, out float gy);
 
+            float x94 = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x94));
+            float y94 = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x98));
+            float z94 = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x9C));
+
+            // Use the canonical player-world offset directly when valid.
+            if (IsCoordinatePlausible(x94, y94, z94))
+            {
+                _preferredPosOffset = 0x94;
+                x = x94; y = y94; z = z94;
+                return true;
+            }
+
+            // Fallback: scan alternate matrix translation blocks.
+            int[] fallbackOffsets = { 0x64, 0x34, 0xC4 };
             float bestScore = float.MinValue;
             int bestOffset = 0;
             float bx = 0f, by = 0f, bz = 0f;
             bool found = false;
 
-            foreach (int off in PosCandidateOffsets)
+            foreach (int off in fallbackOffsets)
             {
                 float cx = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, off));
                 float cy = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, off + 4));
                 float cz = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, off + 8));
                 if (!IsCoordinatePlausible(cx, cy, cz)) continue;
 
-                // Deterministic base preference to avoid arbitrary picks when
-                // cache/global signals are unavailable.
-                float score = off == _preferredPosOffset ? 1.2f : 0f;
-                if (off == 0x94) score += 1.0f;
-                else if (off == 0x64) score += 0.6f;
-                else if (off == 0x34) score += 0.3f;
-                else if (off == 0xC4) score += 0.2f;
-
+                float score = off == _preferredPosOffset ? 0.8f : 0f;
                 if (_hasCache)
                 {
                     double dxy = Math.Sqrt(Math.Pow(cx - _cx, 2) + Math.Pow(cy - _cy, 2));
-                    if (dxy <= 3f) score += 3f;
-                    else if (dxy <= 60f) score += 2f;
-                    else if (dxy <= 250f) score += 1f;
-                    else score -= 3f;
-
-                    float dz = Math.Abs(cz - _cz);
-                    if (dz <= 20f) score += 0.5f;
-                    else if (dz > 500f) score -= 1f;
-                }
-
-                if (haveGlobal)
-                {
-                    double dg = Math.Sqrt(Math.Pow(cx - gx, 2) + Math.Pow(cy - gy, 2));
-                    if (dg <= 3f) score += 4f;
-                    else if (dg <= 30f) score += 2f;
-                    else if (dg <= 200f) score += 0.5f;
+                    if (dxy <= 6f) score += 2.5f;
+                    else if (dxy <= 80f) score += 1.5f;
                     else score -= 2f;
                 }
 
                 if (HasActiveLocReference())
                 {
                     double dr = Math.Sqrt(Math.Pow(cx - _locRefX, 2) + Math.Pow(cy - _locRefY, 2));
-                    if (dr <= 2f) score += 6f;
-                    else if (dr <= 30f) score += 3f;
-                    else if (dr <= 120f) score += 1f;
-                    else score -= 2f;
+                    if (dr <= 30f) score += 3f;
+                    else if (dr <= 150f) score += 1f;
+                    else score -= 1.5f;
                 }
 
                 if (score > bestScore)
@@ -328,45 +320,71 @@ namespace xajh
         bool TryGetPlayerObject(out IntPtr playerObj)
         {
             playerObj = IntPtr.Zero;
+            var candidates = new List<(IntPtr ptr, float pathBias)>();
 
-            // Path A (preferred): direct/static root used by existing native tools.
+            // Path A: direct/static root used by companion tools.
             int root = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)PlayerRootOffset));
             if (root != 0)
             {
                 var rootPtr = new IntPtr((uint)root);
-                if (LooksLikePlayerObject(rootPtr))
-                {
-                    playerObj = rootPtr;
-                    return true;
-                }
+                candidates.Add((rootPtr, 0.2f));
 
                 int rootChild = MemoryHelper.ReadInt32(_h, IntPtr.Add(rootPtr, 0x4C));
                 if (rootChild != 0)
+                    candidates.Add((new IntPtr((uint)rootChild), 0.4f));
+            }
+
+            // Path B: manager/list chain (historically stable in this project).
+            int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
+            if (mgr != 0)
+            {
+                int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
+                if (list != 0)
                 {
-                    var childPtr = new IntPtr((uint)rootChild);
-                    if (LooksLikePlayerObject(childPtr))
-                    {
-                        playerObj = childPtr;
-                        return true;
-                    }
+                    int raw = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), PlayerObjOffset));
+                    if (raw != 0)
+                        candidates.Add((new IntPtr((uint)raw), 1.2f));
                 }
             }
 
-            // Path B: manager/list chain.
-            int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
-            if (mgr == 0) return false;
-
-            int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
-            if (list == 0) return false;
-
-            int raw = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), PlayerObjOffset));
-            if (raw == 0) return false;
-
-            var p = new IntPtr((uint)raw);
-            if (!LooksLikePlayerObject(p))
+            if (candidates.Count == 0)
                 return false;
 
-            playerObj = p;
+            float bestScore = float.MinValue;
+            IntPtr bestPtr = IntPtr.Zero;
+            foreach (var (ptr, pathBias) in candidates)
+            {
+                if (!TryReadPlayerSnapshot(ptr, out float x, out float y, out float z, out float c, out float s))
+                    continue;
+
+                float score = pathBias;
+
+                if (ptr == _preferredPlayerObj)
+                    score += 1.0f;
+
+                if (_hasCache)
+                {
+                    double dxy = Math.Sqrt(Math.Pow(x - _cx, 2) + Math.Pow(y - _cy, 2));
+                    if (dxy <= 8f) score += 2.5f;
+                    else if (dxy <= 80f) score += 1.2f;
+                    else score -= 1.5f;
+                }
+
+                float rotMag = c * c + s * s;
+                score += Math.Max(0f, 1.0f - Math.Abs(rotMag - 1f));
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestPtr = ptr;
+                }
+            }
+
+            if (bestPtr == IntPtr.Zero)
+                return false;
+
+            _preferredPlayerObj = bestPtr;
+            playerObj = bestPtr;
             return true;
         }
 
@@ -375,14 +393,27 @@ namespace xajh
             return _hasLocReference;
         }
 
-        bool LooksLikePlayerObject(IntPtr p)
+        bool TryReadPlayerSnapshot(IntPtr p, out float x, out float y, out float z, out float c, out float s)
         {
+            x = 0f; y = 0f; z = 0f; c = 0f; s = 0f;
             try
             {
-                float x = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x94));
-                float y = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x98));
-                float z = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x9C));
-                return IsCoordinatePlausible(x, y, z);
+                x = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x94));
+                y = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x98));
+                z = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x9C));
+                c = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x10));
+                s = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x1C));
+
+                if (!IsCoordinatePlausible(x, y, z))
+                    return false;
+
+                if (float.IsNaN(c) || float.IsNaN(s) || float.IsInfinity(c) || float.IsInfinity(s))
+                    return false;
+
+                if (Math.Abs(c) > 1.2f || Math.Abs(s) > 1.2f)
+                    return false;
+
+                return true;
             }
             catch
             {
