@@ -97,6 +97,23 @@ namespace xajh
         {
             try
             {
+                if (TryReadSimpleChainPos(out float sx, out float sy, out float sz,
+                                         out int smgr, out int sobj, out int spos, out IntPtr sptr))
+                {
+                    _preferredMgrOffset = smgr;
+                    _preferredObjOffset = sobj;
+                    _preferredPosOffset = spos;
+                    _signaturePlayerObj = IntPtr.Zero;
+                    _dbgMgrOffset = smgr;
+                    _dbgObjOffset = sobj;
+                    _dbgPosOffset = spos;
+                    _dbgPlayerObj = sptr;
+                    _dbgRawX = sx; _dbgRawY = sy; _dbgRawZ = sz;
+                    _dbgSource = "simple";
+                    _cx = sx; _cy = sy; _cz = sz; _hasCache = true;
+                    return (sx, sy, sz);
+                }
+
                 bool haveObj = TryReadPlayerObjectPos(out float ox, out float oy, out float oz);
                 bool haveGlobal = TryReadGlobalXY(out float gx, out float gy);
 
@@ -134,6 +151,69 @@ namespace xajh
                 return (x, y, z);
             }
             catch { return Cached(); }
+        }
+
+        bool TryReadSimpleChainPos(
+            out float x, out float y, out float z,
+            out int mgrOff, out int objOff, out int posOff, out IntPtr playerObj)
+        {
+            x = 0f; y = 0f; z = 0f;
+            mgrOff = 0; objOff = 0; posOff = 0; playerObj = IntPtr.Zero;
+            float bestScore = float.MinValue;
+
+            var mgrOrder = new List<int> { _preferredMgrOffset };
+            foreach (int mo in _candidateMgrOffsets)
+                if (mo != _preferredMgrOffset) mgrOrder.Add(mo);
+
+            foreach (int mo in mgrOrder)
+            {
+                int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, mo));
+                if (mgr == 0) continue;
+
+                foreach (int lo in _candidateListOffsets)
+                {
+                    int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), lo));
+                    if (list == 0) continue;
+
+                    foreach (int oo in _candidateObjOffsets)
+                    {
+                        int raw = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), oo));
+                        if (raw == 0) continue;
+                        var p = new IntPtr((uint)raw);
+
+                        foreach (int po in _candidatePosOffsets)
+                        {
+                            if (!TryReadPosAtOffset(p, po, out float tx, out float ty, out float tz))
+                                continue;
+
+                            float score = 0f;
+                            if (mo == _preferredMgrOffset) score += 2f;
+                            if (oo == _preferredObjOffset) score += 1f;
+                            if (po == _preferredPosOffset) score += 2f;
+                            if (oo == DefaultPlayerObjOffset) score += 1f;
+                            if (po == DefaultPosOffset) score += 1f;
+                            if (_hasCache)
+                            {
+                                double d = DistXY(tx, ty, _cx, _cy);
+                                if (d <= 20f) score += 4f;
+                                else if (d <= 300f) score += 2f;
+                                else if (d <= 3000f) score -= 1f;
+                                else score -= 4f;
+                            }
+
+                            if (score > bestScore)
+                            {
+                                bestScore = score;
+                                x = tx; y = ty; z = tz;
+                                mgrOff = mo; objOff = oo; posOff = po;
+                                playerObj = p;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return playerObj != IntPtr.Zero;
         }
 
         bool TryReadGlobalXY(out float x, out float y)
