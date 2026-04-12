@@ -250,7 +250,7 @@ namespace Xajh
                             Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
                             var dbg = playerReader.GetDebugSnapshot();
                             Console.WriteLine(
-                                $"  [DBG] src={dbg.Source} off=0x{dbg.ObjOffset:X2} pos=0x{dbg.PosOffset:X2} obj=0x{dbg.PlayerObj.ToInt64():X8} " +
+                                $"  [DBG] src={dbg.Source} mgr=0x{dbg.MgrOffset:X} off=0x{dbg.ObjOffset:X2} pos=0x{dbg.PosOffset:X2} obj=0x{dbg.PlayerObj.ToInt64():X8} " +
                                 $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1})");
 
                             // NPC list

@@ -52,7 +52,11 @@ namespace xajh
         const int DefaultPosOffset = 0x94;
         readonly int[] _candidateMgrOffsets =
         {
-            0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C
+            0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C, 0x9D4524, 0x9D450C
+        };
+        readonly int[] _candidateListOffsets =
+        {
+            0x08, 0x0C, 0x04, 0x10, 0x14
         };
         readonly int[] _candidateObjOffsets =
         {
@@ -74,6 +78,7 @@ namespace xajh
         readonly Dictionary<int, (float x, float y, float z)> _lastObjPosByOffset = new Dictionary<int, (float x, float y, float z)>();
         int _preferredObjStaticReads = 0;
         int _preferredMgrOffset = (int)MgrOffset;
+        long _nextDeepMgrScanAtTicks = 0;
         IntPtr _dbgPlayerObj = IntPtr.Zero;
         int _dbgMgrOffset = 0;
         int _dbgObjOffset = 0;
@@ -259,24 +264,37 @@ namespace xajh
         {
             playerObj = IntPtr.Zero;
             _dbgPlayerObj = IntPtr.Zero;
+            _dbgMgrOffset = 0;
             _dbgObjOffset = 0;
             _dbgPosOffset = 0;
             _dbgRawX = float.NaN; _dbgRawY = float.NaN; _dbgRawZ = float.NaN;
             _dbgSource = "none";
             try
             {
-                int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
+                // Fast path: preferred manager offset first.
+                int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, _preferredMgrOffset));
                 if (mgr != 0)
                 {
-                    int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
-                    if (list != 0 && TryResolveFromList(list, "main", out playerObj))
-                        return true;
+                    foreach (int listOff in _candidateListOffsets)
+                    {
+                        int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), listOff));
+                        if (list != 0 && TryResolveFromList(list, "main", _preferredMgrOffset, out playerObj))
+                            return true;
+                    }
                 }
 
                 // Hard fallback: map/session specific manager chains can move.
                 // Probe nearby static manager/list variants before giving up.
                 if (TryResolveFromMgrScans(out playerObj))
                     return true;
+
+                long now = Environment.TickCount64;
+                if (now >= _nextDeepMgrScanAtTicks)
+                {
+                    _nextDeepMgrScanAtTicks = now + 2000;
+                    if (TryResolveFromDeepStaticScan(out playerObj))
+                        return true;
+                }
 
                 _dbgSource = mgr == 0 ? "mgr=0" : "list/obj=0";
                 return false;
@@ -285,6 +303,13 @@ namespace xajh
             {
                 if (TryResolveFromMgrScans(out playerObj))
                     return true;
+                long now = Environment.TickCount64;
+                if (now >= _nextDeepMgrScanAtTicks)
+                {
+                    _nextDeepMgrScanAtTicks = now + 2000;
+                    if (TryResolveFromDeepStaticScan(out playerObj))
+                        return true;
+                }
                 _dbgSource = "obj-ex";
                 return false;
             }
@@ -293,20 +318,18 @@ namespace xajh
         bool TryResolveFromMgrScans(out IntPtr playerObj)
         {
             playerObj = IntPtr.Zero;
-            int[] mgrOffsets = { 0x9D4518, 0x9D4514, 0x9D451C, 0x9D4520, 0x9D4510, 0x9D4524 };
-            int[] listOffsets = { 0x08, 0x0C, 0x04, 0x10 };
             var seenLists = new HashSet<int>();
 
-            foreach (int mgrOff in mgrOffsets)
+            foreach (int mgrOff in _candidateMgrOffsets)
             {
                 int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, mgrOff));
                 if (mgr == 0) continue;
 
-                foreach (int listOff in listOffsets)
+                foreach (int listOff in _candidateListOffsets)
                 {
                     int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), listOff));
                     if (list == 0 || !seenLists.Add(list)) continue;
-                    if (TryResolveFromList(list, $"mgrscan({mgrOff:X},{listOff:X})", out playerObj))
+                    if (TryResolveFromList(list, $"mgrscan({mgrOff:X},{listOff:X})", mgrOff, out playerObj))
                         return true;
                 }
             }
@@ -314,7 +337,27 @@ namespace xajh
             return false;
         }
 
-        bool TryResolveFromList(int list, string sourceTag, out IntPtr playerObj)
+        bool TryResolveFromDeepStaticScan(out IntPtr playerObj)
+        {
+            playerObj = IntPtr.Zero;
+            var seenLists = new HashSet<int>();
+            for (int mgrOff = 0x9D4400; mgrOff <= 0x9D4580; mgrOff += 4)
+            {
+                int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, mgrOff));
+                if (mgr < 0x00100000) continue;
+
+                foreach (int listOff in _candidateListOffsets)
+                {
+                    int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), listOff));
+                    if (list < 0x00100000 || !seenLists.Add(list)) continue;
+                    if (TryResolveFromList(list, $"deepscan({mgrOff:X},{listOff:X})", mgrOff, out playerObj))
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        bool TryResolveFromList(int list, string sourceTag, int mgrOff, out IntPtr playerObj)
         {
             playerObj = IntPtr.Zero;
 
@@ -352,6 +395,7 @@ namespace xajh
                 playerObj = rawPick.p;
                 _preferredObjOffset = rawPick.off;
                 _dbgPlayerObj = rawPick.p;
+                _dbgMgrOffset = mgrOff;
                 _dbgObjOffset = rawPick.off;
                 _dbgSource = $"{sourceTag}-fallback-raw";
                 return true;
@@ -420,8 +464,10 @@ namespace xajh
                 _lastObjPosByOffset[c.off] = (c.x, c.y, c.z);
 
             _preferredObjOffset = bestOffset;
+            _preferredMgrOffset = mgrOff;
             playerObj = bestPtr;
             _dbgPlayerObj = bestPtr;
+            _dbgMgrOffset = mgrOff;
             _dbgObjOffset = bestOffset;
             _dbgRawX = bestX; _dbgRawY = bestY; _dbgRawZ = bestZ;
             _dbgSource = bestOffset == DefaultPlayerObjOffset
