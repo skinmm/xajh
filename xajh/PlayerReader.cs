@@ -23,6 +23,7 @@ namespace xajh
 
         public readonly struct DebugSnapshot
         {
+            public readonly int MgrOffset;     // module offset used for player manager*
             public readonly IntPtr PlayerObj;
             public readonly int ObjOffset;     // offset in player list node -> playerObj*
             public readonly int PosOffset;     // offset in playerObj -> XYZ block
@@ -31,8 +32,9 @@ namespace xajh
             public readonly float RawZ;
             public readonly string Source;
 
-            public DebugSnapshot(IntPtr playerObj, int objOffset, int posOffset, float rawX, float rawY, float rawZ, string source)
+            public DebugSnapshot(int mgrOffset, IntPtr playerObj, int objOffset, int posOffset, float rawX, float rawY, float rawZ, string source)
             {
+                MgrOffset = mgrOffset;
                 PlayerObj = playerObj;
                 ObjOffset = objOffset;
                 PosOffset = posOffset;
@@ -48,6 +50,10 @@ namespace xajh
         const int ListOffset = 0x08;
         const int DefaultPlayerObjOffset = 0x4C;
         const int DefaultPosOffset = 0x94;
+        readonly int[] _candidateMgrOffsets =
+        {
+            0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C
+        };
         readonly int[] _candidateObjOffsets =
         {
             0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C, 0x5C, 0x38, 0x60
@@ -67,7 +73,9 @@ namespace xajh
         int _preferredPosStaticReads = 0;
         readonly Dictionary<int, (float x, float y, float z)> _lastObjPosByOffset = new Dictionary<int, (float x, float y, float z)>();
         int _preferredObjStaticReads = 0;
+        int _preferredMgrOffset = (int)MgrOffset;
         IntPtr _dbgPlayerObj = IntPtr.Zero;
+        int _dbgMgrOffset = 0;
         int _dbgObjOffset = 0;
         int _dbgPosOffset = 0;
         float _dbgRawX = float.NaN, _dbgRawY = float.NaN, _dbgRawZ = float.NaN;
@@ -76,7 +84,7 @@ namespace xajh
         public PlayerReader(IntPtr h, IntPtr m) { _h = h; _m = m; }
 
         public DebugSnapshot GetDebugSnapshot()
-            => new DebugSnapshot(_dbgPlayerObj, _dbgObjOffset, _dbgPosOffset, _dbgRawX, _dbgRawY, _dbgRawZ, _dbgSource);
+            => new DebugSnapshot(_dbgMgrOffset, _dbgPlayerObj, _dbgObjOffset, _dbgPosOffset, _dbgRawX, _dbgRawY, _dbgRawZ, _dbgSource);
 
         public (float x, float y, float z) Get()
         {
@@ -255,20 +263,60 @@ namespace xajh
             _dbgPosOffset = 0;
             _dbgRawX = float.NaN; _dbgRawY = float.NaN; _dbgRawZ = float.NaN;
             _dbgSource = "none";
-
-            int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
-            if (mgr == 0)
+            try
             {
-                _dbgSource = "mgr=0";
+                int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
+                if (mgr != 0)
+                {
+                    int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
+                    if (list != 0 && TryResolveFromList(list, "main", out playerObj))
+                        return true;
+                }
+
+                // Hard fallback: map/session specific manager chains can move.
+                // Probe nearby static manager/list variants before giving up.
+                if (TryResolveFromMgrScans(out playerObj))
+                    return true;
+
+                _dbgSource = mgr == 0 ? "mgr=0" : "list/obj=0";
                 return false;
             }
-
-            int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
-            if (list == 0)
+            catch
             {
-                _dbgSource = "list=0";
+                if (TryResolveFromMgrScans(out playerObj))
+                    return true;
+                _dbgSource = "obj-ex";
                 return false;
             }
+        }
+
+        bool TryResolveFromMgrScans(out IntPtr playerObj)
+        {
+            playerObj = IntPtr.Zero;
+            int[] mgrOffsets = { 0x9D4518, 0x9D4514, 0x9D451C, 0x9D4520, 0x9D4510, 0x9D4524 };
+            int[] listOffsets = { 0x08, 0x0C, 0x04, 0x10 };
+            var seenLists = new HashSet<int>();
+
+            foreach (int mgrOff in mgrOffsets)
+            {
+                int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, mgrOff));
+                if (mgr == 0) continue;
+
+                foreach (int listOff in listOffsets)
+                {
+                    int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), listOff));
+                    if (list == 0 || !seenLists.Add(list)) continue;
+                    if (TryResolveFromList(list, $"mgrscan({mgrOff:X},{listOff:X})", out playerObj))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        bool TryResolveFromList(int list, string sourceTag, out IntPtr playerObj)
+        {
+            playerObj = IntPtr.Zero;
 
             // Probe nearby offsets with continuity and anti-stale scoring.
             var rawCandidates = new List<(int off, IntPtr p)>();
@@ -288,10 +336,7 @@ namespace xajh
             }
 
             if (rawCandidates.Count == 0)
-            {
-                _dbgSource = "obj=0";
                 return false;
-            }
 
             if (candidates.Count == 0)
             {
@@ -308,7 +353,7 @@ namespace xajh
                 _preferredObjOffset = rawPick.off;
                 _dbgPlayerObj = rawPick.p;
                 _dbgObjOffset = rawPick.off;
-                _dbgSource = "fallback-raw";
+                _dbgSource = $"{sourceTag}-fallback-raw";
                 return true;
             }
 
@@ -379,7 +424,9 @@ namespace xajh
             _dbgPlayerObj = bestPtr;
             _dbgObjOffset = bestOffset;
             _dbgRawX = bestX; _dbgRawY = bestY; _dbgRawZ = bestZ;
-            _dbgSource = bestOffset == DefaultPlayerObjOffset ? "default" : "scan";
+            _dbgSource = bestOffset == DefaultPlayerObjOffset
+                ? $"{sourceTag}-default"
+                : $"{sourceTag}-scan";
             return true;
         }
 
