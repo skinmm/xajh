@@ -126,7 +126,6 @@ namespace Xajh
             var npcReader = new NpcReader(hProcess, moduleBase);
             var playerReader = new PlayerReader(hProcess, moduleBase);
             var combat = new CombatOverlay(hProcess, moduleBase);
-            PlayerReader.SetGlobalPosLocked(false);
 
             // Re-acquire window handle (game may create a new window after login)
             IntPtr GetGameHwnd()
