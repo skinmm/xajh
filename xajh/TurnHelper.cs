@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -22,23 +21,6 @@ namespace xajh
     public class TurnHelper
     {
         // ── Win32 ─────────────────────────────────────────────────────────────
-        [StructLayout(LayoutKind.Sequential)]
-        struct INPUT { public int type; public MOUSEINPUT mi; }
-
-        [StructLayout(LayoutKind.Sequential)]
-        struct MOUSEINPUT
-        {
-            public int dx, dy;
-            public uint mouseData, dwFlags, time;
-            public IntPtr dwExtraInfo;
-            public int padA, padB;
-        }
-
-        const int INPUT_MOUSE = 0;
-        const uint MOUSEEVENTF_MOVE = 0x0001;
-        const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
-        const uint MOUSEEVENTF_RIGHTUP = 0x0010;
-
         // Window messages
         const uint WM_MOUSEMOVE = 0x0200;
         const uint WM_RBUTTONDOWN = 0x0204;
@@ -46,16 +28,11 @@ namespace xajh
         const uint WM_KEYDOWN = 0x0100;
         const uint WM_KEYUP = 0x0101;
         const int MK_RBUTTON = 0x0002;
-        const int VK_W = 0x57;
-
-        [DllImport("user32.dll", SetLastError = true)]
-        static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+        const int VK_X = 0x58;
+        const int VK_F = 0x46;
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -69,12 +46,18 @@ namespace xajh
 
         // ── State ─────────────────────────────────────────────────────────────
         private readonly IntPtr _hProcess;
+        private readonly IntPtr _moduleBase;
         private readonly IntPtr _gameHwnd;
         private float _pixelsPerRadian = 0f;     // 0 = uncalibrated
 
-        public TurnHelper(IntPtr hProcess, IntPtr gameHwnd)
+        const int PlayerMgrOffset = 0x9D4518;
+        const int PlayerListOffset = 0x08;
+        const int PlayerObjOffset = 0x4C;
+
+        public TurnHelper(IntPtr hProcess, IntPtr moduleBase, IntPtr gameHwnd)
         {
             _hProcess = hProcess;
+            _moduleBase = moduleBase;
             _gameHwnd = gameHwnd;
         }
 
@@ -91,15 +74,8 @@ namespace xajh
         }
 
         /// <summary>
-        /// Turn the player so it faces (tx, tz) from (px, pz).
-        /// Auto-calibrates on first use, then closed-loop corrects until
-        /// the error is below ~3°.
-        /// </summary>
-        /// <summary>
-        /// Turn to face (tx, ty) from (px, py). Current yaw is measured by
-        /// tapping forward and observing the position delta — the display
-        /// matrix yaw is in a different coordinate frame than world X/Y.
-        /// Needs a delegate to read player position.
+        /// Turn to face (tx, ty) from (px, py) WITHOUT moving the player.
+        /// Uses player matrix yaw + right-drag input only.
         /// </summary>
         public string FaceTarget(Func<(float x, float y, float z)> readPos,
                                  float tx, float ty)
@@ -110,14 +86,20 @@ namespace xajh
                 SetForegroundWindow(_gameHwnd);
             Thread.Sleep(80);
 
-            float curYaw = MeasureYaw(readPos);
+            int playerObj = GetPlayerObject();
+            if (playerObj == 0)
+                return "[!] Player object not found";
+
+            float curYaw = ReadPlayerYaw(playerObj);
             if (float.IsNaN(curYaw))
-                return "[!] Auto-run produced no motion. Key blocked or path obstructed?";
+                return "[!] Failed to read current yaw";
 
             var (px, py, _) = readPos();
             float dx = tx - px;
             float dy = ty - py;
-            float targetYaw = (float)Math.Atan2(dx, dy);
+            // Matrix yaw is opposite of world-vector yaw in this client, so
+            // add PI to align "face target" with actual model orientation.
+            float targetYaw = (float)Math.Atan2(dx, dy) + (float)Math.PI;
 
             float delta = targetYaw - curYaw;
             while (delta > Math.PI) delta -= 2f * (float)Math.PI;
@@ -127,60 +109,48 @@ namespace xajh
             {
                 const int TestPx = 200;
                 DragTurn(TestPx);
-                Thread.Sleep(150);
-                float newYaw = MeasureYaw(readPos);
+                Thread.Sleep(120);
+
+                int playerObjAfterDrag = GetPlayerObject();
+                if (playerObjAfterDrag == 0)
+                    return "[!] Cal failed: player object not found after drag";
+
+                float newYaw = ReadPlayerYaw(playerObjAfterDrag);
                 if (float.IsNaN(newYaw))
-                    return "[!] Cal: second measurement failed";
+                    return "[!] Cal failed: second yaw read failed";
+
                 float yawChange = newYaw - curYaw;
                 while (yawChange > Math.PI) yawChange -= 2f * (float)Math.PI;
                 while (yawChange < -Math.PI) yawChange += 2f * (float)Math.PI;
-                if (Math.Abs(yawChange) < 0.05f)
+                if (Math.Abs(yawChange) < 0.01f)
                     return $"[!] Cal failed: drag={TestPx}px gave yawΔ={yawChange:F2}";
+
                 _pixelsPerRadian = TestPx / yawChange;
                 curYaw = newYaw;
-                var (cx, cy, _) = readPos();
-                dx = tx - cx; dy = ty - cy;
-                targetYaw = (float)Math.Atan2(dx, dy);
+            }
+
+            int pixels = 0;
+            for (int i = 0; i < 2; i++)
+            {
                 delta = targetYaw - curYaw;
                 while (delta > Math.PI) delta -= 2f * (float)Math.PI;
                 while (delta < -Math.PI) delta += 2f * (float)Math.PI;
+
+                pixels = (int)Math.Round(delta * _pixelsPerRadian);
+                if (pixels == 0 && Math.Abs(delta) > 0.03f)
+                    pixels = delta > 0f ? 1 : -1;
+
+                DragTurn(pixels);
+                Thread.Sleep(80);
+
+                int pObj = GetPlayerObject();
+                if (pObj == 0) break;
+                float newYaw = ReadPlayerYaw(pObj);
+                if (float.IsNaN(newYaw)) break;
+                curYaw = newYaw;
             }
 
-            int pixels = (int)Math.Round(delta * _pixelsPerRadian);
-            DragTurn(pixels);
             return $"cur={curYaw:F2} tgt={targetYaw:F2} Δ={delta:F2} ({pixels}px) cal={_pixelsPerRadian:F0}";
-        }
-
-        const int VK_OEM_3 = 0xC0;   // backtick `
-
-        /// <summary>Toggle auto-run by pressing the backtick key.</summary>
-        private void ToggleAutoRun()
-        {
-            if (_gameHwnd == IntPtr.Zero) return;
-            PostMessage(_gameHwnd, WM_KEYDOWN, (IntPtr)VK_OEM_3, (IntPtr)0x00290001);
-            Thread.Sleep(30);
-            PostMessage(_gameHwnd, WM_KEYUP, (IntPtr)VK_OEM_3, unchecked((IntPtr)0xC0290001));
-        }
-
-        /// <summary>
-        /// Measure world yaw by toggling auto-run on, sampling two positions,
-        /// then toggling it off. Returns NaN if motion too small.
-        /// </summary>
-        private float MeasureYaw(Func<(float x, float y, float z)> readPos)
-        {
-            ToggleAutoRun();
-            Thread.Sleep(400);
-            var (x1, y1, _) = readPos();
-            Thread.Sleep(250);
-            var (x2, y2, _) = readPos();
-            ToggleAutoRun();
-            Thread.Sleep(100);
-
-            float dx = x2 - x1;
-            float dy = y2 - y1;
-            float mag = (float)Math.Sqrt(dx * dx + dy * dy);
-            if (mag < 2f) return float.NaN;
-            return (float)Math.Atan2(dx, dy);
         }
 
 
@@ -236,22 +206,33 @@ namespace xajh
 
         public void ResetCalibration() => _pixelsPerRadian = 0f;
 
-        private static void Send(int dx, int dy, uint flags)
+        /// <summary>
+        /// Target nearest NPC then start fight by sending "X" then "F".
+        /// </summary>
+        public bool TriggerTargetAndFight()
         {
-            var inp = new INPUT
-            {
-                type = INPUT_MOUSE,
-                mi = new MOUSEINPUT
-                {
-                    dx = dx,
-                    dy = dy,
-                    mouseData = 0,
-                    dwFlags = flags,
-                    time = 0,
-                    dwExtraInfo = IntPtr.Zero
-                }
-            };
-            SendInput(1, new[] { inp }, Marshal.SizeOf<INPUT>());
+            if (_gameHwnd == IntPtr.Zero) return false;
+
+            // Keep behavior consistent with turn logic: ensure game is active.
+            SetForegroundWindow(_gameHwnd);
+            Thread.Sleep(30);
+            bool targetDown = PostMessage(_gameHwnd, WM_KEYDOWN, (IntPtr)VK_X, IntPtr.Zero);
+            Thread.Sleep(20);
+            bool targetUp = PostMessage(_gameHwnd, WM_KEYUP, (IntPtr)VK_X, IntPtr.Zero);
+            Thread.Sleep(40);
+            bool fightDown = PostMessage(_gameHwnd, WM_KEYDOWN, (IntPtr)VK_F, IntPtr.Zero);
+            Thread.Sleep(20);
+            bool fightUp = PostMessage(_gameHwnd, WM_KEYUP, (IntPtr)VK_F, IntPtr.Zero);
+            return targetDown && targetUp && fightDown && fightUp;
+        }
+
+        private int GetPlayerObject()
+        {
+            int mgr = MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(_moduleBase, PlayerMgrOffset));
+            if (mgr == 0) return 0;
+            int list = MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(new IntPtr((uint)mgr), PlayerListOffset));
+            if (list == 0) return 0;
+            return MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(new IntPtr((uint)list), PlayerObjOffset));
         }
     }
 }

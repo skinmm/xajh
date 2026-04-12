@@ -27,6 +27,28 @@ namespace Xajh
         static void Main(string[] args)
         {
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            static IntPtr Ptr32(int value) => new IntPtr(value);
+            static IntPtr Ptr32Add(int baseValue, int offset) => new IntPtr(unchecked(baseValue + offset));
+            int[] directMgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D4524, 0x9D450C };
+            int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
+            int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
+            int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0xA4, 0xB4, 0xD4, 0xE4, 0x104, 0x114 };
+            int[] directPtrOffsets = { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C };
+            int[] directSubPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30 };
+            int preferredDirectMgr = 0x9D4518;
+            int preferredDirectList = 0x08;
+            int preferredDirectObj = 0x4C;
+            int preferredDirectLink = -1; // -1 = root object, otherwise pointer field offset
+            int preferredDirectPos = 0x94;
+            bool hasDirectCache = false;
+            float directCx = 0f, directCy = 0f, directCz = 0f;
+            int preferredDirectStaticReads = 0;
+            var directLastByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), (float x, float y)>();
+            bool directCalibrating = false;
+            long directCalibEndTicks = 0;
+            var directCalibStartByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), (float x, float y)>();
+            (int mgr, int list, int obj, int link, int pos)? directCalibLock = null;
+            var directMotionByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), float>();
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
@@ -35,12 +57,425 @@ namespace Xajh
                 return (playerMgr != 0, npcMgr != 0);
             }
 
-            (Process game, IntPtr moduleBase, IntPtr hProcess) SelectGameProcess(Process[] procs)
+            bool TryReadStablePos(IntPtr hProcess, IntPtr playerObj, int posOff, out float x, out float y, out float z)
+            {
+                x = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff));
+                y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff + 4));
+                z = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff + 8));
+                if (float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z)) return false;
+                if (float.IsInfinity(x) || float.IsInfinity(y) || float.IsInfinity(z)) return false;
+                if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f || Math.Abs(z) > 1_000_000f) return false;
+                if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) return false;
+
+                // Read twice to reject clearly volatile/garbage pointers.
+                float x2 = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff));
+                float y2 = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff + 4));
+                float z2 = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff + 8));
+                if (Math.Abs(x2 - x) > 200f || Math.Abs(y2 - y) > 200f || Math.Abs(z2 - z) > 200f)
+                    return false;
+                return true;
+            }
+
+            bool TryReadTripletFromBuffer(byte[] buf, int read, int off, out float x, out float y, out float z)
+            {
+                x = 0f; y = 0f; z = 0f;
+                if (off < 0 || off + 12 > read) return false;
+                x = BitConverter.ToSingle(buf, off);
+                y = BitConverter.ToSingle(buf, off + 4);
+                z = BitConverter.ToSingle(buf, off + 8);
+                if (float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z)) return false;
+                if (float.IsInfinity(x) || float.IsInfinity(y) || float.IsInfinity(z)) return false;
+                if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f || Math.Abs(z) > 1_000_000f) return false;
+                if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) return false;
+                return true;
+            }
+
+            void CollectPosCandidatesFromAddress(
+                IntPtr hProcess, IntPtr objAddr, int scanLength, int[] seedOffsets,
+                List<(int po, float x, float y, float z, bool seeded)> outList)
+            {
+                var buf = new byte[scanLength];
+                if (!MemoryHelper.ReadProcessMemory(hProcess, objAddr, buf, scanLength, out int read) || read < 0x40)
+                    return;
+
+                var seen = new HashSet<int>();
+                foreach (int po in seedOffsets)
+                {
+                    if (!seen.Add(po)) continue;
+                    if (TryReadTripletFromBuffer(buf, read, po, out float x, out float y, out float z))
+                        outList.Add((po, x, y, z, true));
+                }
+
+                // Wider scan to discover moving coordinates that are not at known offsets.
+                for (int po = 0x20; po + 12 <= read; po += 4)
+                {
+                    if (!seen.Add(po)) continue;
+                    if (!TryReadTripletFromBuffer(buf, read, po, out float x, out float y, out float z))
+                        continue;
+                    outList.Add((po, x, y, z, false));
+                    if (outList.Count >= 180) break;
+                }
+            }
+
+            bool TryReadDirectPlayerPos(
+                IntPtr hProcess, IntPtr moduleBase,
+                out float x, out float y, out float z, out string source)
+            {
+                x = 0f; y = 0f; z = 0f; source = "direct:none";
+
+                // Strict lock mode: when calibration selected a chain, never hop to unrelated chains.
+                if (directCalibLock.HasValue)
+                {
+                    var lk = directCalibLock.Value;
+                    int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, lk.mgr));
+                    if (mgr != 0)
+                    {
+                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lk.list));
+                        if (list != 0)
+                        {
+                            int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, lk.obj));
+                            if (raw != 0)
+                            {
+                                int targetRaw = raw;
+                                if (lk.link != -1)
+                                {
+                                    int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, lk.link));
+                                    targetRaw = (subRaw != 0 && subRaw != raw) ? subRaw : 0;
+                                }
+
+                                if (targetRaw != 0)
+                                {
+                                    var targetPtr = Ptr32(targetRaw);
+
+                                    // Exact locked position offset first.
+                                    if (TryReadStablePos(hProcess, targetPtr, lk.pos, out x, out y, out z))
+                                    {
+                                        preferredDirectMgr = lk.mgr;
+                                        preferredDirectList = lk.list;
+                                        preferredDirectObj = lk.obj;
+                                        preferredDirectLink = lk.link;
+                                        preferredDirectPos = lk.pos;
+                                        directCx = x; directCy = y; directCz = z; hasDirectCache = true;
+                                        string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
+                                        source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lk.pos:X2},pref-lock)";
+                                        return true;
+                                    }
+
+                                    // Same chain relaxed fallback: allow pos offset switch but keep locked chain.
+                                    var lockPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                                    int[] seeds = lk.link == -1 ? directPosOffsets : directSubPosOffsets;
+                                    int scanLen = lk.link == -1 ? 0x240 : 0x180;
+                                    CollectPosCandidatesFromAddress(hProcess, targetPtr, scanLen, seeds, lockPosCandidates);
+                                    if (lockPosCandidates.Count > 0)
+                                    {
+                                        float best = float.MinValue;
+                                        int bestPos = lk.pos;
+                                        float bx = 0f, by = 0f, bz = 0f;
+                                        foreach (var c in lockPosCandidates)
+                                        {
+                                            float s = 0f;
+                                            if (c.po == lk.pos) s += 2f;
+                                            if (c.po == preferredDirectPos) s += 1f;
+                                            if (hasDirectCache)
+                                            {
+                                                double d = Math.Sqrt(Math.Pow(c.x - directCx, 2) + Math.Pow(c.y - directCy, 2));
+                                                if (d <= 30f) s += 4f;
+                                                else if (d <= 300f) s += 2f;
+                                                else if (d > 3000f) s -= 3f;
+                                            }
+                                            if (directMotionByKey.TryGetValue((lk.mgr, lk.list, lk.obj, lk.link, c.po), out float mv))
+                                                s += Math.Min(mv, 10f);
+                                            if (s > best)
+                                            {
+                                                best = s;
+                                                bestPos = c.po;
+                                                bx = c.x; by = c.y; bz = c.z;
+                                            }
+                                        }
+
+                                        x = bx; y = by; z = bz;
+                                        preferredDirectMgr = lk.mgr;
+                                        preferredDirectList = lk.list;
+                                        preferredDirectObj = lk.obj;
+                                        preferredDirectLink = lk.link;
+                                        preferredDirectPos = bestPos;
+                                        directCalibLock = (lk.mgr, lk.list, lk.obj, lk.link, bestPos);
+                                        directCx = x; directCy = y; directCz = z; hasDirectCache = true;
+                                        string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
+                                        source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{bestPos:X2},pref-lock-relaxed)";
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Final strict lock fallback: keep last locked position instead of hopping chains.
+                    if (hasDirectCache)
+                    {
+                        x = directCx; y = directCy; z = directCz;
+                        string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
+                        source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lk.pos:X2},pref-lock-cache)";
+                        return true;
+                    }
+                }
+
+                var samples = new List<(int mo, int lo, int oo, int link, int po, float x, float y, float z, bool seeded)>();
+
+                var mgrOrder = new List<int> { preferredDirectMgr };
+                foreach (int mo in directMgrOffsets)
+                    if (mo != preferredDirectMgr) mgrOrder.Add(mo);
+
+                void CollectSamples(int[] mgrSet, int[] listSet, int[] objSet)
+                {
+                    foreach (int mo in mgrSet)
+                    {
+                        int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, mo));
+                        if (mgr == 0) continue;
+
+                        foreach (int lo in listSet)
+                        {
+                            int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lo));
+                            if (list == 0) continue;
+
+                            foreach (int oo in objSet)
+                            {
+                                int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, oo));
+                                if (raw == 0) continue;
+                                var pobj = Ptr32(raw);
+
+                                // Root object position candidates.
+                                var rootPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                                CollectPosCandidatesFromAddress(hProcess, pobj, 0x240, directPosOffsets, rootPosCandidates);
+                                foreach (var c in rootPosCandidates)
+                                    samples.Add((mo, lo, oo, -1, c.po, c.x, c.y, c.z, c.seeded));
+
+                                // One-level pointer-linked sub-objects; many maps keep moving
+                                // world coords in a linked child object while root looks static.
+                                foreach (int linkOff in directPtrOffsets)
+                                {
+                                    int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, linkOff));
+                                    if (subRaw == 0 || subRaw == raw) continue;
+                                    if (subRaw < 0x00100000) continue;
+
+                                    var subObj = Ptr32(subRaw);
+                                    var subPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                                    CollectPosCandidatesFromAddress(hProcess, subObj, 0x180, directSubPosOffsets, subPosCandidates);
+                                    foreach (var c in subPosCandidates)
+                                        samples.Add((mo, lo, oo, linkOff, c.po, c.x, c.y, c.z, c.seeded));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Phase 1: strict player chain family only.
+                int[] primaryMgr = { 0x9D4518, 0x9D4514 };
+                int[] primaryList = { 0x08 };
+                int[] primaryObj = { 0x4C, 0x48 };
+                CollectSamples(primaryMgr, primaryList, primaryObj);
+
+                // Phase 2: broader fallback only if strict chain found nothing.
+                if (samples.Count == 0)
+                    CollectSamples(mgrOrder.ToArray(), directListOffsets, directObjOffsets);
+
+                if (samples.Count == 0) return false;
+
+                bool preferredLooksStatic = false;
+                bool anyAltMoved = false;
+                foreach (var s in samples)
+                {
+                    bool isPref = s.mo == preferredDirectMgr &&
+                                  s.lo == preferredDirectList &&
+                                  s.oo == preferredDirectObj &&
+                                  s.link == preferredDirectLink &&
+                                  s.po == preferredDirectPos;
+
+                    if (isPref && hasDirectCache)
+                    {
+                        double d = Math.Sqrt(Math.Pow(s.x - directCx, 2) + Math.Pow(s.y - directCy, 2));
+                        if (d < 0.01) preferredLooksStatic = true;
+                    }
+
+                    if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.link, s.po), out var last))
+                    {
+                        double dSelf = Math.Sqrt(Math.Pow(s.x - last.x, 2) + Math.Pow(s.y - last.y, 2));
+                        if (isPref && dSelf < 0.01) preferredLooksStatic = true;
+                        if (!isPref && dSelf > 0.2 && dSelf <= 3000.0) anyAltMoved = true;
+                    }
+                }
+
+                if (preferredLooksStatic && anyAltMoved)
+                    preferredDirectStaticReads++;
+                else
+                    preferredDirectStaticReads = 0;
+
+                float bestScore = float.MinValue;
+                int bestMgr = 0, bestList = 0, bestObj = 0, bestLink = -1, bestPos = 0;
+                foreach (var s in samples)
+                {
+                    bool isPref = s.mo == preferredDirectMgr &&
+                                  s.lo == preferredDirectList &&
+                                  s.oo == preferredDirectObj &&
+                                  s.link == preferredDirectLink &&
+                                  s.po == preferredDirectPos;
+                    float score = 0f;
+                    if (s.mo == preferredDirectMgr) score += 2f;
+                    if (s.lo == preferredDirectList) score += 1f;
+                    if (s.oo == preferredDirectObj) score += 1f;
+                    if (s.link == preferredDirectLink) score += 1f;
+                    if (s.po == preferredDirectPos) score += 2f;
+                    if (s.lo == 0x08) score += 1f;
+                    if (s.oo == 0x4C) score += 1f;
+                    if (s.oo == 0x48) score += 0.7f;
+                    if (s.link == -1 && s.po == 0x94) score += 0.5f;
+                    if (s.link != -1) score += 0.5f;
+                    if (!s.seeded) score -= 0.35f;
+
+                    if (hasDirectCache)
+                    {
+                        double d = Math.Sqrt(Math.Pow(s.x - directCx, 2) + Math.Pow(s.y - directCy, 2));
+                        if (d <= 20f) score += 4f;
+                        else if (d <= 300f) score += 2f;
+                        else if (d <= 3000f) score -= 1f;
+                        else score -= 4f;
+                    }
+
+                    if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.link, s.po), out var last))
+                    {
+                        double dSelf = Math.Sqrt(Math.Pow(s.x - last.x, 2) + Math.Pow(s.y - last.y, 2));
+                        if (dSelf > 0.2 && dSelf <= 3000f) score += 3.5f;
+                        else if (dSelf < 0.01) score -= 1f;
+                    }
+                    if (directMotionByKey.TryGetValue((s.mo, s.lo, s.oo, s.link, s.po), out float mv))
+                        score += Math.Min(mv, 10f);
+
+                    if (isPref && preferredDirectStaticReads >= 2)
+                        score -= 10f;
+                    if (!isPref && preferredDirectStaticReads >= 2)
+                        score += 2f;
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        x = s.x; y = s.y; z = s.z;
+                        bestMgr = s.mo; bestList = s.lo; bestObj = s.oo; bestLink = s.link; bestPos = s.po;
+                    }
+                }
+
+                foreach (var s in samples)
+                {
+                    var k = (s.mo, s.lo, s.oo, s.link, s.po);
+                    if (directLastByKey.TryGetValue(k, out var last))
+                    {
+                        float old = directMotionByKey.TryGetValue(k, out float om) ? om : 0f;
+                        double dSelf = Math.Sqrt(Math.Pow(s.x - last.x, 2) + Math.Pow(s.y - last.y, 2));
+                        float impulse = dSelf > 0.05 ? (float)Math.Min(dSelf, 25.0) : 0f;
+                        directMotionByKey[k] = old * 0.85f + impulse;
+                    }
+                    else
+                    {
+                        if (!directMotionByKey.ContainsKey(k))
+                            directMotionByKey[k] = 0f;
+                    }
+                    directLastByKey[k] = (s.x, s.y);
+                }
+
+                preferredDirectMgr = bestMgr;
+                preferredDirectList = bestList;
+                preferredDirectObj = bestObj;
+                preferredDirectLink = bestLink;
+                preferredDirectPos = bestPos;
+                directCx = x; directCy = y; directCz = z; hasDirectCache = true;
+                string linkTag = bestLink == -1 ? "root" : $"sub+0x{bestLink:X2}";
+                source = $"direct(mgr=0x{bestMgr:X},list=0x{bestList:X2},obj=0x{bestObj:X2},ln={linkTag},pos=0x{bestPos:X2},st={preferredDirectStaticReads},cand={samples.Count},lock={(directCalibLock.HasValue ? 1 : 0)})";
+                return true;
+            }
+
+            (int chainScore, string chainSummary) ProbeGameChains(IntPtr hProcess, IntPtr moduleBase)
+            {
+                int score = 0;
+
+                int playerMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                bool hasPlayerMgr = playerMgr != 0;
+                if (hasPlayerMgr) score += 4;
+
+                int playerList = 0;
+                if (hasPlayerMgr)
+                {
+                    playerList = MemoryHelper.ReadInt32(hProcess, Ptr32Add(playerMgr, 0x08));
+                    if (playerList != 0) score += 5;
+                }
+
+                int[] playerObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40 };
+                int playerObj = 0;
+                int playerObjOff = 0;
+                if (playerList != 0)
+                {
+                    foreach (int off in playerObjOffsets)
+                    {
+                        int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(playerList, off));
+                        if (raw == 0) continue;
+                        playerObj = raw;
+                        playerObjOff = off;
+                        break;
+                    }
+                    if (playerObj != 0) score += 6;
+                }
+
+                bool hasPlayerPos = false;
+                int playerPosOff = 0;
+                if (playerObj != 0)
+                {
+                    int[] posOffsets = { 0x94, 0x34, 0x64, 0xC4 };
+                    foreach (int poff in posOffsets)
+                    {
+                        if (!TryReadStablePos(hProcess, Ptr32(playerObj), poff, out _, out _, out _))
+                            continue;
+                        hasPlayerPos = true;
+                        playerPosOff = poff;
+                        break;
+                    }
+                    if (hasPlayerPos) score += 10;
+                }
+
+                int npcMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D451C));
+                bool hasNpcMgr = npcMgr != 0;
+                if (hasNpcMgr) score += 2;
+
+                bool hasNpcFirst = false;
+                if (hasNpcMgr)
+                {
+                    int firstNode = MemoryHelper.ReadInt32(hProcess, Ptr32Add(npcMgr, 8));
+                    hasNpcFirst = firstNode != 0;
+                    if (hasNpcFirst) score += 3;
+                }
+
+                string summary =
+                    $"pmgr={(hasPlayerMgr ? 1 : 0)} plist={(playerList != 0 ? 1 : 0)} pobj={(playerObj != 0 ? 1 : 0)}@0x{playerObjOff:X2} " +
+                    $"ppos={(hasPlayerPos ? 1 : 0)}@0x{playerPosOff:X2} nmgr={(hasNpcMgr ? 1 : 0)} nfirst={(hasNpcFirst ? 1 : 0)}";
+                return (score, summary);
+            }
+
+            void PrintAttachDiagnostics(string tag, IntPtr handle, IntPtr baseAddr)
+            {
+                try
+                {
+                    var (sc, summary) = ProbeGameChains(handle, baseAddr);
+                    Console.WriteLine($"[{tag}] score={sc} base=0x{baseAddr.ToInt64():X8} {summary}");
+                }
+                catch
+                {
+                    Console.WriteLine($"[{tag}] failed to probe");
+                }
+            }
+
+            (Process game, IntPtr moduleBase, IntPtr hProcess, List<string> logs) SelectGameProcess(Process[] procs, bool collectLogs = false)
             {
                 Process best = null;
                 IntPtr bestModuleBase = IntPtr.Zero;
                 IntPtr bestHandle = IntPtr.Zero;
                 int bestScore = int.MinValue;
+                var logs = new List<string>();
 
                 foreach (var p in procs)
                 {
@@ -56,11 +491,16 @@ namespace Xajh
                         if (candidateHandle == IntPtr.Zero) continue;
 
                         int score = 0;
-                        var (hasPlayerMgr, hasNpcMgr) = ProbeStatics(candidateHandle, candidateBase);
-                        if (hasPlayerMgr) score += 6;
-                        if (hasNpcMgr) score += 2;
+                        var (chainScore, chainSummary) = ProbeGameChains(candidateHandle, candidateBase);
+                        score += chainScore;
                         if (p.MainWindowHandle != IntPtr.Zero) score += 2;
+                        else score -= 2;
                         if (p.WorkingSet64 > 100L * 1024L * 1024L) score += 1;
+                        if (collectLogs)
+                        {
+                            long mb = p.WorkingSet64 / (1024L * 1024L);
+                            logs.Add($"PID={p.Id} score={score,2} base=0x{candidateBase.ToInt64():X8} win={(p.MainWindowHandle != IntPtr.Zero ? 1 : 0)} ws={mb}MB {chainSummary}");
+                        }
 
                         if (score > bestScore)
                         {
@@ -82,7 +522,7 @@ namespace Xajh
                     }
                 }
 
-                return (best, bestModuleBase, bestHandle);
+                return (best, bestModuleBase, bestHandle, logs);
             }
 
             Console.WriteLine("[*] Waiting for game process (vrchat1) ...");
@@ -138,34 +578,197 @@ namespace Xajh
                 catch { return IntPtr.Zero; }
             }
 
-            var turn = new TurnHelper(hProcess, GetGameHwnd());
+            var turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+            var npcSnapshotLock = new object();
+            var npcSnapshot = new List<Npc>();
+            try
+            {
+                npcSnapshot = npcReader.GetAllNpcs();
+            }
+            catch { }
+
+            bool TryReattachGame(string reason, bool forceRefreshSameProcess = false)
+            {
+                try
+                {
+                    var procs = Process.GetProcessesByName("vrchat1");
+                    if (procs.Length == 0) return false;
+
+                    var picked = SelectGameProcess(procs, collectLogs: true);
+                    if (picked.game == null || picked.hProcess == IntPtr.Zero) return false;
+                    foreach (var line in picked.logs)
+                        Console.WriteLine($"[PICK] {line}");
+
+                    bool sameProcess = game != null &&
+                        !game.HasExited &&
+                        picked.game.Id == game.Id &&
+                        picked.moduleBase == moduleBase;
+
+                    if (sameProcess)
+                    {
+                        if (!forceRefreshSameProcess)
+                        {
+                            // SelectGameProcess opened a handle for this candidate.
+                            // Keep the current one and close the duplicate.
+                            MemoryHelper.CloseHandle(picked.hProcess);
+                            return false;
+                        }
+
+                        // In unresolved mode, force-refresh readers/handle even if PID/base match.
+                        if (hProcess != IntPtr.Zero)
+                            MemoryHelper.CloseHandle(hProcess);
+
+                        hProcess = picked.hProcess;
+                        npcReader = new NpcReader(hProcess, moduleBase);
+                        playerReader = new PlayerReader(hProcess, moduleBase);
+                        combat = new CombatOverlay(hProcess, moduleBase);
+                        turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+
+                        Console.WriteLine($"[REATTACH] {reason} -> PID={game.Id} Base=0x{moduleBase.ToInt64():X8} (refresh)");
+                        return true;
+                    }
+
+                    if (hProcess != IntPtr.Zero)
+                        MemoryHelper.CloseHandle(hProcess);
+
+                    game = picked.game;
+                    moduleBase = picked.moduleBase;
+                    hProcess = picked.hProcess;
+                    npcReader = new NpcReader(hProcess, moduleBase);
+                    playerReader = new PlayerReader(hProcess, moduleBase);
+                    combat = new CombatOverlay(hProcess, moduleBase);
+                    turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+
+                    Console.WriteLine($"[REATTACH] {reason} -> PID={game.Id} Base=0x{moduleBase.ToInt64():X8}");
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            var npcTrackerCts = new CancellationTokenSource();
+            var npcTracker = new Thread(() =>
+            {
+                while (!npcTrackerCts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        var fresh = npcReader.GetAllNpcs();
+                        lock (npcSnapshotLock)
+                            npcSnapshot = fresh;
+                    }
+                    catch { }
+                    Thread.Sleep(120);
+                }
+            })
+            { IsBackground = true };
+            npcTracker.Start();
+            Console.WriteLine("[*] NPC tracker thread started");
 
             Console.WriteLine("=== XAJH Combat Overlay ===");
-            Console.WriteLine("[X] Aim nearest NPC    [A] Auto-aim toggle    [C] Reset calibration");
-            Console.WriteLine("[R] Set radius         [L] List nearby NPCs   [P] Dump player obj");
+            Console.WriteLine("[A] Auto-turn+fight toggle    [C] Reset calibration");
+            Console.WriteLine("[R] Set radius  [L] List nearby NPCs  [M] Calibrate fallback  [P] Dump player obj");
             Console.WriteLine("[W] Refresh window     [End] Exit");
             Console.WriteLine();
 
             bool autoFace = false;
             float aimRadius = 300f;
-            var posCandidates = new List<IntPtr>();
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
+            string lastDirectSource = "";
 
-            int GetPlayerObj()
+            bool IsUnresolvedSource(string src)
+                => src == "none" || src == "mgr=0" || src == "list/obj=0" || src == "obj-ex";
+
+            bool TryReadPlayerDirect(out float x, out float y, out float z, out string source)
             {
-                int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
-                if (mgr == 0) return 0;
-                int list = MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)(mgr + 8)));
-                if (list == 0) return 0;
-                return MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)(list + 0x4C)));
+                return TryReadDirectPlayerPos(hProcess, moduleBase, out x, out y, out z, out source);
+            }
+
+            (float x, float y, float z) ReadPlayerPos()
+            {
+                var p = playerReader.Get();
+                var dbg = playerReader.GetDebugSnapshot();
+                if (IsUnresolvedSource(dbg.Source) &&
+                    TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc))
+                {
+                    lastDirectSource = dsrc;
+                    return (dx, dy, dz);
+                }
+                lastDirectSource = "";
+                return p;
+            }
+
+            void RunDirectMovementCalibration()
+            {
+                Console.WriteLine("[M] Calibrating fallback source. Move your character for ~3 seconds...");
+                directCalibrating = true;
+                directCalibEndTicks = Environment.TickCount64 + 3200;
+                directCalibStartByKey.Clear();
+                directMotionByKey.Clear();
+                directCalibLock = null;
+                directLastByKey.Clear();
+                hasDirectCache = false;
+                preferredDirectStaticReads = 0;
+
+                while (Environment.TickCount64 < directCalibEndTicks)
+                {
+                    TryReadDirectPlayerPos(hProcess, moduleBase, out _, out _, out _, out _);
+                    foreach (var kv in directLastByKey)
+                        if (!directCalibStartByKey.ContainsKey(kv.Key))
+                            directCalibStartByKey[kv.Key] = kv.Value;
+                    Thread.Sleep(120);
+                }
+
+                directCalibrating = false;
+                (int mgr, int list, int obj, int link, int pos)? bestKey = null;
+                float bestMotion = 0f;
+                foreach (var kv in directMotionByKey)
+                {
+                    if (kv.Value > bestMotion)
+                    {
+                        bestMotion = kv.Value;
+                        bestKey = kv.Key;
+                    }
+                }
+
+                if (!bestKey.HasValue || bestMotion < 1.0f)
+                {
+                    Console.WriteLine("[M] Calibration failed: no moving candidate detected.");
+                    return;
+                }
+
+                var bk = bestKey.Value;
+                directCalibLock = bk;
+                preferredDirectMgr = bk.mgr;
+                preferredDirectList = bk.list;
+                preferredDirectObj = bk.obj;
+                preferredDirectLink = bk.link;
+                preferredDirectPos = bk.pos;
+                preferredDirectStaticReads = 0;
+                if (directLastByKey.TryGetValue(bk, out var last))
+                {
+                    directCx = last.x;
+                    directCy = last.y;
+                    hasDirectCache = true;
+                }
+                string linkTag = bk.link == -1 ? "root" : $"sub+0x{bk.link:X2}";
+                Console.WriteLine($"[M] Locked fallback: mgr=0x{bk.mgr:X} list=0x{bk.list:X2} obj=0x{bk.obj:X2} ln={linkTag} pos=0x{bk.pos:X2} motion={bestMotion:F1}");
             }
 
             // Get NPCs within radius, sorted by HORIZONTAL (XY) distance
             // In this game: X,Y = ground plane, Z = height
+            List<Npc> GetTrackedNpcs()
+            {
+                lock (npcSnapshotLock)
+                    return new List<Npc>(npcSnapshot);
+            }
+
             List<(Npc npc, double distXY, double dist3D)> GetNearbyNpcs()
             {
-                var (px, py, pz) = playerReader.Get();
-                var npcs = npcReader.GetAllNpcs();
+                var (px, py, pz) = ReadPlayerPos();
+                var npcs = GetTrackedNpcs();
                 var nearby = new List<(Npc, double, double)>();
                 foreach (var n in npcs)
                 {
@@ -185,12 +788,12 @@ namespace Xajh
 
             string AimNearest(bool verbose = true)
             {
-                var (px, py, pz) = playerReader.Get();
+                var (px, py, pz) = ReadPlayerPos();
                 var nearby = GetNearbyNpcs();
 
                 if (verbose)
                 {
-                    // Full list for debugging when pressing [X]
+                    // Full list for debugging when auto routine runs
                     Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
                     Console.WriteLine($"  {"#",2}  {"Name",-20} {"xy",7} {"3d",7}  {"NpcX",9} {"NpcY",9} {"NpcZ",9}   {"dX",8} {"dY",8} {"dZ",8}");
                     for (int i = 0; i < nearby.Count; i++)
@@ -205,194 +808,158 @@ namespace Xajh
                     return $"[!] No NPC within {aimRadius:F0}";
 
                 var (target, distXY, _) = nearby[0];
-                string r = turn.FaceTarget(() => playerReader.Get(), target.X, target.Y);
-                return $"→ {target.Name} d={distXY:F0}  {r}  ({nearby.Count} in range)";
+                string r = turn.FaceTarget(() => ReadPlayerPos(), target.X, target.Y);
+                bool fightTriggered = false;
+                if (!r.StartsWith("[!]"))
+                    fightTriggered = turn.TriggerTargetAndFight();
+                string fightStatus = fightTriggered ? "target=X fight=F" : "target/fight=!";
+                return $"→ {target.Name} d={distXY:F0}  {r}  {fightStatus}  ({nearby.Count} in range)";
             }
 
-            while (true)
+            try
             {
-                if (Console.KeyAvailable)
+                while (true)
                 {
-                    var key = Console.ReadKey(true).Key;
-                    if (key == ConsoleKey.End) break;
+                    if (Console.KeyAvailable)
+                    {
+                        var key = Console.ReadKey(true).Key;
+                        if (key == ConsoleKey.End) break;
 
-                    if (key == ConsoleKey.X)
-                    {
-                        Console.WriteLine($"[X] {AimNearest()}");
-                    }
-                    else if (key == ConsoleKey.L)
-                    {
-                        var (px, py, pz) = playerReader.Get();
-                        Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
+                        if (key == ConsoleKey.L)
+                        {
+                            var (px, py, pz) = ReadPlayerPos();
+                            var dbg = playerReader.GetDebugSnapshot();
+                            bool unresolved = IsUnresolvedSource(dbg.Source) && string.IsNullOrEmpty(lastDirectSource);
+                            if (unresolved && TryReattachGame($"player-source={dbg.Source}", forceRefreshSameProcess: true))
+                            {
+                                Thread.Sleep(150);
+                                (px, py, pz) = ReadPlayerPos();
+                                dbg = playerReader.GetDebugSnapshot();
+                            }
+                            else if (unresolved)
+                            {
+                                Console.WriteLine($"[REATTACH] failed (source={dbg.Source})");
+                            }
 
-                        // NPC list
-                        var allNpcs = npcReader.GetAllNpcs();
-                        Console.WriteLine($"\n── All NPCs from NpcReader ({allNpcs.Count} total) ──");
-                        Console.WriteLine($"  {"#",3}  {"Name",-20} {"X",9} {"Y",9} {"Z",9}  {"xzDist",8}  in?");
-                        for (int i = 0; i < allNpcs.Count && i < 50; i++)
-                        {
-                            var n = allNpcs[i];
-                            double dxy = Math.Sqrt(Math.Pow(n.X - px, 2) + Math.Pow(n.Y - py, 2));
-                            string inRange = dxy <= aimRadius ? "  ✓" : "";
-                            Console.WriteLine($"  {i + 1,3}. {n.Name,-20} {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}  {dxy,8:F0}{inRange}");
-                        }
+                            Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
+                            Console.WriteLine(
+                                $"  [DBG] src={dbg.Source} mgr=0x{dbg.MgrOffset:X} off=0x{dbg.ObjOffset:X2} pos=0x{dbg.PosOffset:X2} obj=0x{dbg.PlayerObj.ToInt64():X8} " +
+                                $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1})");
+                            if (!string.IsNullOrEmpty(lastDirectSource))
+                                Console.WriteLine($"  [DBG] fallback={lastDirectSource}");
 
-                        // Entity list (monsters with HP)
-                        var entityMgr = new EntityManager(hProcess, moduleBase);
-                        var enemies = entityMgr.GetEnemies();
-                        Console.WriteLine($"\n── Enemies from EntityManager ({enemies.Count} total) ──");
-                        Console.WriteLine($"  {"#",3}  {"OID",8} {"HP",6}/{"Max",6}  {"Addr",12}");
-                        for (int i = 0; i < enemies.Count && i < 30; i++)
-                        {
-                            var e = enemies[i];
-                            Console.WriteLine($"  {i + 1,3}. {e.OID,8}  {e.HP,6}/{e.MaxHP,6}  0x{e.BaseAddress.ToInt64():X8}  ({e.PosX:F0},{e.PosY:F0},{e.PosZ:F0})");
-                        }
-                        Console.WriteLine();
-                    }
-                    else if (key == ConsoleKey.R)
-                    {
-                        Console.Write("New radius> ");
-                        string line = Console.ReadLine()?.Trim() ?? "";
-                        if (float.TryParse(line, out float r) && r > 0)
-                        {
-                            aimRadius = r;
-                            Console.WriteLine($"[R] Radius set to {aimRadius:F0}");
-                        }
-                        else
-                        {
-                            Console.WriteLine($"[R] Invalid — keeping {aimRadius:F0}");
-                        }
-                    }
-                    else if (key == ConsoleKey.C)
-                    {
-                        turn.ResetCalibration();
-                        Console.WriteLine("[C] Calibration reset");
-                    }
-                    else if (key == ConsoleKey.W)
-                    {
-                        // Enumerate all top-level windows owned by the game process,
-                        // pick the largest visible one (the main viewport).
-                        IntPtr best = IntPtr.Zero;
-                        int bestArea = 0;
-                        foreach (ProcessThread t in game.Threads)
-                        {
-                            // no per-thread enum without P/Invoke; fall back below
-                        }
-                        // Use EnumWindows via Process.MainWindowHandle refresh +
-                        // walk all process windows
-                        game.Refresh();
-                        var handles = new List<IntPtr>();
-                        EnumWindows((h, l) =>
-                        {
-                            GetWindowThreadProcessId(h, out uint pid);
-                            if (pid == (uint)game.Id && IsWindowVisible(h))
+                            // NPC list
+                            var allNpcs = GetTrackedNpcs();
+                            Console.WriteLine($"\n── All NPCs from NpcReader ({allNpcs.Count} total) ──");
+                            Console.WriteLine($"  {"#",3}  {"Name",-20} {"X",9} {"Y",9} {"Z",9}  {"xzDist",8}  in?");
+                            for (int i = 0; i < allNpcs.Count && i < 50; i++)
                             {
-                                GetClientRect(h, out RECT rc);
-                                int area = (rc.Right - rc.Left) * (rc.Bottom - rc.Top);
-                                if (area > bestArea) { bestArea = area; best = h; }
-                                handles.Add(h);
+                                var n = allNpcs[i];
+                                double dxy = Math.Sqrt(Math.Pow(n.X - px, 2) + Math.Pow(n.Y - py, 2));
+                                string inRange = dxy <= aimRadius ? "  ✓" : "";
+                                Console.WriteLine($"  {i + 1,3}. {n.Name,-20} {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}  {dxy,8:F0}{inRange}");
                             }
-                            return true;
-                        }, IntPtr.Zero);
 
-                        Console.WriteLine($"[W] Found {handles.Count} visible windows in process:");
-                        foreach (var h in handles)
-                        {
-                            GetClientRect(h, out RECT rc);
-                            var sb = new System.Text.StringBuilder(256);
-                            GetClassName(h, sb, 256);
-                            Console.WriteLine($"    0x{h.ToInt64():X}  {rc.Right - rc.Left}x{rc.Bottom - rc.Top}  class={sb}");
+                            // Entity list (monsters with HP)
+                            var entityMgr = new EntityManager(hProcess, moduleBase);
+                            var enemies = entityMgr.GetEnemies();
+                            Console.WriteLine($"\n── Enemies from EntityManager ({enemies.Count} total) ──");
+                            Console.WriteLine($"  {"#",3}  {"OID",8} {"HP",6}/{"Max",6}  {"Addr",12}");
+                            for (int i = 0; i < enemies.Count && i < 30; i++)
+                            {
+                                var e = enemies[i];
+                                Console.WriteLine($"  {i + 1,3}. {e.OID,8}  {e.HP,6}/{e.MaxHP,6}  0x{e.BaseAddress.ToInt64():X8}  ({e.PosX:F0},{e.PosY:F0},{e.PosZ:F0})");
+                            }
+                            Console.WriteLine();
                         }
-                        Console.WriteLine($"[W] Picked largest: 0x{best.ToInt64():X} ({bestArea}px²)");
-                        turn = new TurnHelper(hProcess, best);
-                    }
-                    else if (key == ConsoleKey.P)
-                    {
-                        combat.DumpPlayerObject();
-                    }
-                    else if (key == ConsoleKey.O)
-                    {
-                        Console.Write("Enter your /loc X> ");
-                        if (!float.TryParse(Console.ReadLine()?.Trim(), out float locX)) { Console.WriteLine("[!] bad"); continue; }
-                        Console.Write("Enter your /loc Y> ");
-                        if (!float.TryParse(Console.ReadLine()?.Trim(), out float locY)) { Console.WriteLine("[!] bad"); continue; }
-
-                        if (posCandidates.Count == 0)
+                        else if (key == ConsoleKey.R)
                         {
-                            // First pass: full scan
-                            Console.WriteLine($"\n[*] Pass 1: global scan for ({locX:F0}, {locY:F0}) ...");
-                            var hits = MemoryHelper.ScanForFloat(hProcess, locX, 5f);
-                            foreach (var addr in hits)
+                            Console.Write("New radius> ");
+                            string line = Console.ReadLine()?.Trim() ?? "";
+                            if (float.TryParse(line, out float r) && r > 0)
                             {
-                                float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                                if (Math.Abs(y - locY) < 5f) posCandidates.Add(addr);
-                            }
-                            Console.WriteLine($"[*] {posCandidates.Count} candidates. Walk to NEW spot and [O] again to narrow,");
-                            Console.WriteLine($"[*] or just use the first one now: 0x{(posCandidates.Count > 0 ? posCandidates[0].ToInt64() : 0):X8}");
-                            if (posCandidates.Count > 0)
-                            {
-                                PlayerReader.GlobalPosAddr = posCandidates[0];
-                                Console.WriteLine($"[+] PlayerReader.GlobalPosAddr = 0x{posCandidates[0].ToInt64():X8}");
-                            }
-                        }
-                        else
-                        {
-                            // Pass 2+: filter existing candidates
-                            Console.WriteLine($"\n[*] Pass 2: filtering {posCandidates.Count} candidates against ({locX:F0}, {locY:F0}) ...");
-                            var keep = new List<IntPtr>();
-                            foreach (var addr in posCandidates)
-                            {
-                                float x = MemoryHelper.ReadFloat(hProcess, addr);
-                                float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                                if (Math.Abs(x - locX) < 5f && Math.Abs(y - locY) < 5f)
-                                    keep.Add(addr);
-                            }
-                            posCandidates = keep;
-                            Console.WriteLine($"[*] {posCandidates.Count} survived");
-                            foreach (var addr in posCandidates)
-                            {
-                                float x = MemoryHelper.ReadFloat(hProcess, addr);
-                                float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                                Console.WriteLine($"  ✓ 0x{addr.ToInt64():X8}  ({x:F1}, {y:F1})");
-                            }
-                            if (posCandidates.Count == 1)
-                            {
-                                PlayerReader.GlobalPosAddr = posCandidates[0];
-                                Console.WriteLine($"\n[+] LOCKED player position @ 0x{posCandidates[0].ToInt64():X8}");
-                                Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
-                            }
-                            else if (posCandidates.Count > 1)
-                            {
-                                // All surviving addresses mirror the same value — just pick first
-                                PlayerReader.GlobalPosAddr = posCandidates[0];
-                                Console.WriteLine($"\n[+] {posCandidates.Count} aliases, using first: 0x{posCandidates[0].ToInt64():X8}");
-                                Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
+                                aimRadius = r;
+                                Console.WriteLine($"[R] Radius set to {aimRadius:F0}");
                             }
                             else
-                                Console.WriteLine("[!] All filtered out — press [K] to reset, try again.");
+                            {
+                                Console.WriteLine($"[R] Invalid — keeping {aimRadius:F0}");
+                            }
+                        }
+                        else if (key == ConsoleKey.M)
+                        {
+                            RunDirectMovementCalibration();
+                        }
+                        else if (key == ConsoleKey.C)
+                        {
+                            turn.ResetCalibration();
+                            Console.WriteLine("[C] Calibration reset");
+                        }
+                        else if (key == ConsoleKey.W)
+                        {
+                            // Enumerate all top-level windows owned by the game process,
+                            // pick the largest visible one (the main viewport).
+                            IntPtr best = IntPtr.Zero;
+                            int bestArea = 0;
+                            foreach (ProcessThread t in game.Threads)
+                            {
+                                // no per-thread enum without P/Invoke; fall back below
+                            }
+                            // Use EnumWindows via Process.MainWindowHandle refresh +
+                            // walk all process windows
+                            game.Refresh();
+                            var handles = new List<IntPtr>();
+                            EnumWindows((h, l) =>
+                            {
+                                GetWindowThreadProcessId(h, out uint pid);
+                                if (pid == (uint)game.Id && IsWindowVisible(h))
+                                {
+                                    GetClientRect(h, out RECT rc);
+                                    int area = (rc.Right - rc.Left) * (rc.Bottom - rc.Top);
+                                    if (area > bestArea) { bestArea = area; best = h; }
+                                    handles.Add(h);
+                                }
+                                return true;
+                            }, IntPtr.Zero);
+
+                            Console.WriteLine($"[W] Found {handles.Count} visible windows in process:");
+                            foreach (var h in handles)
+                            {
+                                GetClientRect(h, out RECT rc);
+                                var sb = new System.Text.StringBuilder(256);
+                                GetClassName(h, sb, 256);
+                                Console.WriteLine($"    0x{h.ToInt64():X}  {rc.Right - rc.Left}x{rc.Bottom - rc.Top}  class={sb}");
+                            }
+                            Console.WriteLine($"[W] Picked largest: 0x{best.ToInt64():X} ({bestArea}px²)");
+                            turn = new TurnHelper(hProcess, moduleBase, best);
+                        }
+                        else if (key == ConsoleKey.P)
+                        {
+                            combat.DumpPlayerObject();
+                        }
+                        else if (key == ConsoleKey.A)
+                        {
+                            autoFace = !autoFace;
+                            Console.WriteLine(autoFace ? $"[+] Auto-turn+fight ON (radius={aimRadius:F0})" : "[-] Auto-turn+fight OFF");
                         }
                     }
-                    else if (key == ConsoleKey.K)
-                    {
-                        posCandidates.Clear();
-                        Console.WriteLine("[K] Position candidates cleared");
-                    }
-                    else if (key == ConsoleKey.A)
-                    {
-                        autoFace = !autoFace;
-                        Console.WriteLine(autoFace ? $"[+] Auto-aim ON (radius={aimRadius:F0})" : "[-] Auto-aim OFF");
-                    }
-                }
 
-                if (autoFace)
-                {
-                    Console.WriteLine($"[AUTO] {AimNearest(verbose: false)}");
-                    Thread.Sleep(800);   // throttle auto-aim
+                    if (autoFace)
+                    {
+                        Console.WriteLine($"[AUTO] {AimNearest(verbose: false)}");
+                        Thread.Sleep(800);   // throttle auto-aim
+                    }
+                    else
+                    {
+                        Thread.Sleep(50);
+                    }
                 }
-                else
-                {
-                    Thread.Sleep(50);
-                }
+            }
+            finally
+            {
+                npcTrackerCts.Cancel();
+                if (!npcTracker.Join(600))
+                    Console.WriteLine("[*] NPC tracker thread stop timeout");
             }
 
         }
