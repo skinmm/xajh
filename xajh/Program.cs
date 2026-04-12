@@ -370,13 +370,16 @@ namespace Xajh
                                 }
                                 Console.WriteLine($"[*] {posCandidates.Count} candidates. Walk to NEW spot and [O] again to narrow,");
                                 Console.WriteLine($"[*] or just use the first one now: 0x{(posCandidates.Count > 0 ? posCandidates[0].ToInt64() : 0):X8}");
-                                if (posCandidates.Count == 1)
+                                if (posCandidates.Count > 0)
                                 {
+                                    // /loc mirrors often exist at many alias addresses.
+                                    // Any alias is fine once /loc matched; lock immediately.
                                     PlayerReader.SetGlobalPosAddr(posCandidates[0], locked: true);
-                                    Console.WriteLine($"[+] LOCKED global mirror @ 0x{posCandidates[0].ToInt64():X8}");
+                                    if (posCandidates.Count == 1)
+                                        Console.WriteLine($"[+] LOCKED global mirror @ 0x{posCandidates[0].ToInt64():X8}");
+                                    else
+                                        Console.WriteLine($"[+] {posCandidates.Count} aliases detected, locked first: 0x{posCandidates[0].ToInt64():X8}");
                                 }
-                                else if (posCandidates.Count > 1)
-                                    Console.WriteLine("[*] Not locking yet (multiple candidates). Walk, then [O] again.");
                             }
                             else
                             {
@@ -398,16 +401,19 @@ namespace Xajh
                                     float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
                                     Console.WriteLine($"  ✓ 0x{addr.ToInt64():X8}  ({x:F1}, {y:F1})");
                                 }
-                                if (posCandidates.Count == 1)
+                                if (posCandidates.Count > 0)
                                 {
                                     PlayerReader.SetGlobalPosAddr(posCandidates[0], locked: true);
-                                    Console.WriteLine($"\n[+] LOCKED player position @ 0x{posCandidates[0].ToInt64():X8}");
-                                    Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
-                                }
-                                else if (posCandidates.Count > 1)
-                                {
-                                    Console.WriteLine($"\n[*] {posCandidates.Count} candidates remain — not locking yet.");
-                                    Console.WriteLine("[*] Move again and press [O] to narrow to one address.");
+                                    if (posCandidates.Count == 1)
+                                    {
+                                        Console.WriteLine($"\n[+] LOCKED player position @ 0x{posCandidates[0].ToInt64():X8}");
+                                        Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine($"\n[+] {posCandidates.Count} aliases remain, using first: 0x{posCandidates[0].ToInt64():X8}");
+                                        Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
+                                    }
                                 }
                                 else
                                     Console.WriteLine("[!] All filtered out — press [K] to reset, try again.");

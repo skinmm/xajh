@@ -87,7 +87,9 @@ namespace xajh
             }
 
             _preferredPosOffset = bestOffset;
-            if (!haveGlobal || bestDist < dGlobal)
+            // Prefer GLOBAL when available unless object offset is clearly closer
+            // to /loc by a meaningful margin.
+            if (!haveGlobal || bestDist + 20f < dGlobal)
             {
                 _xySourceMode = XySourceMode.Object;
                 return $"Reference saved: using OBJECT+0x{bestOffset:X} (d={bestDist:F1})";
