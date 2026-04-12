@@ -82,7 +82,13 @@ namespace xajh
             x = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x94));
             y = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x98));
             z = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x9C));
-            return IsCoordinatePlausible(x, y, z);
+            if (!IsCoordinatePlausible(x, y, z)) return false;
+
+            // Treat pure zero-vector as invalid player location.
+            if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f)
+                return false;
+
+            return true;
         }
 
         bool TryGetPlayerObject(out IntPtr playerObj)
@@ -94,10 +100,28 @@ namespace xajh
             int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
             if (list == 0) return false;
 
+            // Fast path: historical default (+0x4C) first.
+            int rawDefault = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), DefaultPlayerObjOffset));
+            if (rawDefault != 0)
+            {
+                var pDefault = new IntPtr((uint)rawDefault);
+                float xDef = MemoryHelper.ReadFloat(_h, IntPtr.Add(pDefault, 0x94));
+                float yDef = MemoryHelper.ReadFloat(_h, IntPtr.Add(pDefault, 0x98));
+                float zDef = MemoryHelper.ReadFloat(_h, IntPtr.Add(pDefault, 0x9C));
+                bool defValid = IsCoordinatePlausible(xDef, yDef, zDef) &&
+                                !(Math.Abs(xDef) < 0.001f && Math.Abs(yDef) < 0.001f && Math.Abs(zDef) < 0.001f);
+                if (defValid)
+                {
+                    _preferredObjOffset = DefaultPlayerObjOffset;
+                    playerObj = pDefault;
+                    return true;
+                }
+            }
+
+            // Fallback: probe nearby offsets with continuity checks.
             float bestScore = float.MinValue;
             IntPtr bestPtr = IntPtr.Zero;
             int bestOffset = _preferredObjOffset;
-
             var seen = new HashSet<int>();
             foreach (int off in _candidateObjOffsets)
             {
@@ -111,28 +135,13 @@ namespace xajh
                 if (!IsCoordinatePlausible(x, y, z)) continue;
                 if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) continue;
 
-                float c = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x10));
-                float s = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x1C));
-                if (float.IsNaN(c) || float.IsNaN(s) || float.IsInfinity(c) || float.IsInfinity(s))
-                    continue;
-                if (Math.Abs(c) > 1.2f || Math.Abs(s) > 1.2f) continue;
-
-                float score = 0f;
-                if (off == _preferredObjOffset) score += 1.5f;
-                if (off == DefaultPlayerObjOffset) score += 1.0f;
-
-                float rotMagErr = Math.Abs((c * c + s * s) - 1f);
-                score += Math.Max(0f, 1.0f - rotMagErr);
-
+                float score = off == _preferredObjOffset ? 1.0f : 0f;
                 if (_hasCache)
                 {
                     double dxy = Math.Sqrt(Math.Pow(x - _cx, 2) + Math.Pow(y - _cy, 2));
                     if (dxy <= 8f) score += 3f;
                     else if (dxy <= 120f) score += 1.5f;
                     else score -= 2f;
-
-                    float dz = Math.Abs(z - _cz);
-                    if (dz <= 40f) score += 0.5f;
                 }
 
                 if (score > bestScore)
@@ -143,7 +152,9 @@ namespace xajh
                 }
             }
 
-            if (bestPtr == IntPtr.Zero) return false;
+            if (bestPtr == IntPtr.Zero)
+                return false;
+
             _preferredObjOffset = bestOffset;
             playerObj = bestPtr;
             return true;
