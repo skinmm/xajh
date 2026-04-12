@@ -168,7 +168,7 @@ namespace Xajh
             Console.WriteLine("[*] NPC tracker thread started");
 
             Console.WriteLine("=== XAJH Combat Overlay ===");
-            Console.WriteLine("[X] Aim nearest NPC    [A] Auto-aim toggle    [C] Reset calibration");
+            Console.WriteLine("[A] Auto-turn+fight toggle    [C] Reset calibration");
             Console.WriteLine("[R] Set radius         [L] List nearby NPCs   [P] Dump player obj");
             Console.WriteLine("[W] Refresh window     [End] Exit");
             Console.WriteLine();
@@ -224,7 +224,7 @@ namespace Xajh
 
                 if (verbose)
                 {
-                    // Full list for debugging when pressing [X]
+                    // Full list for debugging when auto routine runs
                     Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
                     Console.WriteLine($"  {"#",2}  {"Name",-20} {"xy",7} {"3d",7}  {"NpcX",9} {"NpcY",9} {"NpcZ",9}   {"dX",8} {"dY",8} {"dZ",8}");
                     for (int i = 0; i < nearby.Count; i++)
@@ -256,11 +256,7 @@ namespace Xajh
                         var key = Console.ReadKey(true).Key;
                         if (key == ConsoleKey.End) break;
 
-                        if (key == ConsoleKey.X)
-                        {
-                            Console.WriteLine($"[X] {AimNearest()}");
-                        }
-                        else if (key == ConsoleKey.L)
+                        if (key == ConsoleKey.L)
                         {
                             var (px, py, pz) = playerReader.Get();
                             Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
@@ -429,7 +425,7 @@ namespace Xajh
                         else if (key == ConsoleKey.A)
                         {
                             autoFace = !autoFace;
-                            Console.WriteLine(autoFace ? $"[+] Auto-aim ON (radius={aimRadius:F0})" : "[-] Auto-aim OFF");
+                            Console.WriteLine(autoFace ? $"[+] Auto-turn+fight ON (radius={aimRadius:F0})" : "[-] Auto-turn+fight OFF");
                         }
                     }
 
