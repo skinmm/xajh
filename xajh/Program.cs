@@ -206,7 +206,11 @@ namespace Xajh
 
                 var (target, distXY, _) = nearby[0];
                 string r = turn.FaceTarget(() => playerReader.Get(), target.X, target.Y);
-                return $"→ {target.Name} d={distXY:F0}  {r}  ({nearby.Count} in range)";
+                bool fightTriggered = false;
+                if (!r.StartsWith("[!]"))
+                    fightTriggered = turn.TriggerFight();
+                string fightStatus = fightTriggered ? "fight=F" : "fight=!";
+                return $"→ {target.Name} d={distXY:F0}  {r}  {fightStatus}  ({nearby.Count} in range)";
             }
 
             while (true)
