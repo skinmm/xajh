@@ -27,6 +27,8 @@ namespace Xajh
         static void Main(string[] args)
         {
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            static IntPtr Ptr32(int value) => new IntPtr(value);
+            static IntPtr Ptr32Add(int baseValue, int offset) => new IntPtr(unchecked(baseValue + offset));
             int[] directMgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C, 0x9D4524, 0x9D450C };
             int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
             int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
@@ -82,14 +84,14 @@ namespace Xajh
 
                     foreach (int lo in directListOffsets)
                     {
-                        int list = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)mgr), lo));
+                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lo));
                         if (list == 0) continue;
 
                         foreach (int oo in directObjOffsets)
                         {
-                            int raw = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)list), oo));
+                            int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, oo));
                             if (raw == 0) continue;
-                            var pobj = new IntPtr((uint)raw);
+                            var pobj = Ptr32(raw);
 
                             foreach (int po in directPosOffsets)
                             {
@@ -143,7 +145,7 @@ namespace Xajh
                 int playerList = 0;
                 if (hasPlayerMgr)
                 {
-                    playerList = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)playerMgr), 0x08));
+                    playerList = MemoryHelper.ReadInt32(hProcess, Ptr32Add(playerMgr, 0x08));
                     if (playerList != 0) score += 5;
                 }
 
@@ -154,7 +156,7 @@ namespace Xajh
                 {
                     foreach (int off in playerObjOffsets)
                     {
-                        int raw = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)playerList), off));
+                        int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(playerList, off));
                         if (raw == 0) continue;
                         playerObj = raw;
                         playerObjOff = off;
@@ -170,7 +172,7 @@ namespace Xajh
                     int[] posOffsets = { 0x94, 0x34, 0x64, 0xC4 };
                     foreach (int poff in posOffsets)
                     {
-                        if (!TryReadStablePos(hProcess, new IntPtr((uint)playerObj), poff, out _, out _, out _))
+                        if (!TryReadStablePos(hProcess, Ptr32(playerObj), poff, out _, out _, out _))
                             continue;
                         hasPlayerPos = true;
                         playerPosOff = poff;
@@ -186,7 +188,7 @@ namespace Xajh
                 bool hasNpcFirst = false;
                 if (hasNpcMgr)
                 {
-                    int firstNode = MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)(npcMgr + 8)));
+                    int firstNode = MemoryHelper.ReadInt32(hProcess, Ptr32Add(npcMgr, 8));
                     hasNpcFirst = firstNode != 0;
                     if (hasNpcFirst) score += 3;
                 }
@@ -443,13 +445,13 @@ namespace Xajh
                     if (mgr == 0) continue;
                     foreach (int lo in listOffsets)
                     {
-                        int list = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)mgr), lo));
+                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lo));
                         if (list == 0) continue;
                         foreach (int oo in objOffsets)
                         {
-                            int rawObj = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)list), oo));
+                            int rawObj = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, oo));
                             if (rawObj == 0) continue;
-                            var pobj = new IntPtr((uint)rawObj);
+                            var pobj = Ptr32(rawObj);
                             foreach (int po in posOffsets)
                             {
                                 float tx = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(pobj, po));
