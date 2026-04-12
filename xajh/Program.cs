@@ -147,6 +147,49 @@ namespace Xajh
             }
             catch { }
 
+            bool TryReattachGame(string reason)
+            {
+                try
+                {
+                    var procs = Process.GetProcessesByName("vrchat1");
+                    if (procs.Length == 0) return false;
+
+                    var picked = SelectGameProcess(procs);
+                    if (picked.game == null || picked.hProcess == IntPtr.Zero) return false;
+
+                    bool sameProcess = game != null &&
+                        !game.HasExited &&
+                        picked.game.Id == game.Id &&
+                        picked.moduleBase == moduleBase;
+
+                    if (sameProcess)
+                    {
+                        // SelectGameProcess opened a handle for this candidate.
+                        // Keep the current one and close the duplicate.
+                        MemoryHelper.CloseHandle(picked.hProcess);
+                        return false;
+                    }
+
+                    if (hProcess != IntPtr.Zero)
+                        MemoryHelper.CloseHandle(hProcess);
+
+                    game = picked.game;
+                    moduleBase = picked.moduleBase;
+                    hProcess = picked.hProcess;
+                    npcReader = new NpcReader(hProcess, moduleBase);
+                    playerReader = new PlayerReader(hProcess, moduleBase);
+                    combat = new CombatOverlay(hProcess, moduleBase);
+                    turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+
+                    Console.WriteLine($"[REATTACH] {reason} -> PID={game.Id} Base=0x{moduleBase.ToInt64():X8}");
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
             var npcTrackerCts = new CancellationTokenSource();
             var npcTracker = new Thread(() =>
             {
@@ -247,8 +290,19 @@ namespace Xajh
                         if (key == ConsoleKey.L)
                         {
                             var (px, py, pz) = playerReader.Get();
-                            Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
                             var dbg = playerReader.GetDebugSnapshot();
+                            bool unresolved = dbg.Source == "none" ||
+                                              dbg.Source == "mgr=0" ||
+                                              dbg.Source == "list/obj=0" ||
+                                              dbg.Source == "obj-ex";
+                            if (unresolved && TryReattachGame($"player-source={dbg.Source}"))
+                            {
+                                Thread.Sleep(150);
+                                (px, py, pz) = playerReader.Get();
+                                dbg = playerReader.GetDebugSnapshot();
+                            }
+
+                            Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
                             Console.WriteLine(
                                 $"  [DBG] src={dbg.Source} mgr=0x{dbg.MgrOffset:X} off=0x{dbg.ObjOffset:X2} pos=0x{dbg.PosOffset:X2} obj=0x{dbg.PlayerObj.ToInt64():X8} " +
                                 $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1})");
