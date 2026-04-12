@@ -35,12 +35,84 @@ namespace Xajh
                 return (playerMgr != 0, npcMgr != 0);
             }
 
-            (Process game, IntPtr moduleBase, IntPtr hProcess) SelectGameProcess(Process[] procs)
+            (int chainScore, string chainSummary) ProbeGameChains(IntPtr hProcess, IntPtr moduleBase)
+            {
+                int score = 0;
+
+                int playerMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                bool hasPlayerMgr = playerMgr != 0;
+                if (hasPlayerMgr) score += 4;
+
+                int playerList = 0;
+                if (hasPlayerMgr)
+                {
+                    playerList = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)playerMgr), 0x08));
+                    if (playerList != 0) score += 5;
+                }
+
+                int[] playerObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40 };
+                int playerObj = 0;
+                int playerObjOff = 0;
+                if (playerList != 0)
+                {
+                    foreach (int off in playerObjOffsets)
+                    {
+                        int raw = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)playerList), off));
+                        if (raw == 0) continue;
+                        playerObj = raw;
+                        playerObjOff = off;
+                        break;
+                    }
+                    if (playerObj != 0) score += 6;
+                }
+
+                bool hasPlayerPos = false;
+                int playerPosOff = 0;
+                if (playerObj != 0)
+                {
+                    int[] posOffsets = { 0x94, 0x34, 0x64, 0xC4 };
+                    foreach (int poff in posOffsets)
+                    {
+                        float x = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(new IntPtr((uint)playerObj), poff));
+                        float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(new IntPtr((uint)playerObj), poff + 4));
+                        float z = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(new IntPtr((uint)playerObj), poff + 8));
+                        bool plausible = !float.IsNaN(x) && !float.IsNaN(y) && !float.IsNaN(z) &&
+                                        !float.IsInfinity(x) && !float.IsInfinity(y) && !float.IsInfinity(z) &&
+                                        Math.Abs(x) < 1_000_000f && Math.Abs(y) < 1_000_000f && Math.Abs(z) < 1_000_000f &&
+                                        !(Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f);
+                        if (!plausible) continue;
+                        hasPlayerPos = true;
+                        playerPosOff = poff;
+                        break;
+                    }
+                    if (hasPlayerPos) score += 10;
+                }
+
+                int npcMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D451C));
+                bool hasNpcMgr = npcMgr != 0;
+                if (hasNpcMgr) score += 2;
+
+                bool hasNpcFirst = false;
+                if (hasNpcMgr)
+                {
+                    int firstNode = MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)(npcMgr + 8)));
+                    hasNpcFirst = firstNode != 0;
+                    if (hasNpcFirst) score += 3;
+                }
+
+                string summary =
+                    $"pmgr={(hasPlayerMgr ? 1 : 0)} plist={(playerList != 0 ? 1 : 0)} pobj={(playerObj != 0 ? 1 : 0)}@0x{playerObjOff:X2} " +
+                    $"ppos={(hasPlayerPos ? 1 : 0)}@0x{playerPosOff:X2} nmgr={(hasNpcMgr ? 1 : 0)} nfirst={(hasNpcFirst ? 1 : 0)}";
+                return (score, summary);
+            }
+
+            (Process game, IntPtr moduleBase, IntPtr hProcess, List<string> logs) SelectGameProcess(Process[] procs, bool collectLogs = false)
             {
                 Process best = null;
                 IntPtr bestModuleBase = IntPtr.Zero;
                 IntPtr bestHandle = IntPtr.Zero;
                 int bestScore = int.MinValue;
+                var logs = new List<string>();
 
                 foreach (var p in procs)
                 {
@@ -56,11 +128,16 @@ namespace Xajh
                         if (candidateHandle == IntPtr.Zero) continue;
 
                         int score = 0;
-                        var (hasPlayerMgr, hasNpcMgr) = ProbeStatics(candidateHandle, candidateBase);
-                        if (hasPlayerMgr) score += 6;
-                        if (hasNpcMgr) score += 2;
+                        var (chainScore, chainSummary) = ProbeGameChains(candidateHandle, candidateBase);
+                        score += chainScore;
                         if (p.MainWindowHandle != IntPtr.Zero) score += 2;
+                        else score -= 2;
                         if (p.WorkingSet64 > 100L * 1024L * 1024L) score += 1;
+                        if (collectLogs)
+                        {
+                            long mb = p.WorkingSet64 / (1024L * 1024L);
+                            logs.Add($"PID={p.Id} score={score,2} base=0x{candidateBase.ToInt64():X8} win={(p.MainWindowHandle != IntPtr.Zero ? 1 : 0)} ws={mb}MB {chainSummary}");
+                        }
 
                         if (score > bestScore)
                         {
@@ -82,7 +159,7 @@ namespace Xajh
                     }
                 }
 
-                return (best, bestModuleBase, bestHandle);
+                return (best, bestModuleBase, bestHandle, logs);
             }
 
             Console.WriteLine("[*] Waiting for game process (vrchat1) ...");
@@ -154,8 +231,10 @@ namespace Xajh
                     var procs = Process.GetProcessesByName("vrchat1");
                     if (procs.Length == 0) return false;
 
-                    var picked = SelectGameProcess(procs);
+                    var picked = SelectGameProcess(procs, collectLogs: true);
                     if (picked.game == null || picked.hProcess == IntPtr.Zero) return false;
+                    foreach (var line in picked.logs)
+                        Console.WriteLine($"[PICK] {line}");
 
                     bool sameProcess = game != null &&
                         !game.HasExited &&
