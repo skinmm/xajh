@@ -29,7 +29,7 @@ namespace Xajh
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
             static IntPtr Ptr32(int value) => new IntPtr(value);
             static IntPtr Ptr32Add(int baseValue, int offset) => new IntPtr(unchecked(baseValue + offset));
-            int[] directMgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C, 0x9D4524, 0x9D450C };
+            int[] directMgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D4524, 0x9D450C };
             int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
             int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
             int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0xA4, 0xB4, 0xD4, 0xE4, 0x104, 0x114 };
@@ -41,7 +41,7 @@ namespace Xajh
             int preferredDirectLink = -1; // -1 = root object, otherwise pointer field offset
             int preferredDirectPos = 0x94;
             bool hasDirectCache = false;
-            float directCx = 0f, directCy = 0f;
+            float directCx = 0f, directCy = 0f, directCz = 0f;
             int preferredDirectStaticReads = 0;
             var directLastByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), (float x, float y)>();
             bool directCalibrating = false;
@@ -122,75 +122,164 @@ namespace Xajh
                 out float x, out float y, out float z, out string source)
             {
                 x = 0f; y = 0f; z = 0f; source = "direct:none";
+
+                // Strict lock mode: when calibration selected a chain, never hop to unrelated chains.
+                if (directCalibLock.HasValue)
+                {
+                    var lk = directCalibLock.Value;
+                    int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, lk.mgr));
+                    if (mgr != 0)
+                    {
+                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lk.list));
+                        if (list != 0)
+                        {
+                            int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, lk.obj));
+                            if (raw != 0)
+                            {
+                                int targetRaw = raw;
+                                if (lk.link != -1)
+                                {
+                                    int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, lk.link));
+                                    targetRaw = (subRaw != 0 && subRaw != raw) ? subRaw : 0;
+                                }
+
+                                if (targetRaw != 0)
+                                {
+                                    var targetPtr = Ptr32(targetRaw);
+
+                                    // Exact locked position offset first.
+                                    if (TryReadStablePos(hProcess, targetPtr, lk.pos, out x, out y, out z))
+                                    {
+                                        preferredDirectMgr = lk.mgr;
+                                        preferredDirectList = lk.list;
+                                        preferredDirectObj = lk.obj;
+                                        preferredDirectLink = lk.link;
+                                        preferredDirectPos = lk.pos;
+                                        directCx = x; directCy = y; directCz = z; hasDirectCache = true;
+                                        string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
+                                        source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lk.pos:X2},pref-lock)";
+                                        return true;
+                                    }
+
+                                    // Same chain relaxed fallback: allow pos offset switch but keep locked chain.
+                                    var lockPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                                    int[] seeds = lk.link == -1 ? directPosOffsets : directSubPosOffsets;
+                                    int scanLen = lk.link == -1 ? 0x240 : 0x180;
+                                    CollectPosCandidatesFromAddress(hProcess, targetPtr, scanLen, seeds, lockPosCandidates);
+                                    if (lockPosCandidates.Count > 0)
+                                    {
+                                        float best = float.MinValue;
+                                        int bestPos = lk.pos;
+                                        float bx = 0f, by = 0f, bz = 0f;
+                                        foreach (var c in lockPosCandidates)
+                                        {
+                                            float s = 0f;
+                                            if (c.po == lk.pos) s += 2f;
+                                            if (c.po == preferredDirectPos) s += 1f;
+                                            if (hasDirectCache)
+                                            {
+                                                double d = Math.Sqrt(Math.Pow(c.x - directCx, 2) + Math.Pow(c.y - directCy, 2));
+                                                if (d <= 30f) s += 4f;
+                                                else if (d <= 300f) s += 2f;
+                                                else if (d > 3000f) s -= 3f;
+                                            }
+                                            if (directMotionByKey.TryGetValue((lk.mgr, lk.list, lk.obj, lk.link, c.po), out float mv))
+                                                s += Math.Min(mv, 10f);
+                                            if (s > best)
+                                            {
+                                                best = s;
+                                                bestPos = c.po;
+                                                bx = c.x; by = c.y; bz = c.z;
+                                            }
+                                        }
+
+                                        x = bx; y = by; z = bz;
+                                        preferredDirectMgr = lk.mgr;
+                                        preferredDirectList = lk.list;
+                                        preferredDirectObj = lk.obj;
+                                        preferredDirectLink = lk.link;
+                                        preferredDirectPos = bestPos;
+                                        directCalibLock = (lk.mgr, lk.list, lk.obj, lk.link, bestPos);
+                                        directCx = x; directCy = y; directCz = z; hasDirectCache = true;
+                                        string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
+                                        source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{bestPos:X2},pref-lock-relaxed)";
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Final strict lock fallback: keep last locked position instead of hopping chains.
+                    if (hasDirectCache)
+                    {
+                        x = directCx; y = directCy; z = directCz;
+                        string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
+                        source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lk.pos:X2},pref-lock-cache)";
+                        return true;
+                    }
+                }
+
                 var samples = new List<(int mo, int lo, int oo, int link, int po, float x, float y, float z, bool seeded)>();
 
                 var mgrOrder = new List<int> { preferredDirectMgr };
                 foreach (int mo in directMgrOffsets)
                     if (mo != preferredDirectMgr) mgrOrder.Add(mo);
 
-                foreach (int mo in mgrOrder)
+                void CollectSamples(int[] mgrSet, int[] listSet, int[] objSet)
                 {
-                    int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, mo));
-                    if (mgr == 0) continue;
-
-                    foreach (int lo in directListOffsets)
+                    foreach (int mo in mgrSet)
                     {
-                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lo));
-                        if (list == 0) continue;
+                        int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, mo));
+                        if (mgr == 0) continue;
 
-                        foreach (int oo in directObjOffsets)
+                        foreach (int lo in listSet)
                         {
-                            int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, oo));
-                            if (raw == 0) continue;
-                            var pobj = Ptr32(raw);
+                            int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lo));
+                            if (list == 0) continue;
 
-                            // Root object position candidates.
-                            var rootPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
-                            CollectPosCandidatesFromAddress(hProcess, pobj, 0x240, directPosOffsets, rootPosCandidates);
-                            foreach (var c in rootPosCandidates)
-                                samples.Add((mo, lo, oo, -1, c.po, c.x, c.y, c.z, c.seeded));
-
-                            // One-level pointer-linked sub-objects; many maps keep moving
-                            // world coords in a linked child object while root looks static.
-                            foreach (int linkOff in directPtrOffsets)
+                            foreach (int oo in objSet)
                             {
-                                int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, linkOff));
-                                if (subRaw == 0 || subRaw == raw) continue;
-                                if (subRaw < 0x00100000) continue;
+                                int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, oo));
+                                if (raw == 0) continue;
+                                var pobj = Ptr32(raw);
 
-                                var subObj = Ptr32(subRaw);
-                                var subPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
-                                CollectPosCandidatesFromAddress(hProcess, subObj, 0x180, directSubPosOffsets, subPosCandidates);
-                                foreach (var c in subPosCandidates)
-                                    samples.Add((mo, lo, oo, linkOff, c.po, c.x, c.y, c.z, c.seeded));
+                                // Root object position candidates.
+                                var rootPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                                CollectPosCandidatesFromAddress(hProcess, pobj, 0x240, directPosOffsets, rootPosCandidates);
+                                foreach (var c in rootPosCandidates)
+                                    samples.Add((mo, lo, oo, -1, c.po, c.x, c.y, c.z, c.seeded));
+
+                                // One-level pointer-linked sub-objects; many maps keep moving
+                                // world coords in a linked child object while root looks static.
+                                foreach (int linkOff in directPtrOffsets)
+                                {
+                                    int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, linkOff));
+                                    if (subRaw == 0 || subRaw == raw) continue;
+                                    if (subRaw < 0x00100000) continue;
+
+                                    var subObj = Ptr32(subRaw);
+                                    var subPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                                    CollectPosCandidatesFromAddress(hProcess, subObj, 0x180, directSubPosOffsets, subPosCandidates);
+                                    foreach (var c in subPosCandidates)
+                                        samples.Add((mo, lo, oo, linkOff, c.po, c.x, c.y, c.z, c.seeded));
+                                }
                             }
                         }
                     }
                 }
 
+                // Phase 1: strict player chain family only.
+                int[] primaryMgr = { 0x9D4518, 0x9D4514 };
+                int[] primaryList = { 0x08 };
+                int[] primaryObj = { 0x4C, 0x48 };
+                CollectSamples(primaryMgr, primaryList, primaryObj);
+
+                // Phase 2: broader fallback only if strict chain found nothing.
+                if (samples.Count == 0)
+                    CollectSamples(mgrOrder.ToArray(), directListOffsets, directObjOffsets);
+
                 if (samples.Count == 0) return false;
-
-                // If movement calibration locked a candidate, use it directly when present.
-                if (directCalibLock.HasValue)
-                {
-                    var lk = directCalibLock.Value;
-                    foreach (var s in samples)
-                    {
-                        if (s.mo != lk.mgr || s.lo != lk.list || s.oo != lk.obj || s.link != lk.link || s.po != lk.pos)
-                            continue;
-
-                        x = s.x; y = s.y; z = s.z;
-                        preferredDirectMgr = s.mo;
-                        preferredDirectList = s.lo;
-                        preferredDirectObj = s.oo;
-                        preferredDirectLink = s.link;
-                        preferredDirectPos = s.po;
-                        directCx = x; directCy = y; hasDirectCache = true;
-                        string lockTag = s.link == -1 ? "root" : $"sub+0x{s.link:X2}";
-                        source = $"direct(mgr=0x{s.mo:X},list=0x{s.lo:X2},obj=0x{s.oo:X2},ln={lockTag},pos=0x{s.po:X2},pref-lock)";
-                        return true;
-                    }
-                }
 
                 bool preferredLooksStatic = false;
                 bool anyAltMoved = false;
@@ -230,13 +319,6 @@ namespace Xajh
                                   s.oo == preferredDirectObj &&
                                   s.link == preferredDirectLink &&
                                   s.po == preferredDirectPos;
-                    bool isLocked = directCalibLock.HasValue &&
-                                    s.mo == directCalibLock.Value.mgr &&
-                                    s.lo == directCalibLock.Value.list &&
-                                    s.oo == directCalibLock.Value.obj &&
-                                    s.link == directCalibLock.Value.link &&
-                                    s.po == directCalibLock.Value.pos;
-
                     float score = 0f;
                     if (s.mo == preferredDirectMgr) score += 2f;
                     if (s.lo == preferredDirectList) score += 1f;
@@ -245,6 +327,7 @@ namespace Xajh
                     if (s.po == preferredDirectPos) score += 2f;
                     if (s.lo == 0x08) score += 1f;
                     if (s.oo == 0x4C) score += 1f;
+                    if (s.oo == 0x48) score += 0.7f;
                     if (s.link == -1 && s.po == 0x94) score += 0.5f;
                     if (s.link != -1) score += 0.5f;
                     if (!s.seeded) score -= 0.35f;
@@ -271,12 +354,6 @@ namespace Xajh
                         score -= 10f;
                     if (!isPref && preferredDirectStaticReads >= 2)
                         score += 2f;
-                    if (directCalibLock.HasValue)
-                    {
-                        if (isLocked) score += 120f;
-                        else score -= 120f;
-                    }
-
                     if (score > bestScore)
                     {
                         bestScore = score;
@@ -308,7 +385,7 @@ namespace Xajh
                 preferredDirectObj = bestObj;
                 preferredDirectLink = bestLink;
                 preferredDirectPos = bestPos;
-                directCx = x; directCy = y; hasDirectCache = true;
+                directCx = x; directCy = y; directCz = z; hasDirectCache = true;
                 string linkTag = bestLink == -1 ? "root" : $"sub+0x{bestLink:X2}";
                 source = $"direct(mgr=0x{bestMgr:X},list=0x{bestList:X2},obj=0x{bestObj:X2},ln={linkTag},pos=0x{bestPos:X2},st={preferredDirectStaticReads},cand={samples.Count},lock={(directCalibLock.HasValue ? 1 : 0)})";
                 return true;
