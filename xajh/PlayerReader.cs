@@ -5,19 +5,37 @@ namespace xajh
 {
     class PlayerReader
     {
+        readonly struct PosSample
+        {
+            public readonly int Offset;
+            public readonly float X;
+            public readonly float Y;
+            public readonly float Z;
+
+            public PosSample(int offset, float x, float y, float z)
+            {
+                Offset = offset;
+                X = x;
+                Y = y;
+                Z = z;
+            }
+        }
+
         public readonly struct DebugSnapshot
         {
             public readonly IntPtr PlayerObj;
-            public readonly int ObjOffset;
+            public readonly int ObjOffset;     // offset in player list node -> playerObj*
+            public readonly int PosOffset;     // offset in playerObj -> XYZ block
             public readonly float RawX;
             public readonly float RawY;
             public readonly float RawZ;
             public readonly string Source;
 
-            public DebugSnapshot(IntPtr playerObj, int objOffset, float rawX, float rawY, float rawZ, string source)
+            public DebugSnapshot(IntPtr playerObj, int objOffset, int posOffset, float rawX, float rawY, float rawZ, string source)
             {
                 PlayerObj = playerObj;
                 ObjOffset = objOffset;
+                PosOffset = posOffset;
                 RawX = rawX;
                 RawY = rawY;
                 RawZ = rawZ;
@@ -29,24 +47,34 @@ namespace xajh
         const long MgrOffset = 0x9D4518;
         const int ListOffset = 0x08;
         const int DefaultPlayerObjOffset = 0x4C;
+        const int DefaultPosOffset = 0x94;
         readonly int[] _candidateObjOffsets =
         {
             0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C, 0x5C, 0x38, 0x60
+        };
+        readonly int[] _candidatePosOffsets =
+        {
+            // Translation triplets from four 3x3 matrix blocks inside player object.
+            0x94, 0x34, 0x64, 0xC4
         };
 
         readonly IntPtr _h, _m;
         float _cx, _cy, _cz;
         bool _hasCache;
         int _preferredObjOffset = DefaultPlayerObjOffset;
+        int _preferredPosOffset = DefaultPosOffset;
+        readonly Dictionary<int, (float x, float y, float z)> _lastPosByOffset = new Dictionary<int, (float x, float y, float z)>();
+        int _preferredPosStaticReads = 0;
         IntPtr _dbgPlayerObj = IntPtr.Zero;
         int _dbgObjOffset = 0;
+        int _dbgPosOffset = 0;
         float _dbgRawX = float.NaN, _dbgRawY = float.NaN, _dbgRawZ = float.NaN;
         string _dbgSource = "none";
 
         public PlayerReader(IntPtr h, IntPtr m) { _h = h; _m = m; }
 
         public DebugSnapshot GetDebugSnapshot()
-            => new DebugSnapshot(_dbgPlayerObj, _dbgObjOffset, _dbgRawX, _dbgRawY, _dbgRawZ, _dbgSource);
+            => new DebugSnapshot(_dbgPlayerObj, _dbgObjOffset, _dbgPosOffset, _dbgRawX, _dbgRawY, _dbgRawZ, _dbgSource);
 
         public (float x, float y, float z) Get()
         {
@@ -105,16 +133,99 @@ namespace xajh
         {
             x = 0f; y = 0f; z = 0f;
             if (!TryGetPlayerObject(out IntPtr p)) return false;
+            if (!TryReadBestPlayerPos(p, out x, out y, out z, out int posOffset)) return false;
+            _dbgPosOffset = posOffset;
+            _dbgRawX = x; _dbgRawY = y; _dbgRawZ = z;
+            return true;
+        }
 
-            x = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x94));
-            y = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x98));
-            z = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x9C));
-            if (!IsCoordinatePlausible(x, y, z)) return false;
+        bool TryReadBestPlayerPos(IntPtr playerObj, out float x, out float y, out float z, out int posOffset)
+        {
+            x = 0f; y = 0f; z = 0f; posOffset = 0;
+            var samples = new List<PosSample>(_candidatePosOffsets.Length);
+            foreach (int off in _candidatePosOffsets)
+            {
+                if (!TryReadPosAtOffset(playerObj, off, out float sx, out float sy, out float sz))
+                    continue;
+                samples.Add(new PosSample(off, sx, sy, sz));
+            }
 
-            // Treat pure zero-vector as invalid player location.
-            if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f)
+            if (samples.Count == 0)
                 return false;
 
+            bool preferredLooksStatic = false;
+            bool anyAltMovedFromCache = false;
+            if (_hasCache)
+            {
+                foreach (var s in samples)
+                {
+                    double dCache = DistXY(s.X, s.Y, _cx, _cy);
+                    if (s.Offset == _preferredPosOffset && dCache < 0.01)
+                        preferredLooksStatic = true;
+                    if (s.Offset != _preferredPosOffset && dCache > 0.20 && dCache <= 300.0)
+                        anyAltMovedFromCache = true;
+                }
+            }
+
+            if (preferredLooksStatic && anyAltMovedFromCache)
+                _preferredPosStaticReads++;
+            else
+                _preferredPosStaticReads = 0;
+
+            float bestScore = float.MinValue;
+            PosSample best = samples[0];
+            foreach (var s in samples)
+            {
+                float score = 0f;
+
+                if (s.Offset == _preferredPosOffset) score += 2f;
+                if (s.Offset == DefaultPosOffset) score += 1f;
+
+                if (_hasCache)
+                {
+                    double dCache = DistXY(s.X, s.Y, _cx, _cy);
+                    if (dCache <= 10.0) score += 2f;
+                    else if (dCache <= 300.0) score += 1f;
+                    else score -= 3f;
+
+                    if (dCache > 0.20 && dCache <= 300.0) score += 1f;
+                }
+
+                if (_lastPosByOffset.TryGetValue(s.Offset, out var last))
+                {
+                    double dSelf = DistXY(s.X, s.Y, last.x, last.y);
+                    if (dSelf > 0.05 && dSelf <= 300.0) score += 2f;
+                    else if (dSelf < 0.005) score -= 0.5f;
+                }
+
+                // If current preferred block appears frozen while another block moves,
+                // strongly encourage a switch after a couple of consecutive reads.
+                if (s.Offset == _preferredPosOffset && _preferredPosStaticReads >= 2)
+                    score -= 6f;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = s;
+                }
+            }
+
+            foreach (var s in samples)
+                _lastPosByOffset[s.Offset] = (s.X, s.Y, s.Z);
+
+            _preferredPosOffset = best.Offset;
+            x = best.X; y = best.Y; z = best.Z;
+            posOffset = best.Offset;
+            return true;
+        }
+
+        bool TryReadPosAtOffset(IntPtr playerObj, int posOffset, out float x, out float y, out float z)
+        {
+            x = MemoryHelper.ReadFloat(_h, IntPtr.Add(playerObj, posOffset));
+            y = MemoryHelper.ReadFloat(_h, IntPtr.Add(playerObj, posOffset + 4));
+            z = MemoryHelper.ReadFloat(_h, IntPtr.Add(playerObj, posOffset + 8));
+            if (!IsCoordinatePlausible(x, y, z)) return false;
+            if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) return false;
             return true;
         }
 
@@ -123,6 +234,7 @@ namespace xajh
             playerObj = IntPtr.Zero;
             _dbgPlayerObj = IntPtr.Zero;
             _dbgObjOffset = 0;
+            _dbgPosOffset = 0;
             _dbgRawX = float.NaN; _dbgRawY = float.NaN; _dbgRawZ = float.NaN;
             _dbgSource = "none";
 
@@ -210,6 +322,9 @@ namespace xajh
                 return false;
             return true;
         }
+
+        static double DistXY(float ax, float ay, float bx, float by)
+            => Math.Sqrt(Math.Pow(ax - bx, 2) + Math.Pow(ay - by, 2));
 
         (float, float, float) Cached() => _hasCache ? (_cx, _cy, _cz) : (0f, 0f, 0f);
     }
