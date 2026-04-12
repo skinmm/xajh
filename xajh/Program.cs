@@ -208,8 +208,8 @@ namespace Xajh
                 string r = turn.FaceTarget(() => playerReader.Get(), target.X, target.Y);
                 bool fightTriggered = false;
                 if (!r.StartsWith("[!]"))
-                    fightTriggered = turn.TriggerFight();
-                string fightStatus = fightTriggered ? "fight=F" : "fight=!";
+                    fightTriggered = turn.TriggerTargetAndFight();
+                string fightStatus = fightTriggered ? "target=X fight=F" : "target/fight=!";
                 return $"→ {target.Name} d={distXY:F0}  {r}  {fightStatus}  ({nearby.Count} in range)";
             }
 
