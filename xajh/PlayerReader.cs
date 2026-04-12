@@ -5,6 +5,7 @@ namespace xajh
 {
     class PlayerReader
     {
+        public static IntPtr GlobalPosAddr = new IntPtr(0x0B201ABC);
         const long MgrOffset = 0x9D4518;
         const int ListOffset = 0x08;
         const int DefaultPlayerObjOffset = 0x4C;
@@ -24,13 +25,53 @@ namespace xajh
         {
             try
             {
-                if (!TryReadPlayerObjectPos(out float x, out float y, out float z))
+                bool haveObj = TryReadPlayerObjectPos(out float ox, out float oy, out float oz);
+                bool haveGlobal = TryReadGlobalXY(out float gx, out float gy);
+
+                float x, y, z;
+                if (haveObj)
+                {
+                    // Some wrong object candidates read as exactly 0,0,0.
+                    // If that happens, prefer global world-space XY when available.
+                    bool objLooksZero = Math.Abs(ox) < 0.001f && Math.Abs(oy) < 0.001f && Math.Abs(oz) < 0.001f;
+                    if (objLooksZero && haveGlobal && (Math.Abs(gx) > 1f || Math.Abs(gy) > 1f))
+                    {
+                        x = gx;
+                        y = gy;
+                        z = _hasCache ? _cz : 0f;
+                    }
+                    else
+                    {
+                        x = ox;
+                        y = oy;
+                        z = oz;
+                    }
+                }
+                else if (haveGlobal)
+                {
+                    x = gx;
+                    y = gy;
+                    z = _hasCache ? _cz : 0f;
+                }
+                else
+                {
                     return Cached();
+                }
 
                 _cx = x; _cy = y; _cz = z; _hasCache = true;
                 return (x, y, z);
             }
             catch { return Cached(); }
+        }
+
+        bool TryReadGlobalXY(out float x, out float y)
+        {
+            x = MemoryHelper.ReadFloat(_h, GlobalPosAddr);
+            y = MemoryHelper.ReadFloat(_h, IntPtr.Add(GlobalPosAddr, 4));
+            if (float.IsNaN(x) || float.IsNaN(y)) return false;
+            if (float.IsInfinity(x) || float.IsInfinity(y)) return false;
+            if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f) return false;
+            return true;
         }
 
         bool TryReadPlayerObjectPos(out float x, out float y, out float z)
@@ -68,6 +109,7 @@ namespace xajh
                 float y = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x98));
                 float z = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x9C));
                 if (!IsCoordinatePlausible(x, y, z)) continue;
+                if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) continue;
 
                 float c = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x10));
                 float s = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x1C));
