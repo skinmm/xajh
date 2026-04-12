@@ -139,6 +139,32 @@ namespace Xajh
             }
 
             var turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+            var npcSnapshotLock = new object();
+            var npcSnapshot = new List<Npc>();
+            try
+            {
+                npcSnapshot = npcReader.GetAllNpcs();
+            }
+            catch { }
+
+            var npcTrackerCts = new CancellationTokenSource();
+            var npcTracker = new Thread(() =>
+            {
+                while (!npcTrackerCts.IsCancellationRequested)
+                {
+                    try
+                    {
+                        var fresh = npcReader.GetAllNpcs();
+                        lock (npcSnapshotLock)
+                            npcSnapshot = fresh;
+                    }
+                    catch { }
+                    Thread.Sleep(120);
+                }
+            })
+            { IsBackground = true };
+            npcTracker.Start();
+            Console.WriteLine("[*] NPC tracker thread started");
 
             Console.WriteLine("=== XAJH Combat Overlay ===");
             Console.WriteLine("[X] Aim nearest NPC    [A] Auto-aim toggle    [C] Reset calibration");
@@ -162,10 +188,16 @@ namespace Xajh
 
             // Get NPCs within radius, sorted by HORIZONTAL (XY) distance
             // In this game: X,Y = ground plane, Z = height
+            List<Npc> GetTrackedNpcs()
+            {
+                lock (npcSnapshotLock)
+                    return new List<Npc>(npcSnapshot);
+            }
+
             List<(Npc npc, double distXY, double dist3D)> GetNearbyNpcs()
             {
                 var (px, py, pz) = playerReader.Get();
-                var npcs = npcReader.GetAllNpcs();
+                var npcs = GetTrackedNpcs();
                 var nearby = new List<(Npc, double, double)>();
                 foreach (var n in npcs)
                 {
@@ -213,190 +245,199 @@ namespace Xajh
                 return $"→ {target.Name} d={distXY:F0}  {r}  {fightStatus}  ({nearby.Count} in range)";
             }
 
-            while (true)
+            try
             {
-                if (Console.KeyAvailable)
+                while (true)
                 {
-                    var key = Console.ReadKey(true).Key;
-                    if (key == ConsoleKey.End) break;
+                    if (Console.KeyAvailable)
+                    {
+                        var key = Console.ReadKey(true).Key;
+                        if (key == ConsoleKey.End) break;
 
-                    if (key == ConsoleKey.X)
-                    {
-                        Console.WriteLine($"[X] {AimNearest()}");
-                    }
-                    else if (key == ConsoleKey.L)
-                    {
-                        var (px, py, pz) = playerReader.Get();
-                        Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
+                        if (key == ConsoleKey.X)
+                        {
+                            Console.WriteLine($"[X] {AimNearest()}");
+                        }
+                        else if (key == ConsoleKey.L)
+                        {
+                            var (px, py, pz) = playerReader.Get();
+                            Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
 
-                        // NPC list
-                        var allNpcs = npcReader.GetAllNpcs();
-                        Console.WriteLine($"\n── All NPCs from NpcReader ({allNpcs.Count} total) ──");
-                        Console.WriteLine($"  {"#",3}  {"Name",-20} {"X",9} {"Y",9} {"Z",9}  {"xzDist",8}  in?");
-                        for (int i = 0; i < allNpcs.Count && i < 50; i++)
-                        {
-                            var n = allNpcs[i];
-                            double dxy = Math.Sqrt(Math.Pow(n.X - px, 2) + Math.Pow(n.Y - py, 2));
-                            string inRange = dxy <= aimRadius ? "  ✓" : "";
-                            Console.WriteLine($"  {i + 1,3}. {n.Name,-20} {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}  {dxy,8:F0}{inRange}");
-                        }
+                            // NPC list
+                            var allNpcs = GetTrackedNpcs();
+                            Console.WriteLine($"\n── All NPCs from NpcReader ({allNpcs.Count} total) ──");
+                            Console.WriteLine($"  {"#",3}  {"Name",-20} {"X",9} {"Y",9} {"Z",9}  {"xzDist",8}  in?");
+                            for (int i = 0; i < allNpcs.Count && i < 50; i++)
+                            {
+                                var n = allNpcs[i];
+                                double dxy = Math.Sqrt(Math.Pow(n.X - px, 2) + Math.Pow(n.Y - py, 2));
+                                string inRange = dxy <= aimRadius ? "  ✓" : "";
+                                Console.WriteLine($"  {i + 1,3}. {n.Name,-20} {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}  {dxy,8:F0}{inRange}");
+                            }
 
-                        // Entity list (monsters with HP)
-                        var entityMgr = new EntityManager(hProcess, moduleBase);
-                        var enemies = entityMgr.GetEnemies();
-                        Console.WriteLine($"\n── Enemies from EntityManager ({enemies.Count} total) ──");
-                        Console.WriteLine($"  {"#",3}  {"OID",8} {"HP",6}/{"Max",6}  {"Addr",12}");
-                        for (int i = 0; i < enemies.Count && i < 30; i++)
-                        {
-                            var e = enemies[i];
-                            Console.WriteLine($"  {i + 1,3}. {e.OID,8}  {e.HP,6}/{e.MaxHP,6}  0x{e.BaseAddress.ToInt64():X8}  ({e.PosX:F0},{e.PosY:F0},{e.PosZ:F0})");
-                        }
-                        Console.WriteLine();
-                    }
-                    else if (key == ConsoleKey.R)
-                    {
-                        Console.Write("New radius> ");
-                        string line = Console.ReadLine()?.Trim() ?? "";
-                        if (float.TryParse(line, out float r) && r > 0)
-                        {
-                            aimRadius = r;
-                            Console.WriteLine($"[R] Radius set to {aimRadius:F0}");
-                        }
-                        else
-                        {
-                            Console.WriteLine($"[R] Invalid — keeping {aimRadius:F0}");
-                        }
-                    }
-                    else if (key == ConsoleKey.C)
-                    {
-                        turn.ResetCalibration();
-                        Console.WriteLine("[C] Calibration reset");
-                    }
-                    else if (key == ConsoleKey.W)
-                    {
-                        // Enumerate all top-level windows owned by the game process,
-                        // pick the largest visible one (the main viewport).
-                        IntPtr best = IntPtr.Zero;
-                        int bestArea = 0;
-                        foreach (ProcessThread t in game.Threads)
-                        {
-                            // no per-thread enum without P/Invoke; fall back below
-                        }
-                        // Use EnumWindows via Process.MainWindowHandle refresh +
-                        // walk all process windows
-                        game.Refresh();
-                        var handles = new List<IntPtr>();
-                        EnumWindows((h, l) =>
-                        {
-                            GetWindowThreadProcessId(h, out uint pid);
-                            if (pid == (uint)game.Id && IsWindowVisible(h))
+                            // Entity list (monsters with HP)
+                            var entityMgr = new EntityManager(hProcess, moduleBase);
+                            var enemies = entityMgr.GetEnemies();
+                            Console.WriteLine($"\n── Enemies from EntityManager ({enemies.Count} total) ──");
+                            Console.WriteLine($"  {"#",3}  {"OID",8} {"HP",6}/{"Max",6}  {"Addr",12}");
+                            for (int i = 0; i < enemies.Count && i < 30; i++)
                             {
-                                GetClientRect(h, out RECT rc);
-                                int area = (rc.Right - rc.Left) * (rc.Bottom - rc.Top);
-                                if (area > bestArea) { bestArea = area; best = h; }
-                                handles.Add(h);
+                                var e = enemies[i];
+                                Console.WriteLine($"  {i + 1,3}. {e.OID,8}  {e.HP,6}/{e.MaxHP,6}  0x{e.BaseAddress.ToInt64():X8}  ({e.PosX:F0},{e.PosY:F0},{e.PosZ:F0})");
                             }
-                            return true;
-                        }, IntPtr.Zero);
-
-                        Console.WriteLine($"[W] Found {handles.Count} visible windows in process:");
-                        foreach (var h in handles)
-                        {
-                            GetClientRect(h, out RECT rc);
-                            var sb = new System.Text.StringBuilder(256);
-                            GetClassName(h, sb, 256);
-                            Console.WriteLine($"    0x{h.ToInt64():X}  {rc.Right - rc.Left}x{rc.Bottom - rc.Top}  class={sb}");
+                            Console.WriteLine();
                         }
-                        Console.WriteLine($"[W] Picked largest: 0x{best.ToInt64():X} ({bestArea}px²)");
-                        turn = new TurnHelper(hProcess, moduleBase, best);
-                    }
-                    else if (key == ConsoleKey.P)
-                    {
-                        combat.DumpPlayerObject();
-                    }
-                    else if (key == ConsoleKey.O)
-                    {
-                        Console.Write("Enter your /loc X> ");
-                        if (!float.TryParse(Console.ReadLine()?.Trim(), out float locX)) { Console.WriteLine("[!] bad"); continue; }
-                        Console.Write("Enter your /loc Y> ");
-                        if (!float.TryParse(Console.ReadLine()?.Trim(), out float locY)) { Console.WriteLine("[!] bad"); continue; }
-
-                        if (posCandidates.Count == 0)
+                        else if (key == ConsoleKey.R)
                         {
-                            // First pass: full scan
-                            Console.WriteLine($"\n[*] Pass 1: global scan for ({locX:F0}, {locY:F0}) ...");
-                            var hits = MemoryHelper.ScanForFloat(hProcess, locX, 5f);
-                            foreach (var addr in hits)
+                            Console.Write("New radius> ");
+                            string line = Console.ReadLine()?.Trim() ?? "";
+                            if (float.TryParse(line, out float r) && r > 0)
                             {
-                                float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                                if (Math.Abs(y - locY) < 5f) posCandidates.Add(addr);
-                            }
-                            Console.WriteLine($"[*] {posCandidates.Count} candidates. Walk to NEW spot and [O] again to narrow,");
-                            Console.WriteLine($"[*] or just use the first one now: 0x{(posCandidates.Count > 0 ? posCandidates[0].ToInt64() : 0):X8}");
-                            if (posCandidates.Count > 0)
-                            {
-                                PlayerReader.GlobalPosAddr = posCandidates[0];
-                                Console.WriteLine($"[+] PlayerReader.GlobalPosAddr = 0x{posCandidates[0].ToInt64():X8}");
-                            }
-                        }
-                        else
-                        {
-                            // Pass 2+: filter existing candidates
-                            Console.WriteLine($"\n[*] Pass 2: filtering {posCandidates.Count} candidates against ({locX:F0}, {locY:F0}) ...");
-                            var keep = new List<IntPtr>();
-                            foreach (var addr in posCandidates)
-                            {
-                                float x = MemoryHelper.ReadFloat(hProcess, addr);
-                                float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                                if (Math.Abs(x - locX) < 5f && Math.Abs(y - locY) < 5f)
-                                    keep.Add(addr);
-                            }
-                            posCandidates = keep;
-                            Console.WriteLine($"[*] {posCandidates.Count} survived");
-                            foreach (var addr in posCandidates)
-                            {
-                                float x = MemoryHelper.ReadFloat(hProcess, addr);
-                                float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                                Console.WriteLine($"  ✓ 0x{addr.ToInt64():X8}  ({x:F1}, {y:F1})");
-                            }
-                            if (posCandidates.Count == 1)
-                            {
-                                PlayerReader.GlobalPosAddr = posCandidates[0];
-                                Console.WriteLine($"\n[+] LOCKED player position @ 0x{posCandidates[0].ToInt64():X8}");
-                                Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
-                            }
-                            else if (posCandidates.Count > 1)
-                            {
-                                // All surviving addresses mirror the same value — just pick first
-                                PlayerReader.GlobalPosAddr = posCandidates[0];
-                                Console.WriteLine($"\n[+] {posCandidates.Count} aliases, using first: 0x{posCandidates[0].ToInt64():X8}");
-                                Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
+                                aimRadius = r;
+                                Console.WriteLine($"[R] Radius set to {aimRadius:F0}");
                             }
                             else
-                                Console.WriteLine("[!] All filtered out — press [K] to reset, try again.");
+                            {
+                                Console.WriteLine($"[R] Invalid — keeping {aimRadius:F0}");
+                            }
+                        }
+                        else if (key == ConsoleKey.C)
+                        {
+                            turn.ResetCalibration();
+                            Console.WriteLine("[C] Calibration reset");
+                        }
+                        else if (key == ConsoleKey.W)
+                        {
+                            // Enumerate all top-level windows owned by the game process,
+                            // pick the largest visible one (the main viewport).
+                            IntPtr best = IntPtr.Zero;
+                            int bestArea = 0;
+                            foreach (ProcessThread t in game.Threads)
+                            {
+                                // no per-thread enum without P/Invoke; fall back below
+                            }
+                            // Use EnumWindows via Process.MainWindowHandle refresh +
+                            // walk all process windows
+                            game.Refresh();
+                            var handles = new List<IntPtr>();
+                            EnumWindows((h, l) =>
+                            {
+                                GetWindowThreadProcessId(h, out uint pid);
+                                if (pid == (uint)game.Id && IsWindowVisible(h))
+                                {
+                                    GetClientRect(h, out RECT rc);
+                                    int area = (rc.Right - rc.Left) * (rc.Bottom - rc.Top);
+                                    if (area > bestArea) { bestArea = area; best = h; }
+                                    handles.Add(h);
+                                }
+                                return true;
+                            }, IntPtr.Zero);
+
+                            Console.WriteLine($"[W] Found {handles.Count} visible windows in process:");
+                            foreach (var h in handles)
+                            {
+                                GetClientRect(h, out RECT rc);
+                                var sb = new System.Text.StringBuilder(256);
+                                GetClassName(h, sb, 256);
+                                Console.WriteLine($"    0x{h.ToInt64():X}  {rc.Right - rc.Left}x{rc.Bottom - rc.Top}  class={sb}");
+                            }
+                            Console.WriteLine($"[W] Picked largest: 0x{best.ToInt64():X} ({bestArea}px²)");
+                            turn = new TurnHelper(hProcess, moduleBase, best);
+                        }
+                        else if (key == ConsoleKey.P)
+                        {
+                            combat.DumpPlayerObject();
+                        }
+                        else if (key == ConsoleKey.O)
+                        {
+                            Console.Write("Enter your /loc X> ");
+                            if (!float.TryParse(Console.ReadLine()?.Trim(), out float locX)) { Console.WriteLine("[!] bad"); continue; }
+                            Console.Write("Enter your /loc Y> ");
+                            if (!float.TryParse(Console.ReadLine()?.Trim(), out float locY)) { Console.WriteLine("[!] bad"); continue; }
+
+                            if (posCandidates.Count == 0)
+                            {
+                                // First pass: full scan
+                                Console.WriteLine($"\n[*] Pass 1: global scan for ({locX:F0}, {locY:F0}) ...");
+                                var hits = MemoryHelper.ScanForFloat(hProcess, locX, 5f);
+                                foreach (var addr in hits)
+                                {
+                                    float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
+                                    if (Math.Abs(y - locY) < 5f) posCandidates.Add(addr);
+                                }
+                                Console.WriteLine($"[*] {posCandidates.Count} candidates. Walk to NEW spot and [O] again to narrow,");
+                                Console.WriteLine($"[*] or just use the first one now: 0x{(posCandidates.Count > 0 ? posCandidates[0].ToInt64() : 0):X8}");
+                                if (posCandidates.Count > 0)
+                                {
+                                    PlayerReader.GlobalPosAddr = posCandidates[0];
+                                    Console.WriteLine($"[+] PlayerReader.GlobalPosAddr = 0x{posCandidates[0].ToInt64():X8}");
+                                }
+                            }
+                            else
+                            {
+                                // Pass 2+: filter existing candidates
+                                Console.WriteLine($"\n[*] Pass 2: filtering {posCandidates.Count} candidates against ({locX:F0}, {locY:F0}) ...");
+                                var keep = new List<IntPtr>();
+                                foreach (var addr in posCandidates)
+                                {
+                                    float x = MemoryHelper.ReadFloat(hProcess, addr);
+                                    float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
+                                    if (Math.Abs(x - locX) < 5f && Math.Abs(y - locY) < 5f)
+                                        keep.Add(addr);
+                                }
+                                posCandidates = keep;
+                                Console.WriteLine($"[*] {posCandidates.Count} survived");
+                                foreach (var addr in posCandidates)
+                                {
+                                    float x = MemoryHelper.ReadFloat(hProcess, addr);
+                                    float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
+                                    Console.WriteLine($"  ✓ 0x{addr.ToInt64():X8}  ({x:F1}, {y:F1})");
+                                }
+                                if (posCandidates.Count == 1)
+                                {
+                                    PlayerReader.GlobalPosAddr = posCandidates[0];
+                                    Console.WriteLine($"\n[+] LOCKED player position @ 0x{posCandidates[0].ToInt64():X8}");
+                                    Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
+                                }
+                                else if (posCandidates.Count > 1)
+                                {
+                                    // All surviving addresses mirror the same value — just pick first
+                                    PlayerReader.GlobalPosAddr = posCandidates[0];
+                                    Console.WriteLine($"\n[+] {posCandidates.Count} aliases, using first: 0x{posCandidates[0].ToInt64():X8}");
+                                    Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
+                                }
+                                else
+                                    Console.WriteLine("[!] All filtered out — press [K] to reset, try again.");
+                            }
+                        }
+                        else if (key == ConsoleKey.K)
+                        {
+                            posCandidates.Clear();
+                            Console.WriteLine("[K] Position candidates cleared");
+                        }
+                        else if (key == ConsoleKey.A)
+                        {
+                            autoFace = !autoFace;
+                            Console.WriteLine(autoFace ? $"[+] Auto-aim ON (radius={aimRadius:F0})" : "[-] Auto-aim OFF");
                         }
                     }
-                    else if (key == ConsoleKey.K)
-                    {
-                        posCandidates.Clear();
-                        Console.WriteLine("[K] Position candidates cleared");
-                    }
-                    else if (key == ConsoleKey.A)
-                    {
-                        autoFace = !autoFace;
-                        Console.WriteLine(autoFace ? $"[+] Auto-aim ON (radius={aimRadius:F0})" : "[-] Auto-aim OFF");
-                    }
-                }
 
-                if (autoFace)
-                {
-                    Console.WriteLine($"[AUTO] {AimNearest(verbose: false)}");
-                    Thread.Sleep(800);   // throttle auto-aim
+                    if (autoFace)
+                    {
+                        Console.WriteLine($"[AUTO] {AimNearest(verbose: false)}");
+                        Thread.Sleep(800);   // throttle auto-aim
+                    }
+                    else
+                    {
+                        Thread.Sleep(50);
+                    }
                 }
-                else
-                {
-                    Thread.Sleep(50);
-                }
+            }
+            finally
+            {
+                npcTrackerCts.Cancel();
+                if (!npcTracker.Join(600))
+                    Console.WriteLine("[*] NPC tracker thread stop timeout");
             }
 
         }
