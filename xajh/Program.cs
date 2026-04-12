@@ -126,6 +126,7 @@ namespace Xajh
             var npcReader = new NpcReader(hProcess, moduleBase);
             var playerReader = new PlayerReader(hProcess, moduleBase);
             var combat = new CombatOverlay(hProcess, moduleBase);
+            PlayerReader.SetGlobalPosLocked(false);
 
             // Re-acquire window handle (game may create a new window after login)
             IntPtr GetGameHwnd()
@@ -176,6 +177,7 @@ namespace Xajh
             float aimRadius = 300f;
             var posCandidates = new List<IntPtr>();
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
+            Console.WriteLine("[*] Global XY mirror unlocked. Use [O] with /loc to calibrate+lock.");
 
             int GetPlayerObj()
             {
@@ -354,6 +356,7 @@ namespace Xajh
                             if (!float.TryParse(Console.ReadLine()?.Trim(), out float locX)) { Console.WriteLine("[!] bad"); continue; }
                             Console.Write("Enter your /loc Y> ");
                             if (!float.TryParse(Console.ReadLine()?.Trim(), out float locY)) { Console.WriteLine("[!] bad"); continue; }
+                            Console.WriteLine($"[*] {playerReader.UpdateLocationReference(locX, locY)}");
 
                             if (posCandidates.Count == 0)
                             {
@@ -367,11 +370,13 @@ namespace Xajh
                                 }
                                 Console.WriteLine($"[*] {posCandidates.Count} candidates. Walk to NEW spot and [O] again to narrow,");
                                 Console.WriteLine($"[*] or just use the first one now: 0x{(posCandidates.Count > 0 ? posCandidates[0].ToInt64() : 0):X8}");
-                                if (posCandidates.Count > 0)
+                                if (posCandidates.Count == 1)
                                 {
-                                    PlayerReader.GlobalPosAddr = posCandidates[0];
-                                    Console.WriteLine($"[+] PlayerReader.GlobalPosAddr = 0x{posCandidates[0].ToInt64():X8}");
+                                    PlayerReader.SetGlobalPosAddr(posCandidates[0], locked: true);
+                                    Console.WriteLine($"[+] LOCKED global mirror @ 0x{posCandidates[0].ToInt64():X8}");
                                 }
+                                else if (posCandidates.Count > 1)
+                                    Console.WriteLine("[*] Not locking yet (multiple candidates). Walk, then [O] again.");
                             }
                             else
                             {
@@ -395,16 +400,14 @@ namespace Xajh
                                 }
                                 if (posCandidates.Count == 1)
                                 {
-                                    PlayerReader.GlobalPosAddr = posCandidates[0];
+                                    PlayerReader.SetGlobalPosAddr(posCandidates[0], locked: true);
                                     Console.WriteLine($"\n[+] LOCKED player position @ 0x{posCandidates[0].ToInt64():X8}");
                                     Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
                                 }
                                 else if (posCandidates.Count > 1)
                                 {
-                                    // All surviving addresses mirror the same value — just pick first
-                                    PlayerReader.GlobalPosAddr = posCandidates[0];
-                                    Console.WriteLine($"\n[+] {posCandidates.Count} aliases, using first: 0x{posCandidates[0].ToInt64():X8}");
-                                    Console.WriteLine("[+] PlayerReader.GlobalPosAddr updated live");
+                                    Console.WriteLine($"\n[*] {posCandidates.Count} candidates remain — not locking yet.");
+                                    Console.WriteLine("[*] Move again and press [O] to narrow to one address.");
                                 }
                                 else
                                     Console.WriteLine("[!] All filtered out — press [K] to reset, try again.");
@@ -413,6 +416,8 @@ namespace Xajh
                         else if (key == ConsoleKey.K)
                         {
                             posCandidates.Clear();
+                            PlayerReader.SetGlobalPosLocked(false);
+                            playerReader.ClearLocationReference();
                             Console.WriteLine("[K] Position candidates cleared");
                         }
                         else if (key == ConsoleKey.A)

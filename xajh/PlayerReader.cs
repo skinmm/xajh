@@ -4,6 +4,13 @@ namespace xajh
 {
     class PlayerReader
     {
+        enum XySourceMode
+        {
+            Auto,
+            Global,
+            Object
+        }
+
         // Primary path: read player object matrix-translation candidates and
         // choose the most plausible world position each tick.
         // Fallback path: use global mirror address discovered by [O] scanner.
@@ -12,13 +19,89 @@ namespace xajh
         const int PlayerObjOffset = 0x4C;
         static readonly int[] PosCandidateOffsets = { 0x34, 0x64, 0x94, 0xC4 };
         public static IntPtr GlobalPosAddr = new IntPtr(0x0B201ABC);
+        static bool _globalPosLocked;
 
         readonly IntPtr _h, _m;
         float _cx, _cy, _cz;
         bool _hasCache;
         int _preferredPosOffset = 0x94;
+        bool _hasLocReference;
+        float _locRefX, _locRefY;
+        XySourceMode _xySourceMode = XySourceMode.Auto;
 
         public PlayerReader(IntPtr h, IntPtr m) { _h = h; _m = m; }
+
+        public static void SetGlobalPosAddr(IntPtr addr, bool locked = true)
+        {
+            GlobalPosAddr = addr;
+            _globalPosLocked = locked;
+        }
+
+        public static void SetGlobalPosLocked(bool locked) => _globalPosLocked = locked;
+
+        public string UpdateLocationReference(float locX, float locY)
+        {
+            _hasLocReference = true;
+            _locRefX = locX;
+            _locRefY = locY;
+
+            bool haveGlobal = TryReadGlobalMirror(out float gx, out float gy);
+            double dGlobal = double.MaxValue;
+            if (haveGlobal)
+                dGlobal = Math.Sqrt(Math.Pow(gx - locX, 2) + Math.Pow(gy - locY, 2));
+
+            if (!TryGetPlayerObject(out IntPtr pObj))
+            {
+                if (haveGlobal)
+                {
+                    _xySourceMode = XySourceMode.Global;
+                    return $"Reference saved: using GLOBAL XY (d={dGlobal:F1})";
+                }
+                return "Reference saved (player object unavailable now)";
+            }
+
+            int bestOffset = _preferredPosOffset;
+            double bestDist = double.MaxValue;
+            foreach (int off in PosCandidateOffsets)
+            {
+                float cx = MemoryHelper.ReadFloat(_h, IntPtr.Add(pObj, off));
+                float cy = MemoryHelper.ReadFloat(_h, IntPtr.Add(pObj, off + 4));
+                float cz = MemoryHelper.ReadFloat(_h, IntPtr.Add(pObj, off + 8));
+                if (!IsCoordinatePlausible(cx, cy, cz)) continue;
+                double d = Math.Sqrt(Math.Pow(cx - locX, 2) + Math.Pow(cy - locY, 2));
+                if (d < bestDist)
+                {
+                    bestDist = d;
+                    bestOffset = off;
+                }
+            }
+
+            if (bestDist == double.MaxValue)
+            {
+                if (haveGlobal)
+                {
+                    _xySourceMode = XySourceMode.Global;
+                    return $"Reference saved: using GLOBAL XY (d={dGlobal:F1}), no valid object offsets";
+                }
+                return "Reference saved (no valid object offsets now)";
+            }
+
+            _preferredPosOffset = bestOffset;
+            if (!haveGlobal || bestDist < dGlobal)
+            {
+                _xySourceMode = XySourceMode.Object;
+                return $"Reference saved: using OBJECT+0x{bestOffset:X} (d={bestDist:F1})";
+            }
+
+            _xySourceMode = XySourceMode.Global;
+            return $"Reference saved: using GLOBAL XY (d={dGlobal:F1}), object+0x{bestOffset:X} d={bestDist:F1}";
+        }
+
+        public void ClearLocationReference()
+        {
+            _hasLocReference = false;
+            _xySourceMode = XySourceMode.Auto;
+        }
 
         public (float x, float y, float z) Get()
         {
@@ -30,28 +113,31 @@ namespace xajh
                 float x, y, z;
                 if (haveGlobal && haveObjPos)
                 {
-                    bool useObjXY = false;
-                    if (_hasCache)
+                    bool useObjXY;
+                    if (_xySourceMode == XySourceMode.Global)
                     {
-                        double dGlobal = Math.Sqrt(Math.Pow(gx - _cx, 2) + Math.Pow(gy - _cy, 2));
-                        double dObj = Math.Sqrt(Math.Pow(objX - _cx, 2) + Math.Pow(objY - _cy, 2));
-                        // If global jumps wildly while object position stays smooth,
-                        // trust object XY for this tick (global mirror may be stale).
-                        if (dGlobal > 300f && dObj < 80f)
-                            useObjXY = true;
+                        useObjXY = false;
                     }
-
-                    if (useObjXY)
+                    else if (_xySourceMode == XySourceMode.Object)
                     {
-                        x = objX;
-                        y = objY;
+                        useObjXY = true;
                     }
                     else
                     {
-                        // Global mirror XY is the most stable source when valid.
-                        x = gx;
-                        y = gy;
+                        useObjXY = false;
+                        if (_hasCache)
+                        {
+                            double dGlobal = Math.Sqrt(Math.Pow(gx - _cx, 2) + Math.Pow(gy - _cy, 2));
+                            double dObj = Math.Sqrt(Math.Pow(objX - _cx, 2) + Math.Pow(objY - _cy, 2));
+                            // If global jumps wildly while object position stays smooth,
+                            // trust object XY for this tick (global mirror may be stale).
+                            if (dGlobal > 300f && dObj < 80f)
+                                useObjXY = true;
+                        }
                     }
+
+                    x = useObjXY ? objX : gx;
+                    y = useObjXY ? objY : gy;
                     z = objZ;
                 }
                 else if (haveGlobal)
@@ -83,16 +169,7 @@ namespace xajh
         bool TryReadPlayerObjectPos(out float x, out float y, out float z)
         {
             x = 0f; y = 0f; z = 0f;
-            int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
-            if (mgr == 0) return false;
-
-            int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
-            if (list == 0) return false;
-
-            int playerObj = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), PlayerObjOffset));
-            if (playerObj == 0) return false;
-
-            var p = new IntPtr((uint)playerObj);
+            if (!TryGetPlayerObject(out IntPtr p)) return false;
             bool haveGlobal = TryReadGlobalMirror(out float gx, out float gy);
 
             float bestScore = float.MinValue;
@@ -132,6 +209,15 @@ namespace xajh
                     else score -= 2f;
                 }
 
+                if (HasActiveLocReference())
+                {
+                    double dr = Math.Sqrt(Math.Pow(cx - _locRefX, 2) + Math.Pow(cy - _locRefY, 2));
+                    if (dr <= 2f) score += 6f;
+                    else if (dr <= 30f) score += 3f;
+                    else if (dr <= 120f) score += 1f;
+                    else score -= 2f;
+                }
+
                 if (score > bestScore)
                 {
                     bestScore = score;
@@ -149,12 +235,39 @@ namespace xajh
 
         bool TryReadGlobalMirror(out float x, out float y)
         {
+            if (!_globalPosLocked)
+            {
+                x = 0f; y = 0f;
+                return false;
+            }
+
             x = MemoryHelper.ReadFloat(_h, GlobalPosAddr);
             y = MemoryHelper.ReadFloat(_h, IntPtr.Add(GlobalPosAddr, 4));
             if (float.IsNaN(x) || float.IsNaN(y)) return false;
             if (float.IsInfinity(x) || float.IsInfinity(y)) return false;
             if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f) return false;
             return true;
+        }
+
+        bool TryGetPlayerObject(out IntPtr playerObj)
+        {
+            playerObj = IntPtr.Zero;
+            int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
+            if (mgr == 0) return false;
+
+            int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
+            if (list == 0) return false;
+
+            int raw = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), PlayerObjOffset));
+            if (raw == 0) return false;
+
+            playerObj = new IntPtr((uint)raw);
+            return true;
+        }
+
+        bool HasActiveLocReference()
+        {
+            return _hasLocReference;
         }
 
         static bool IsCoordinatePlausible(float x, float y, float z)
