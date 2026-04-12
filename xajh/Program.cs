@@ -44,6 +44,11 @@ namespace Xajh
             float directCx = 0f, directCy = 0f;
             int preferredDirectStaticReads = 0;
             var directLastByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), (float x, float y)>();
+            bool directCalibrating = false;
+            long directCalibEndTicks = 0;
+            var directCalibStartByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), (float x, float y)>();
+            (int mgr, int list, int obj, int link, int pos)? directCalibLock = null;
+            var directMotionByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), float>();
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
@@ -71,12 +76,53 @@ namespace Xajh
                 return true;
             }
 
+            bool TryReadTripletFromBuffer(byte[] buf, int read, int off, out float x, out float y, out float z)
+            {
+                x = 0f; y = 0f; z = 0f;
+                if (off < 0 || off + 12 > read) return false;
+                x = BitConverter.ToSingle(buf, off);
+                y = BitConverter.ToSingle(buf, off + 4);
+                z = BitConverter.ToSingle(buf, off + 8);
+                if (float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z)) return false;
+                if (float.IsInfinity(x) || float.IsInfinity(y) || float.IsInfinity(z)) return false;
+                if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f || Math.Abs(z) > 1_000_000f) return false;
+                if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) return false;
+                return true;
+            }
+
+            void CollectPosCandidatesFromAddress(
+                IntPtr hProcess, IntPtr objAddr, int scanLength, int[] seedOffsets,
+                List<(int po, float x, float y, float z, bool seeded)> outList)
+            {
+                var buf = new byte[scanLength];
+                if (!MemoryHelper.ReadProcessMemory(hProcess, objAddr, buf, scanLength, out int read) || read < 0x40)
+                    return;
+
+                var seen = new HashSet<int>();
+                foreach (int po in seedOffsets)
+                {
+                    if (!seen.Add(po)) continue;
+                    if (TryReadTripletFromBuffer(buf, read, po, out float x, out float y, out float z))
+                        outList.Add((po, x, y, z, true));
+                }
+
+                // Wider scan to discover moving coordinates that are not at known offsets.
+                for (int po = 0x20; po + 12 <= read; po += 4)
+                {
+                    if (!seen.Add(po)) continue;
+                    if (!TryReadTripletFromBuffer(buf, read, po, out float x, out float y, out float z))
+                        continue;
+                    outList.Add((po, x, y, z, false));
+                    if (outList.Count >= 180) break;
+                }
+            }
+
             bool TryReadDirectPlayerPos(
                 IntPtr hProcess, IntPtr moduleBase,
                 out float x, out float y, out float z, out string source)
             {
                 x = 0f; y = 0f; z = 0f; source = "direct:none";
-                var samples = new List<(int mo, int lo, int oo, int link, int po, float x, float y, float z)>();
+                var samples = new List<(int mo, int lo, int oo, int link, int po, float x, float y, float z, bool seeded)>();
 
                 var mgrOrder = new List<int> { preferredDirectMgr };
                 foreach (int mo in directMgrOffsets)
@@ -99,12 +145,10 @@ namespace Xajh
                             var pobj = Ptr32(raw);
 
                             // Root object position candidates.
-                            foreach (int po in directPosOffsets)
-                            {
-                                if (!TryReadStablePos(hProcess, pobj, po, out float px, out float py, out float pz))
-                                    continue;
-                                samples.Add((mo, lo, oo, -1, po, px, py, pz));
-                            }
+                            var rootPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                            CollectPosCandidatesFromAddress(hProcess, pobj, 0x240, directPosOffsets, rootPosCandidates);
+                            foreach (var c in rootPosCandidates)
+                                samples.Add((mo, lo, oo, -1, c.po, c.x, c.y, c.z, c.seeded));
 
                             // One-level pointer-linked sub-objects; many maps keep moving
                             // world coords in a linked child object while root looks static.
@@ -115,12 +159,10 @@ namespace Xajh
                                 if (subRaw < 0x00100000) continue;
 
                                 var subObj = Ptr32(subRaw);
-                                foreach (int po in directSubPosOffsets)
-                                {
-                                    if (!TryReadStablePos(hProcess, subObj, po, out float px, out float py, out float pz))
-                                        continue;
-                                    samples.Add((mo, lo, oo, linkOff, po, px, py, pz));
-                                }
+                                var subPosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                                CollectPosCandidatesFromAddress(hProcess, subObj, 0x180, directSubPosOffsets, subPosCandidates);
+                                foreach (var c in subPosCandidates)
+                                    samples.Add((mo, lo, oo, linkOff, c.po, c.x, c.y, c.z, c.seeded));
                             }
                         }
                     }
@@ -142,7 +184,6 @@ namespace Xajh
                     {
                         double d = Math.Sqrt(Math.Pow(s.x - directCx, 2) + Math.Pow(s.y - directCy, 2));
                         if (d < 0.01) preferredLooksStatic = true;
-                        if (!isPref && d > 0.2 && d <= 3000.0) anyAltMoved = true;
                     }
 
                     if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.link, s.po), out var last))
@@ -167,6 +208,12 @@ namespace Xajh
                                   s.oo == preferredDirectObj &&
                                   s.link == preferredDirectLink &&
                                   s.po == preferredDirectPos;
+                    bool isLocked = directCalibLock.HasValue &&
+                                    s.mo == directCalibLock.Value.mgr &&
+                                    s.lo == directCalibLock.Value.list &&
+                                    s.oo == directCalibLock.Value.obj &&
+                                    s.link == directCalibLock.Value.link &&
+                                    s.po == directCalibLock.Value.pos;
 
                     float score = 0f;
                     if (s.mo == preferredDirectMgr) score += 2f;
@@ -178,6 +225,7 @@ namespace Xajh
                     if (s.oo == 0x4C) score += 1f;
                     if (s.link == -1 && s.po == 0x94) score += 0.5f;
                     if (s.link != -1) score += 0.5f;
+                    if (!s.seeded) score -= 0.35f;
 
                     if (hasDirectCache)
                     {
@@ -191,14 +239,21 @@ namespace Xajh
                     if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.link, s.po), out var last))
                     {
                         double dSelf = Math.Sqrt(Math.Pow(s.x - last.x, 2) + Math.Pow(s.y - last.y, 2));
-                        if (dSelf > 0.2 && dSelf <= 3000f) score += 3f;
+                        if (dSelf > 0.2 && dSelf <= 3000f) score += 3.5f;
                         else if (dSelf < 0.01) score -= 1f;
                     }
+                    if (directMotionByKey.TryGetValue((s.mo, s.lo, s.oo, s.link, s.po), out float mv))
+                        score += Math.Min(mv, 10f);
 
                     if (isPref && preferredDirectStaticReads >= 2)
                         score -= 10f;
                     if (!isPref && preferredDirectStaticReads >= 2)
                         score += 2f;
+                    if (directCalibLock.HasValue)
+                    {
+                        if (isLocked) score += 120f;
+                        else score -= 120f;
+                    }
 
                     if (score > bestScore)
                     {
@@ -209,7 +264,22 @@ namespace Xajh
                 }
 
                 foreach (var s in samples)
-                    directLastByKey[(s.mo, s.lo, s.oo, s.link, s.po)] = (s.x, s.y);
+                {
+                    var k = (s.mo, s.lo, s.oo, s.link, s.po);
+                    if (directLastByKey.TryGetValue(k, out var last))
+                    {
+                        float old = directMotionByKey.TryGetValue(k, out float om) ? om : 0f;
+                        double dSelf = Math.Sqrt(Math.Pow(s.x - last.x, 2) + Math.Pow(s.y - last.y, 2));
+                        float impulse = dSelf > 0.05 ? (float)Math.Min(dSelf, 25.0) : 0f;
+                        directMotionByKey[k] = old * 0.85f + impulse;
+                    }
+                    else
+                    {
+                        if (!directMotionByKey.ContainsKey(k))
+                            directMotionByKey[k] = 0f;
+                    }
+                    directLastByKey[k] = (s.x, s.y);
+                }
 
                 preferredDirectMgr = bestMgr;
                 preferredDirectList = bestList;
@@ -218,7 +288,7 @@ namespace Xajh
                 preferredDirectPos = bestPos;
                 directCx = x; directCy = y; hasDirectCache = true;
                 string linkTag = bestLink == -1 ? "root" : $"sub+0x{bestLink:X2}";
-                source = $"direct(mgr=0x{bestMgr:X},list=0x{bestList:X2},obj=0x{bestObj:X2},ln={linkTag},pos=0x{bestPos:X2},st={preferredDirectStaticReads})";
+                source = $"direct(mgr=0x{bestMgr:X},list=0x{bestList:X2},obj=0x{bestObj:X2},ln={linkTag},pos=0x{bestPos:X2},st={preferredDirectStaticReads},cand={samples.Count},lock={(directCalibLock.HasValue ? 1 : 0)})";
                 return true;
             }
 
@@ -500,7 +570,7 @@ namespace Xajh
 
             Console.WriteLine("=== XAJH Combat Overlay ===");
             Console.WriteLine("[A] Auto-turn+fight toggle    [C] Reset calibration");
-            Console.WriteLine("[R] Set radius         [L] List nearby NPCs   [P] Dump player obj");
+            Console.WriteLine("[R] Set radius  [L] List nearby NPCs  [M] Calibrate fallback  [P] Dump player obj");
             Console.WriteLine("[W] Refresh window     [End] Exit");
             Console.WriteLine();
 
@@ -529,6 +599,63 @@ namespace Xajh
                 }
                 lastDirectSource = "";
                 return p;
+            }
+
+            void RunDirectMovementCalibration()
+            {
+                Console.WriteLine("[M] Calibrating fallback source. Move your character for ~3 seconds...");
+                directCalibrating = true;
+                directCalibEndTicks = Environment.TickCount64 + 3200;
+                directCalibStartByKey.Clear();
+                directMotionByKey.Clear();
+                directCalibLock = null;
+                directLastByKey.Clear();
+                hasDirectCache = false;
+                preferredDirectStaticReads = 0;
+
+                while (Environment.TickCount64 < directCalibEndTicks)
+                {
+                    TryReadDirectPlayerPos(hProcess, moduleBase, out _, out _, out _, out _);
+                    foreach (var kv in directLastByKey)
+                        if (!directCalibStartByKey.ContainsKey(kv.Key))
+                            directCalibStartByKey[kv.Key] = kv.Value;
+                    Thread.Sleep(120);
+                }
+
+                directCalibrating = false;
+                (int mgr, int list, int obj, int link, int pos)? bestKey = null;
+                float bestMotion = 0f;
+                foreach (var kv in directMotionByKey)
+                {
+                    if (kv.Value > bestMotion)
+                    {
+                        bestMotion = kv.Value;
+                        bestKey = kv.Key;
+                    }
+                }
+
+                if (!bestKey.HasValue || bestMotion < 1.0f)
+                {
+                    Console.WriteLine("[M] Calibration failed: no moving candidate detected.");
+                    return;
+                }
+
+                var bk = bestKey.Value;
+                directCalibLock = bk;
+                preferredDirectMgr = bk.mgr;
+                preferredDirectList = bk.list;
+                preferredDirectObj = bk.obj;
+                preferredDirectLink = bk.link;
+                preferredDirectPos = bk.pos;
+                preferredDirectStaticReads = 0;
+                if (directLastByKey.TryGetValue(bk, out var last))
+                {
+                    directCx = last.x;
+                    directCy = last.y;
+                    hasDirectCache = true;
+                }
+                string linkTag = bk.link == -1 ? "root" : $"sub+0x{bk.link:X2}";
+                Console.WriteLine($"[M] Locked fallback: mgr=0x{bk.mgr:X} list=0x{bk.list:X2} obj=0x{bk.obj:X2} ln={linkTag} pos=0x{bk.pos:X2} motion={bestMotion:F1}");
             }
 
             // Get NPCs within radius, sorted by HORIZONTAL (XY) distance
@@ -659,6 +786,10 @@ namespace Xajh
                             {
                                 Console.WriteLine($"[R] Invalid — keeping {aimRadius:F0}");
                             }
+                        }
+                        else if (key == ConsoleKey.M)
+                        {
+                            RunDirectMovementCalibration();
                         }
                         else if (key == ConsoleKey.C)
                         {
