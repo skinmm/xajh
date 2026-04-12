@@ -5,6 +5,26 @@ namespace xajh
 {
     class PlayerReader
     {
+        public readonly struct DebugSnapshot
+        {
+            public readonly IntPtr PlayerObj;
+            public readonly int ObjOffset;
+            public readonly float RawX;
+            public readonly float RawY;
+            public readonly float RawZ;
+            public readonly string Source;
+
+            public DebugSnapshot(IntPtr playerObj, int objOffset, float rawX, float rawY, float rawZ, string source)
+            {
+                PlayerObj = playerObj;
+                ObjOffset = objOffset;
+                RawX = rawX;
+                RawY = rawY;
+                RawZ = rawZ;
+                Source = source;
+            }
+        }
+
         public static IntPtr GlobalPosAddr = new IntPtr(0x0B201ABC);
         const long MgrOffset = 0x9D4518;
         const int ListOffset = 0x08;
@@ -18,8 +38,15 @@ namespace xajh
         float _cx, _cy, _cz;
         bool _hasCache;
         int _preferredObjOffset = DefaultPlayerObjOffset;
+        IntPtr _dbgPlayerObj = IntPtr.Zero;
+        int _dbgObjOffset = 0;
+        float _dbgRawX = float.NaN, _dbgRawY = float.NaN, _dbgRawZ = float.NaN;
+        string _dbgSource = "none";
 
         public PlayerReader(IntPtr h, IntPtr m) { _h = h; _m = m; }
+
+        public DebugSnapshot GetDebugSnapshot()
+            => new DebugSnapshot(_dbgPlayerObj, _dbgObjOffset, _dbgRawX, _dbgRawY, _dbgRawZ, _dbgSource);
 
         public (float x, float y, float z) Get()
         {
@@ -94,6 +121,11 @@ namespace xajh
         bool TryGetPlayerObject(out IntPtr playerObj)
         {
             playerObj = IntPtr.Zero;
+            _dbgPlayerObj = IntPtr.Zero;
+            _dbgObjOffset = 0;
+            _dbgRawX = float.NaN; _dbgRawY = float.NaN; _dbgRawZ = float.NaN;
+            _dbgSource = "none";
+
             int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
             if (mgr == 0) return false;
 
@@ -114,6 +146,10 @@ namespace xajh
                 {
                     _preferredObjOffset = DefaultPlayerObjOffset;
                     playerObj = pDefault;
+                    _dbgPlayerObj = pDefault;
+                    _dbgObjOffset = DefaultPlayerObjOffset;
+                    _dbgRawX = xDef; _dbgRawY = yDef; _dbgRawZ = zDef;
+                    _dbgSource = "default";
                     return true;
                 }
             }
@@ -122,6 +158,7 @@ namespace xajh
             float bestScore = float.MinValue;
             IntPtr bestPtr = IntPtr.Zero;
             int bestOffset = _preferredObjOffset;
+            float bestX = float.NaN, bestY = float.NaN, bestZ = float.NaN;
             var seen = new HashSet<int>();
             foreach (int off in _candidateObjOffsets)
             {
@@ -149,6 +186,7 @@ namespace xajh
                     bestScore = score;
                     bestPtr = p;
                     bestOffset = off;
+                    bestX = x; bestY = y; bestZ = z;
                 }
             }
 
@@ -157,6 +195,10 @@ namespace xajh
 
             _preferredObjOffset = bestOffset;
             playerObj = bestPtr;
+            _dbgPlayerObj = bestPtr;
+            _dbgObjOffset = bestOffset;
+            _dbgRawX = bestX; _dbgRawY = bestY; _dbgRawZ = bestZ;
+            _dbgSource = "scan";
             return true;
         }
 
