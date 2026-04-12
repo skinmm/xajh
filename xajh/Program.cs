@@ -178,47 +178,12 @@ namespace Xajh
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
             Console.WriteLine("[*] Auto-locating stable player XY mirror...");
 
-            var mirrorCandidates = new List<IntPtr>();
             bool AutoDetectGlobalMirror()
             {
-                try
-                {
-                    var (px, py, _) = playerReader.Get();
-                    if (Math.Abs(px) < 1f && Math.Abs(py) < 1f) return false;
-
-                    if (mirrorCandidates.Count == 0)
-                    {
-                        var hits = MemoryHelper.ScanForFloat(hProcess, px, 5f);
-                        foreach (var addr in hits)
-                        {
-                            float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                            if (Math.Abs(y - py) < 5f) mirrorCandidates.Add(addr);
-                        }
-                    }
-                    else
-                    {
-                        var narrowed = new List<IntPtr>();
-                        foreach (var addr in mirrorCandidates)
-                        {
-                            float x = MemoryHelper.ReadFloat(hProcess, addr);
-                            float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
-                            if (Math.Abs(x - px) < 5f && Math.Abs(y - py) < 5f)
-                                narrowed.Add(addr);
-                        }
-                        mirrorCandidates = narrowed;
-                    }
-
-                    if (mirrorCandidates.Count > 0)
-                    {
-                        // Mirrors are aliases; first one is enough.
-                        PlayerReader.SetGlobalPosAddr(mirrorCandidates[0], locked: true);
-                        playerReader.PreferGlobalSource();
-                        Console.WriteLine($"[+] Auto-locked global XY mirror @ 0x{mirrorCandidates[0].ToInt64():X8} ({mirrorCandidates.Count} aliases)");
-                        return true;
-                    }
-                }
-                catch { }
-                return false;
+                bool locked = playerReader.TryAutoLockGlobalMirror(out string status);
+                if (!string.IsNullOrEmpty(status))
+                    Console.WriteLine(status);
+                return locked;
             }
 
             if (!AutoDetectGlobalMirror())

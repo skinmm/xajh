@@ -15,6 +15,9 @@ namespace xajh
         // Primary path: read player object matrix-translation candidates and
         // choose the most plausible world position each tick.
         // Fallback path: use global mirror address discovered by [O] scanner.
+        // Reverse-engineered from companion binaries: this static frequently
+        // points to (or near) the active player object.
+        const long PlayerRootOffset = 0x9D4514;
         const long MgrOffset = 0x9D4518;
         const int ListOffset = 0x08;
         const int PlayerObjOffset = 0x4C;
@@ -252,8 +255,13 @@ namespace xajh
                 float cz = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, off + 8));
                 if (!IsCoordinatePlausible(cx, cy, cz)) continue;
 
-                float score = 0f;
-                if ((_hasCache || haveGlobal) && off == _preferredPosOffset) score += 0.7f;
+                // Deterministic base preference to avoid arbitrary picks when
+                // cache/global signals are unavailable.
+                float score = off == _preferredPosOffset ? 1.2f : 0f;
+                if (off == 0x94) score += 1.0f;
+                else if (off == 0x64) score += 0.6f;
+                else if (off == 0x34) score += 0.3f;
+                else if (off == 0xC4) score += 0.2f;
 
                 if (_hasCache)
                 {
@@ -320,6 +328,31 @@ namespace xajh
         bool TryGetPlayerObject(out IntPtr playerObj)
         {
             playerObj = IntPtr.Zero;
+
+            // Path A (preferred): direct/static root used by existing native tools.
+            int root = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)PlayerRootOffset));
+            if (root != 0)
+            {
+                var rootPtr = new IntPtr((uint)root);
+                if (LooksLikePlayerObject(rootPtr))
+                {
+                    playerObj = rootPtr;
+                    return true;
+                }
+
+                int rootChild = MemoryHelper.ReadInt32(_h, IntPtr.Add(rootPtr, 0x4C));
+                if (rootChild != 0)
+                {
+                    var childPtr = new IntPtr((uint)rootChild);
+                    if (LooksLikePlayerObject(childPtr))
+                    {
+                        playerObj = childPtr;
+                        return true;
+                    }
+                }
+            }
+
+            // Path B: manager/list chain.
             int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
             if (mgr == 0) return false;
 
@@ -329,13 +362,32 @@ namespace xajh
             int raw = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), PlayerObjOffset));
             if (raw == 0) return false;
 
-            playerObj = new IntPtr((uint)raw);
+            var p = new IntPtr((uint)raw);
+            if (!LooksLikePlayerObject(p))
+                return false;
+
+            playerObj = p;
             return true;
         }
 
         bool HasActiveLocReference()
         {
             return _hasLocReference;
+        }
+
+        bool LooksLikePlayerObject(IntPtr p)
+        {
+            try
+            {
+                float x = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x94));
+                float y = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x98));
+                float z = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x9C));
+                return IsCoordinatePlausible(x, y, z);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         static bool IsCoordinatePlausible(float x, float y, float z)
