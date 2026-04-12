@@ -79,6 +79,8 @@ namespace xajh
         int _preferredObjStaticReads = 0;
         int _preferredMgrOffset = (int)MgrOffset;
         long _nextDeepMgrScanAtTicks = 0;
+        long _nextSigScanAtTicks = 0;
+        IntPtr _signaturePlayerObj = IntPtr.Zero;
         IntPtr _dbgPlayerObj = IntPtr.Zero;
         int _dbgMgrOffset = 0;
         int _dbgObjOffset = 0;
@@ -288,11 +290,22 @@ namespace xajh
                 if (TryResolveFromMgrScans(out playerObj))
                     return true;
 
+                // Reuse previously signature-scanned object if still valid.
+                if (TryResolveFromSignatureCache(out playerObj))
+                    return true;
+
                 long now = Environment.TickCount64;
                 if (now >= _nextDeepMgrScanAtTicks)
                 {
                     _nextDeepMgrScanAtTicks = now + 2000;
                     if (TryResolveFromDeepStaticScan(out playerObj))
+                        return true;
+                }
+
+                if (now >= _nextSigScanAtTicks)
+                {
+                    _nextSigScanAtTicks = now + 3000;
+                    if (TryResolveFromSignatureScan(out playerObj))
                         return true;
                 }
 
@@ -308,6 +321,12 @@ namespace xajh
                 {
                     _nextDeepMgrScanAtTicks = now + 2000;
                     if (TryResolveFromDeepStaticScan(out playerObj))
+                        return true;
+                }
+                if (now >= _nextSigScanAtTicks)
+                {
+                    _nextSigScanAtTicks = now + 3000;
+                    if (TryResolveFromSignatureScan(out playerObj))
                         return true;
                 }
                 _dbgSource = "obj-ex";
@@ -357,6 +376,163 @@ namespace xajh
             return false;
         }
 
+        bool TryResolveFromSignatureCache(out IntPtr playerObj)
+        {
+            playerObj = IntPtr.Zero;
+            if (_signaturePlayerObj == IntPtr.Zero)
+                return false;
+            if (!TrySampleObjectPosition(_signaturePlayerObj, out float x, out float y, out float z, out int posOff))
+                return false;
+
+            playerObj = _signaturePlayerObj;
+            _dbgPlayerObj = playerObj;
+            _dbgMgrOffset = 0;
+            _dbgObjOffset = 0;
+            _dbgPosOffset = posOff;
+            _dbgRawX = x; _dbgRawY = y; _dbgRawZ = z;
+            _dbgSource = "sigcache";
+            return true;
+        }
+
+        bool TryResolveFromSignatureScan(out IntPtr playerObj)
+        {
+            playerObj = IntPtr.Zero;
+            float bestScore = float.MinValue;
+            IntPtr bestPtr = IntPtr.Zero;
+            float bestX = 0f, bestY = 0f, bestZ = 0f;
+            int bestPosOff = 0;
+
+            IntPtr address = IntPtr.Zero;
+            while (true)
+            {
+                if (!MemoryHelper.VirtualQueryEx(
+                    _h,
+                    address,
+                    out var mbi,
+                    (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryHelper.MEMORY_BASIC_INFORMATION>()))
+                    break;
+
+                bool writable = mbi.State == MemoryHelper.MEM_COMMIT &&
+                    (mbi.Protect == MemoryHelper.PAGE_READWRITE ||
+                     mbi.Protect == MemoryHelper.PAGE_WRITECOPY ||
+                     mbi.Protect == MemoryHelper.PAGE_EXECUTE_READWRITE ||
+                     mbi.Protect == MemoryHelper.PAGE_EXECUTE_WRITECOPY);
+
+                if (writable)
+                {
+                    long regionBase = mbi.BaseAddress.ToInt64();
+                    long regionSize = mbi.RegionSize.ToInt64();
+                    const int ScanChunk = 0x20000;
+                    const int Tail = 0x200;
+                    const int MinRead = 0x140;
+
+                    for (long off = 0; off < regionSize; off += ScanChunk)
+                    {
+                        int toRead = (int)Math.Min(ScanChunk + Tail, regionSize - off);
+                        if (toRead < MinRead) break;
+
+                        var chunkBase = new IntPtr(regionBase + off);
+                        var buf = new byte[toRead];
+                        if (!MemoryHelper.ReadProcessMemory(_h, chunkBase, buf, toRead, out int bytesRead) || bytesRead < MinRead)
+                            continue;
+
+                        int limit = bytesRead - 0xD0;
+                        for (int i = 0; i <= limit; i += 4)
+                        {
+                            float c0 = BitConverter.ToSingle(buf, i + 0x10);
+                            float s0 = BitConverter.ToSingle(buf, i + 0x1C);
+                            if (!LooksLikeUnitPair(c0, s0))
+                                continue;
+
+                            float c1 = BitConverter.ToSingle(buf, i + 0x40);
+                            float s1 = BitConverter.ToSingle(buf, i + 0x4C);
+                            int pairCount = 1 + (LooksLikeUnitPair(c1, s1) ? 1 : 0);
+
+                            int validPosCount = 0;
+                            float localBest = float.MinValue;
+                            int localPosOff = 0;
+                            float localX = 0f, localY = 0f, localZ = 0f;
+                            foreach (int posOff in _candidatePosOffsets)
+                            {
+                                int p = i + posOff;
+                                if (p + 8 >= bytesRead) continue;
+                                float x = BitConverter.ToSingle(buf, p);
+                                float y = BitConverter.ToSingle(buf, p + 4);
+                                float z = BitConverter.ToSingle(buf, p + 8);
+                                if (!IsCoordinatePlausible(x, y, z)) continue;
+                                if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) continue;
+
+                                validPosCount++;
+                                float s = 0f;
+                                if (posOff == _preferredPosOffset) s += 1f;
+                                if (posOff == DefaultPosOffset) s += 0.5f;
+                                if (_hasCache)
+                                {
+                                    double d = DistXY(x, y, _cx, _cy);
+                                    if (d <= 250f) s += 4f;
+                                    else if (d <= 2000f) s += 2f;
+                                    else s -= 2f;
+                                }
+                                if (s > localBest)
+                                {
+                                    localBest = s;
+                                    localPosOff = posOff;
+                                    localX = x; localY = y; localZ = z;
+                                }
+                            }
+
+                            // Strong signature: rotation + at least two plausible translation triplets.
+                            if (validPosCount < 2)
+                                continue;
+
+                            float score = localBest + (pairCount * 2f) + (validPosCount * 1.5f);
+                            int maybeVtable = BitConverter.ToInt32(buf, i);
+                            if (maybeVtable > 0x00400000 && maybeVtable < 0x7FFFFFFF)
+                                score += 1f;
+
+                            if (score <= bestScore)
+                                continue;
+
+                            bestScore = score;
+                            bestPtr = IntPtr.Add(chunkBase, i);
+                            bestX = localX; bestY = localY; bestZ = localZ;
+                            bestPosOff = localPosOff;
+                        }
+                    }
+                }
+
+                long next = address.ToInt64() + mbi.RegionSize.ToInt64();
+                if (next <= 0 || next >= long.MaxValue) break;
+                address = new IntPtr(next);
+            }
+
+            if (bestPtr == IntPtr.Zero)
+                return false;
+
+            _signaturePlayerObj = bestPtr;
+            _preferredPosOffset = bestPosOff == 0 ? _preferredPosOffset : bestPosOff;
+            playerObj = bestPtr;
+            _dbgPlayerObj = bestPtr;
+            _dbgMgrOffset = 0;
+            _dbgObjOffset = 0;
+            _dbgPosOffset = bestPosOff;
+            _dbgRawX = bestX; _dbgRawY = bestY; _dbgRawZ = bestZ;
+            _dbgSource = "sigscan";
+            return true;
+        }
+
+        static bool LooksLikeUnitPair(float c, float s)
+        {
+            if (float.IsNaN(c) || float.IsNaN(s) || float.IsInfinity(c) || float.IsInfinity(s))
+                return false;
+            if (Math.Abs(c) > 1.01f || Math.Abs(s) > 1.01f)
+                return false;
+            if (Math.Abs(c) < 0.01f || Math.Abs(s) < 0.01f)
+                return false;
+            float mag = c * c + s * s;
+            return Math.Abs(mag - 1f) < 0.05f;
+        }
+
         bool TryResolveFromList(int list, string sourceTag, int mgrOff, out IntPtr playerObj)
         {
             playerObj = IntPtr.Zero;
@@ -372,7 +548,7 @@ namespace xajh
 
                 var p = new IntPtr((uint)raw);
                 rawCandidates.Add((off, p));
-                if (!TrySampleObjectPosition(p, out float x, out float y, out float z))
+                if (!TrySampleObjectPosition(p, out float x, out float y, out float z, out _))
                     continue;
 
                 candidates.Add((off, p, x, y, z));
@@ -465,6 +641,7 @@ namespace xajh
 
             _preferredObjOffset = bestOffset;
             _preferredMgrOffset = mgrOff;
+            _signaturePlayerObj = IntPtr.Zero;
             playerObj = bestPtr;
             _dbgPlayerObj = bestPtr;
             _dbgMgrOffset = mgrOff;
@@ -476,9 +653,9 @@ namespace xajh
             return true;
         }
 
-        bool TrySampleObjectPosition(IntPtr playerObj, out float x, out float y, out float z)
+        bool TrySampleObjectPosition(IntPtr playerObj, out float x, out float y, out float z, out int bestPosOffset)
         {
-            x = 0f; y = 0f; z = 0f;
+            x = 0f; y = 0f; z = 0f; bestPosOffset = 0;
             float bestScore = float.MinValue;
             bool found = false;
             foreach (int posOff in _candidatePosOffsets)
@@ -499,6 +676,7 @@ namespace xajh
                 {
                     bestScore = score;
                     x = sx; y = sy; z = sz;
+                    bestPosOffset = posOff;
                     found = true;
                 }
             }
