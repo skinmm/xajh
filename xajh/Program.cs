@@ -147,7 +147,7 @@ namespace Xajh
             }
             catch { }
 
-            bool TryReattachGame(string reason)
+            bool TryReattachGame(string reason, bool forceRefreshSameProcess = false)
             {
                 try
                 {
@@ -164,10 +164,26 @@ namespace Xajh
 
                     if (sameProcess)
                     {
-                        // SelectGameProcess opened a handle for this candidate.
-                        // Keep the current one and close the duplicate.
-                        MemoryHelper.CloseHandle(picked.hProcess);
-                        return false;
+                        if (!forceRefreshSameProcess)
+                        {
+                            // SelectGameProcess opened a handle for this candidate.
+                            // Keep the current one and close the duplicate.
+                            MemoryHelper.CloseHandle(picked.hProcess);
+                            return false;
+                        }
+
+                        // In unresolved mode, force-refresh readers/handle even if PID/base match.
+                        if (hProcess != IntPtr.Zero)
+                            MemoryHelper.CloseHandle(hProcess);
+
+                        hProcess = picked.hProcess;
+                        npcReader = new NpcReader(hProcess, moduleBase);
+                        playerReader = new PlayerReader(hProcess, moduleBase);
+                        combat = new CombatOverlay(hProcess, moduleBase);
+                        turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+
+                        Console.WriteLine($"[REATTACH] {reason} -> PID={game.Id} Base=0x{moduleBase.ToInt64():X8} (refresh)");
+                        return true;
                     }
 
                     if (hProcess != IntPtr.Zero)
@@ -295,11 +311,15 @@ namespace Xajh
                                               dbg.Source == "mgr=0" ||
                                               dbg.Source == "list/obj=0" ||
                                               dbg.Source == "obj-ex";
-                            if (unresolved && TryReattachGame($"player-source={dbg.Source}"))
+                            if (unresolved && TryReattachGame($"player-source={dbg.Source}", forceRefreshSameProcess: true))
                             {
                                 Thread.Sleep(150);
                                 (px, py, pz) = playerReader.Get();
                                 dbg = playerReader.GetDebugSnapshot();
+                            }
+                            else if (unresolved)
+                            {
+                                Console.WriteLine($"[REATTACH] failed (source={dbg.Source})");
                             }
 
                             Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
