@@ -27,12 +27,109 @@ namespace Xajh
         static void Main(string[] args)
         {
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            int[] directMgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C, 0x9D4524, 0x9D450C };
+            int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
+            int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
+            int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4 };
+            int preferredDirectMgr = 0x9D4518;
+            int preferredDirectObj = 0x4C;
+            int preferredDirectPos = 0x94;
+            bool hasDirectCache = false;
+            float directCx = 0f, directCy = 0f;
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
                 int playerMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
                 int npcMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D451C));
                 return (playerMgr != 0, npcMgr != 0);
+            }
+
+            bool TryReadStablePos(IntPtr hProcess, IntPtr playerObj, int posOff, out float x, out float y, out float z)
+            {
+                x = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff));
+                y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff + 4));
+                z = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff + 8));
+                if (float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z)) return false;
+                if (float.IsInfinity(x) || float.IsInfinity(y) || float.IsInfinity(z)) return false;
+                if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f || Math.Abs(z) > 1_000_000f) return false;
+                if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) return false;
+
+                // Read twice to reject clearly volatile/garbage pointers.
+                float x2 = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff));
+                float y2 = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff + 4));
+                float z2 = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(playerObj, posOff + 8));
+                if (Math.Abs(x2 - x) > 200f || Math.Abs(y2 - y) > 200f || Math.Abs(z2 - z) > 200f)
+                    return false;
+                return true;
+            }
+
+            bool TryReadDirectPlayerPos(
+                IntPtr hProcess, IntPtr moduleBase,
+                out float x, out float y, out float z, out string source)
+            {
+                x = 0f; y = 0f; z = 0f; source = "direct:none";
+                float bestScore = float.MinValue;
+                int bestMgr = 0, bestObj = 0, bestPos = 0;
+
+                var mgrOrder = new List<int> { preferredDirectMgr };
+                foreach (int mo in directMgrOffsets)
+                    if (mo != preferredDirectMgr) mgrOrder.Add(mo);
+
+                foreach (int mo in mgrOrder)
+                {
+                    int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, mo));
+                    if (mgr == 0) continue;
+
+                    foreach (int lo in directListOffsets)
+                    {
+                        int list = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)mgr), lo));
+                        if (list == 0) continue;
+
+                        foreach (int oo in directObjOffsets)
+                        {
+                            int raw = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)list), oo));
+                            if (raw == 0) continue;
+                            var pobj = new IntPtr((uint)raw);
+
+                            foreach (int po in directPosOffsets)
+                            {
+                                if (!TryReadStablePos(hProcess, pobj, po, out float px, out float py, out float pz))
+                                    continue;
+
+                                float score = 0f;
+                                if (mo == preferredDirectMgr) score += 2f;
+                                if (oo == preferredDirectObj) score += 1f;
+                                if (po == preferredDirectPos) score += 2f;
+                                if (oo == 0x4C) score += 1f;
+                                if (po == 0x94) score += 1f;
+
+                                if (hasDirectCache)
+                                {
+                                    double d = Math.Sqrt(Math.Pow(px - directCx, 2) + Math.Pow(py - directCy, 2));
+                                    if (d <= 20f) score += 4f;
+                                    else if (d <= 300f) score += 2f;
+                                    else if (d <= 3000f) score -= 1f;
+                                    else score -= 4f;
+                                }
+
+                                if (score > bestScore)
+                                {
+                                    bestScore = score;
+                                    x = px; y = py; z = pz;
+                                    bestMgr = mo; bestObj = oo; bestPos = po;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (bestMgr == 0) return false;
+                preferredDirectMgr = bestMgr;
+                preferredDirectObj = bestObj;
+                preferredDirectPos = bestPos;
+                directCx = x; directCy = y; hasDirectCache = true;
+                source = $"direct(m=0x{bestMgr:X},o=0x{bestObj:X2},p=0x{bestPos:X2})";
+                return true;
             }
 
             (int chainScore, string chainSummary) ProbeGameChains(IntPtr hProcess, IntPtr moduleBase)
@@ -73,14 +170,8 @@ namespace Xajh
                     int[] posOffsets = { 0x94, 0x34, 0x64, 0xC4 };
                     foreach (int poff in posOffsets)
                     {
-                        float x = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(new IntPtr((uint)playerObj), poff));
-                        float y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(new IntPtr((uint)playerObj), poff + 4));
-                        float z = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(new IntPtr((uint)playerObj), poff + 8));
-                        bool plausible = !float.IsNaN(x) && !float.IsNaN(y) && !float.IsNaN(z) &&
-                                        !float.IsInfinity(x) && !float.IsInfinity(y) && !float.IsInfinity(z) &&
-                                        Math.Abs(x) < 1_000_000f && Math.Abs(y) < 1_000_000f && Math.Abs(z) < 1_000_000f &&
-                                        !(Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f);
-                        if (!plausible) continue;
+                        if (!TryReadStablePos(hProcess, new IntPtr((uint)playerObj), poff, out _, out _, out _))
+                            continue;
                         hasPlayerPos = true;
                         playerPosOff = poff;
                         break;
@@ -104,6 +195,19 @@ namespace Xajh
                     $"pmgr={(hasPlayerMgr ? 1 : 0)} plist={(playerList != 0 ? 1 : 0)} pobj={(playerObj != 0 ? 1 : 0)}@0x{playerObjOff:X2} " +
                     $"ppos={(hasPlayerPos ? 1 : 0)}@0x{playerPosOff:X2} nmgr={(hasNpcMgr ? 1 : 0)} nfirst={(hasNpcFirst ? 1 : 0)}";
                 return (score, summary);
+            }
+
+            void PrintAttachDiagnostics(string tag, IntPtr handle, IntPtr baseAddr)
+            {
+                try
+                {
+                    var (sc, summary) = ProbeGameChains(handle, baseAddr);
+                    Console.WriteLine($"[{tag}] score={sc} base=0x{baseAddr.ToInt64():X8} {summary}");
+                }
+                catch
+                {
+                    Console.WriteLine($"[{tag}] failed to probe");
+                }
             }
 
             (Process game, IntPtr moduleBase, IntPtr hProcess, List<string> logs) SelectGameProcess(Process[] procs, bool collectLogs = false)
@@ -313,6 +417,96 @@ namespace Xajh
             bool autoFace = false;
             float aimRadius = 300f;
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
+            bool directPosHasCache = false;
+            float directPosCacheX = 0f, directPosCacheY = 0f;
+            string lastDirectSource = "";
+
+            bool IsUnresolvedSource(string src)
+                => src == "none" || src == "mgr=0" || src == "list/obj=0" || src == "obj-ex";
+
+            bool TryReadPlayerDirect(out float x, out float y, out float z, out string source)
+            {
+                x = y = z = 0f;
+                source = "";
+                int[] mgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C, 0x9D4524, 0x9D450C };
+                int[] listOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
+                int[] objOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
+                int[] posOffsets = { 0x94, 0x34, 0x64, 0xC4 };
+
+                float bestScore = float.MinValue;
+                bool found = false;
+                int bestMgr = 0, bestObj = 0, bestPos = 0;
+
+                foreach (int mo in mgrOffsets)
+                {
+                    int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, mo));
+                    if (mgr == 0) continue;
+                    foreach (int lo in listOffsets)
+                    {
+                        int list = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)mgr), lo));
+                        if (list == 0) continue;
+                        foreach (int oo in objOffsets)
+                        {
+                            int rawObj = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(new IntPtr((uint)list), oo));
+                            if (rawObj == 0) continue;
+                            var pobj = new IntPtr((uint)rawObj);
+                            foreach (int po in posOffsets)
+                            {
+                                float tx = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(pobj, po));
+                                float ty = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(pobj, po + 4));
+                                float tz = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(pobj, po + 8));
+                                bool plausible = !float.IsNaN(tx) && !float.IsNaN(ty) && !float.IsNaN(tz) &&
+                                                 !float.IsInfinity(tx) && !float.IsInfinity(ty) && !float.IsInfinity(tz) &&
+                                                 Math.Abs(tx) < 1_000_000f && Math.Abs(ty) < 1_000_000f && Math.Abs(tz) < 1_000_000f &&
+                                                 !(Math.Abs(tx) < 0.001f && Math.Abs(ty) < 0.001f && Math.Abs(tz) < 0.001f);
+                                if (!plausible) continue;
+
+                                float score = 0f;
+                                if (mo == 0x9D4518) score += 2f;
+                                if (oo == 0x4C) score += 1f;
+                                if (po == 0x94) score += 1f;
+                                if (directPosHasCache)
+                                {
+                                    double dxy = Math.Sqrt(Math.Pow(tx - directPosCacheX, 2) + Math.Pow(ty - directPosCacheY, 2));
+                                    if (dxy <= 20f) score += 4f;
+                                    else if (dxy <= 300f) score += 2f;
+                                    else if (dxy > 3000f) score -= 3f;
+                                }
+
+                                if (score > bestScore)
+                                {
+                                    bestScore = score;
+                                    x = tx; y = ty; z = tz;
+                                    bestMgr = mo; bestObj = oo; bestPos = po;
+                                    found = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!found) return false;
+
+                directPosCacheX = x;
+                directPosCacheY = y;
+                directPosHasCache = true;
+                source = $"direct(mgr=0x{bestMgr:X},obj=0x{bestObj:X2},pos=0x{bestPos:X2})";
+                return true;
+            }
+
+            (float x, float y, float z) ReadPlayerPos()
+            {
+                var p = playerReader.Get();
+                var dbg = playerReader.GetDebugSnapshot();
+                if (IsUnresolvedSource(dbg.Source) &&
+                    TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc))
+                {
+                    lastDirectSource = dsrc;
+                    return (dx, dy, dz);
+                }
+                lastDirectSource = "";
+                return p;
+            }
 
             // Get NPCs within radius, sorted by HORIZONTAL (XY) distance
             // In this game: X,Y = ground plane, Z = height
@@ -324,7 +518,7 @@ namespace Xajh
 
             List<(Npc npc, double distXY, double dist3D)> GetNearbyNpcs()
             {
-                var (px, py, pz) = playerReader.Get();
+                var (px, py, pz) = ReadPlayerPos();
                 var npcs = GetTrackedNpcs();
                 var nearby = new List<(Npc, double, double)>();
                 foreach (var n in npcs)
@@ -345,7 +539,7 @@ namespace Xajh
 
             string AimNearest(bool verbose = true)
             {
-                var (px, py, pz) = playerReader.Get();
+                var (px, py, pz) = ReadPlayerPos();
                 var nearby = GetNearbyNpcs();
 
                 if (verbose)
@@ -365,7 +559,7 @@ namespace Xajh
                     return $"[!] No NPC within {aimRadius:F0}";
 
                 var (target, distXY, _) = nearby[0];
-                string r = turn.FaceTarget(() => playerReader.Get(), target.X, target.Y);
+                string r = turn.FaceTarget(() => ReadPlayerPos(), target.X, target.Y);
                 bool fightTriggered = false;
                 if (!r.StartsWith("[!]"))
                     fightTriggered = turn.TriggerTargetAndFight();
@@ -384,16 +578,13 @@ namespace Xajh
 
                         if (key == ConsoleKey.L)
                         {
-                            var (px, py, pz) = playerReader.Get();
+                            var (px, py, pz) = ReadPlayerPos();
                             var dbg = playerReader.GetDebugSnapshot();
-                            bool unresolved = dbg.Source == "none" ||
-                                              dbg.Source == "mgr=0" ||
-                                              dbg.Source == "list/obj=0" ||
-                                              dbg.Source == "obj-ex";
+                            bool unresolved = IsUnresolvedSource(dbg.Source) && string.IsNullOrEmpty(lastDirectSource);
                             if (unresolved && TryReattachGame($"player-source={dbg.Source}", forceRefreshSameProcess: true))
                             {
                                 Thread.Sleep(150);
-                                (px, py, pz) = playerReader.Get();
+                                (px, py, pz) = ReadPlayerPos();
                                 dbg = playerReader.GetDebugSnapshot();
                             }
                             else if (unresolved)
@@ -405,6 +596,8 @@ namespace Xajh
                             Console.WriteLine(
                                 $"  [DBG] src={dbg.Source} mgr=0x{dbg.MgrOffset:X} off=0x{dbg.ObjOffset:X2} pos=0x{dbg.PosOffset:X2} obj=0x{dbg.PlayerObj.ToInt64():X8} " +
                                 $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1})");
+                            if (!string.IsNullOrEmpty(lastDirectSource))
+                                Console.WriteLine($"  [DBG] fallback={lastDirectSource}");
 
                             // NPC list
                             var allNpcs = GetTrackedNpcs();
