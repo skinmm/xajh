@@ -4,19 +4,19 @@ namespace xajh
 {
     class PlayerReader
     {
-        // Primary path: read player object position at +0x94/+0x98/+0x9C.
+        // Primary path: read player object matrix-translation candidates and
+        // choose the most plausible world position each tick.
         // Fallback path: use global mirror address discovered by [O] scanner.
         const long MgrOffset = 0x9D4518;
         const int ListOffset = 0x08;
         const int PlayerObjOffset = 0x4C;
-        const int PosXOffset = 0x94;
-        const int PosYOffset = 0x98;
-        const int PosZOffset = 0x9C;
+        static readonly int[] PosCandidateOffsets = { 0x34, 0x64, 0x94, 0xC4 };
         public static IntPtr GlobalPosAddr = new IntPtr(0x0B201ABC);
 
         readonly IntPtr _h, _m;
         float _cx, _cy, _cz;
         bool _hasCache;
+        int _preferredPosOffset = 0x94;
 
         public PlayerReader(IntPtr h, IntPtr m) { _h = h; _m = m; }
 
@@ -24,15 +24,25 @@ namespace xajh
         {
             try
             {
-                bool haveObjPos = TryReadPlayerObjectPos(out float x, out float y, out float z);
+                bool haveObjPos = TryReadPlayerObjectPos(out float objX, out float objY, out float objZ);
+                bool haveGlobal = TryReadGlobalMirror(out float gx, out float gy);
 
-                // Keep global mirror as a runtime fallback because users can
-                // re-lock it with [O] when game updates shuffle structures.
-                if (!haveObjPos)
+                float x, y, z;
+                if (haveObjPos)
                 {
-                    x = MemoryHelper.ReadFloat(_h, GlobalPosAddr);
-                    y = MemoryHelper.ReadFloat(_h, IntPtr.Add(GlobalPosAddr, 4));
-                    z = _cz;
+                    x = objX;
+                    y = objY;
+                    z = objZ;
+                }
+                else if (haveGlobal)
+                {
+                    x = gx;
+                    y = gy;
+                    z = _hasCache ? _cz : 0f;
+                }
+                else
+                {
+                    return Cached();
                 }
 
                 if (float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z)) return Cached();
@@ -57,10 +67,77 @@ namespace xajh
             if (playerObj == 0) return false;
 
             var p = new IntPtr((uint)playerObj);
-            x = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, PosXOffset));
-            y = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, PosYOffset));
-            z = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, PosZOffset));
-            return !(float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z));
+            bool haveGlobal = TryReadGlobalMirror(out float gx, out float gy);
+
+            float bestScore = float.MinValue;
+            int bestOffset = 0;
+            float bx = 0f, by = 0f, bz = 0f;
+            bool found = false;
+
+            foreach (int off in PosCandidateOffsets)
+            {
+                float cx = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, off));
+                float cy = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, off + 4));
+                float cz = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, off + 8));
+                if (!IsCoordinatePlausible(cx, cy, cz)) continue;
+
+                float score = 0f;
+                if (off == _preferredPosOffset) score += 0.7f;
+
+                if (_hasCache)
+                {
+                    double dxy = Math.Sqrt(Math.Pow(cx - _cx, 2) + Math.Pow(cy - _cy, 2));
+                    if (dxy <= 3f) score += 3f;
+                    else if (dxy <= 60f) score += 2f;
+                    else if (dxy <= 250f) score += 1f;
+                    else score -= 3f;
+
+                    float dz = Math.Abs(cz - _cz);
+                    if (dz <= 20f) score += 0.5f;
+                    else if (dz > 500f) score -= 1f;
+                }
+
+                if (haveGlobal)
+                {
+                    double dg = Math.Sqrt(Math.Pow(cx - gx, 2) + Math.Pow(cy - gy, 2));
+                    if (dg <= 3f) score += 4f;
+                    else if (dg <= 30f) score += 2f;
+                    else if (dg <= 200f) score += 0.5f;
+                    else score -= 2f;
+                }
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestOffset = off;
+                    bx = cx; by = cy; bz = cz;
+                    found = true;
+                }
+            }
+
+            if (!found) return false;
+            _preferredPosOffset = bestOffset;
+            x = bx; y = by; z = bz;
+            return true;
+        }
+
+        bool TryReadGlobalMirror(out float x, out float y)
+        {
+            x = MemoryHelper.ReadFloat(_h, GlobalPosAddr);
+            y = MemoryHelper.ReadFloat(_h, IntPtr.Add(GlobalPosAddr, 4));
+            if (float.IsNaN(x) || float.IsNaN(y)) return false;
+            if (float.IsInfinity(x) || float.IsInfinity(y)) return false;
+            if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f) return false;
+            return true;
+        }
+
+        static bool IsCoordinatePlausible(float x, float y, float z)
+        {
+            if (float.IsNaN(x) || float.IsNaN(y) || float.IsNaN(z)) return false;
+            if (float.IsInfinity(x) || float.IsInfinity(y) || float.IsInfinity(z)) return false;
+            if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f || Math.Abs(z) > 1_000_000f)
+                return false;
+            return true;
         }
 
         (float, float, float) Cached() => _hasCache ? (_cx, _cy, _cz) : (0f, 0f, 0f);
