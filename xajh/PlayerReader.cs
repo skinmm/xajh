@@ -128,6 +128,7 @@ namespace xajh
             if (float.IsNaN(x) || float.IsNaN(y)) return false;
             if (float.IsInfinity(x) || float.IsInfinity(y)) return false;
             if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f) return false;
+            if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f) return false;
             return true;
         }
 
@@ -135,10 +136,25 @@ namespace xajh
         {
             x = 0f; y = 0f; z = 0f;
             if (!TryGetPlayerObject(out IntPtr p)) return false;
-            if (!TryReadBestPlayerPos(p, out x, out y, out z, out int posOffset)) return false;
-            _dbgPosOffset = posOffset;
-            _dbgRawX = x; _dbgRawY = y; _dbgRawZ = z;
-            return true;
+            if (TryReadBestPlayerPos(p, out x, out y, out z, out int posOffset))
+            {
+                _dbgPosOffset = posOffset;
+                _dbgRawX = x; _dbgRawY = y; _dbgRawZ = z;
+                return true;
+            }
+
+            // Last-chance read so we don't regress to src=none/0,0,0 on maps where
+            // sampling heuristics cannot score candidates reliably.
+            if (TryReadPosAtOffset(p, DefaultPosOffset, out x, out y, out z))
+            {
+                _dbgPosOffset = DefaultPosOffset;
+                _dbgRawX = x; _dbgRawY = y; _dbgRawZ = z;
+                if (_dbgSource == "fallback-raw")
+                    _dbgSource = "fallback-raw+94";
+                return true;
+            }
+
+            return false;
         }
 
         bool TryReadBestPlayerPos(IntPtr playerObj, out float x, out float y, out float z, out int posOffset)
@@ -241,12 +257,21 @@ namespace xajh
             _dbgSource = "none";
 
             int mgr = MemoryHelper.ReadInt32(_h, IntPtr.Add(_m, (int)MgrOffset));
-            if (mgr == 0) return false;
+            if (mgr == 0)
+            {
+                _dbgSource = "mgr=0";
+                return false;
+            }
 
             int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
-            if (list == 0) return false;
+            if (list == 0)
+            {
+                _dbgSource = "list=0";
+                return false;
+            }
 
             // Probe nearby offsets with continuity and anti-stale scoring.
+            var rawCandidates = new List<(int off, IntPtr p)>();
             var candidates = new List<(int off, IntPtr p, float x, float y, float z)>();
             var seen = new HashSet<int>();
             foreach (int off in _candidateObjOffsets)
@@ -255,15 +280,37 @@ namespace xajh
                 if (raw == 0 || !seen.Add(raw)) continue;
 
                 var p = new IntPtr((uint)raw);
-                if (!TryReadPosAtOffset(p, _preferredPosOffset, out float x, out float y, out float z) &&
-                    !TryReadPosAtOffset(p, DefaultPosOffset, out x, out y, out z))
+                rawCandidates.Add((off, p));
+                if (!TrySampleObjectPosition(p, out float x, out float y, out float z))
                     continue;
 
                 candidates.Add((off, p, x, y, z));
             }
 
-            if (candidates.Count == 0)
+            if (rawCandidates.Count == 0)
+            {
+                _dbgSource = "obj=0";
                 return false;
+            }
+
+            if (candidates.Count == 0)
+            {
+                // Keep a raw fallback to avoid total loss ("src=none") when
+                // all current sampled position blocks look invalid.
+                (int off, IntPtr p) rawPick = rawCandidates[0];
+                foreach (var rc in rawCandidates)
+                {
+                    if (rc.off == _preferredObjOffset) { rawPick = rc; break; }
+                    if (rc.off == DefaultPlayerObjOffset) rawPick = rc;
+                }
+
+                playerObj = rawPick.p;
+                _preferredObjOffset = rawPick.off;
+                _dbgPlayerObj = rawPick.p;
+                _dbgObjOffset = rawPick.off;
+                _dbgSource = "fallback-raw";
+                return true;
+            }
 
             bool preferredLooksStatic = false;
             bool anyAltMovedFromCache = false;
@@ -334,6 +381,35 @@ namespace xajh
             _dbgRawX = bestX; _dbgRawY = bestY; _dbgRawZ = bestZ;
             _dbgSource = bestOffset == DefaultPlayerObjOffset ? "default" : "scan";
             return true;
+        }
+
+        bool TrySampleObjectPosition(IntPtr playerObj, out float x, out float y, out float z)
+        {
+            x = 0f; y = 0f; z = 0f;
+            float bestScore = float.MinValue;
+            bool found = false;
+            foreach (int posOff in _candidatePosOffsets)
+            {
+                if (!TryReadPosAtOffset(playerObj, posOff, out float sx, out float sy, out float sz))
+                    continue;
+                float score = 0f;
+                if (posOff == _preferredPosOffset) score += 2f;
+                if (posOff == DefaultPosOffset) score += 1f;
+                if (_hasCache)
+                {
+                    double d = DistXY(sx, sy, _cx, _cy);
+                    if (d <= 10f) score += 2f;
+                    else if (d <= 300f) score += 1f;
+                    else if (d > 3000f) score -= 3f;
+                }
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    x = sx; y = sy; z = sz;
+                    found = true;
+                }
+            }
+            return found;
         }
 
         static bool IsCoordinatePlausible(float x, float y, float z)
