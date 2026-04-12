@@ -34,10 +34,13 @@ namespace Xajh
             int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
             int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4 };
             int preferredDirectMgr = 0x9D4518;
+            int preferredDirectList = 0x08;
             int preferredDirectObj = 0x4C;
             int preferredDirectPos = 0x94;
             bool hasDirectCache = false;
             float directCx = 0f, directCy = 0f;
+            int preferredDirectStaticReads = 0;
+            var directLastByKey = new Dictionary<(int mgr, int list, int obj, int pos), (float x, float y)>();
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
@@ -70,8 +73,7 @@ namespace Xajh
                 out float x, out float y, out float z, out string source)
             {
                 x = 0f; y = 0f; z = 0f; source = "direct:none";
-                float bestScore = float.MinValue;
-                int bestMgr = 0, bestObj = 0, bestPos = 0;
+                var samples = new List<(int mo, int lo, int oo, int po, float x, float y, float z)>();
 
                 var mgrOrder = new List<int> { preferredDirectMgr };
                 foreach (int mo in directMgrOffsets)
@@ -97,40 +99,96 @@ namespace Xajh
                             {
                                 if (!TryReadStablePos(hProcess, pobj, po, out float px, out float py, out float pz))
                                     continue;
-
-                                float score = 0f;
-                                if (mo == preferredDirectMgr) score += 2f;
-                                if (oo == preferredDirectObj) score += 1f;
-                                if (po == preferredDirectPos) score += 2f;
-                                if (oo == 0x4C) score += 1f;
-                                if (po == 0x94) score += 1f;
-
-                                if (hasDirectCache)
-                                {
-                                    double d = Math.Sqrt(Math.Pow(px - directCx, 2) + Math.Pow(py - directCy, 2));
-                                    if (d <= 20f) score += 4f;
-                                    else if (d <= 300f) score += 2f;
-                                    else if (d <= 3000f) score -= 1f;
-                                    else score -= 4f;
-                                }
-
-                                if (score > bestScore)
-                                {
-                                    bestScore = score;
-                                    x = px; y = py; z = pz;
-                                    bestMgr = mo; bestObj = oo; bestPos = po;
-                                }
+                                samples.Add((mo, lo, oo, po, px, py, pz));
                             }
                         }
                     }
                 }
 
-                if (bestMgr == 0) return false;
+                if (samples.Count == 0) return false;
+
+                bool preferredLooksStatic = false;
+                bool anyAltMoved = false;
+                foreach (var s in samples)
+                {
+                    bool isPref = s.mo == preferredDirectMgr &&
+                                  s.lo == preferredDirectList &&
+                                  s.oo == preferredDirectObj &&
+                                  s.po == preferredDirectPos;
+
+                    if (isPref && hasDirectCache)
+                    {
+                        double d = Math.Sqrt(Math.Pow(s.x - directCx, 2) + Math.Pow(s.y - directCy, 2));
+                        if (d < 0.01) preferredLooksStatic = true;
+                    }
+
+                    if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.po), out var last))
+                    {
+                        double dSelf = Math.Sqrt(Math.Pow(s.x - last.x, 2) + Math.Pow(s.y - last.y, 2));
+                        if (isPref && dSelf < 0.01) preferredLooksStatic = true;
+                        if (!isPref && dSelf > 0.2 && dSelf <= 3000.0) anyAltMoved = true;
+                    }
+                }
+
+                if (preferredLooksStatic && anyAltMoved)
+                    preferredDirectStaticReads++;
+                else
+                    preferredDirectStaticReads = 0;
+
+                float bestScore = float.MinValue;
+                int bestMgr = 0, bestList = 0, bestObj = 0, bestPos = 0;
+                foreach (var s in samples)
+                {
+                    bool isPref = s.mo == preferredDirectMgr &&
+                                  s.lo == preferredDirectList &&
+                                  s.oo == preferredDirectObj &&
+                                  s.po == preferredDirectPos;
+
+                    float score = 0f;
+                    if (s.mo == preferredDirectMgr) score += 2f;
+                    if (s.lo == preferredDirectList) score += 1f;
+                    if (s.oo == preferredDirectObj) score += 1f;
+                    if (s.po == preferredDirectPos) score += 2f;
+                    if (s.lo == 0x08) score += 1f;
+                    if (s.oo == 0x4C) score += 1f;
+                    if (s.po == 0x94) score += 1f;
+
+                    if (hasDirectCache)
+                    {
+                        double d = Math.Sqrt(Math.Pow(s.x - directCx, 2) + Math.Pow(s.y - directCy, 2));
+                        if (d <= 20f) score += 4f;
+                        else if (d <= 300f) score += 2f;
+                        else if (d <= 3000f) score -= 1f;
+                        else score -= 4f;
+                    }
+
+                    if (directLastByKey.TryGetValue((s.mo, s.lo, s.oo, s.po), out var last))
+                    {
+                        double dSelf = Math.Sqrt(Math.Pow(s.x - last.x, 2) + Math.Pow(s.y - last.y, 2));
+                        if (dSelf > 0.2 && dSelf <= 3000f) score += 2f;
+                        else if (dSelf < 0.01) score -= 0.5f;
+                    }
+
+                    if (isPref && preferredDirectStaticReads >= 2)
+                        score -= 8f;
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        x = s.x; y = s.y; z = s.z;
+                        bestMgr = s.mo; bestList = s.lo; bestObj = s.oo; bestPos = s.po;
+                    }
+                }
+
+                foreach (var s in samples)
+                    directLastByKey[(s.mo, s.lo, s.oo, s.po)] = (s.x, s.y);
+
                 preferredDirectMgr = bestMgr;
+                preferredDirectList = bestList;
                 preferredDirectObj = bestObj;
                 preferredDirectPos = bestPos;
                 directCx = x; directCy = y; hasDirectCache = true;
-                source = $"direct(m=0x{bestMgr:X},o=0x{bestObj:X2},p=0x{bestPos:X2})";
+                source = $"direct(mgr=0x{bestMgr:X},list=0x{bestList:X2},obj=0x{bestObj:X2},pos=0x{bestPos:X2},st={preferredDirectStaticReads})";
                 return true;
             }
 
@@ -419,8 +477,6 @@ namespace Xajh
             bool autoFace = false;
             float aimRadius = 300f;
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
-            bool directPosHasCache = false;
-            float directPosCacheX = 0f, directPosCacheY = 0f;
             string lastDirectSource = "";
 
             bool IsUnresolvedSource(string src)
@@ -428,72 +484,7 @@ namespace Xajh
 
             bool TryReadPlayerDirect(out float x, out float y, out float z, out string source)
             {
-                x = y = z = 0f;
-                source = "";
-                int[] mgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C, 0x9D4524, 0x9D450C };
-                int[] listOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
-                int[] objOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
-                int[] posOffsets = { 0x94, 0x34, 0x64, 0xC4 };
-
-                float bestScore = float.MinValue;
-                bool found = false;
-                int bestMgr = 0, bestObj = 0, bestPos = 0;
-
-                foreach (int mo in mgrOffsets)
-                {
-                    int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, mo));
-                    if (mgr == 0) continue;
-                    foreach (int lo in listOffsets)
-                    {
-                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lo));
-                        if (list == 0) continue;
-                        foreach (int oo in objOffsets)
-                        {
-                            int rawObj = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, oo));
-                            if (rawObj == 0) continue;
-                            var pobj = Ptr32(rawObj);
-                            foreach (int po in posOffsets)
-                            {
-                                float tx = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(pobj, po));
-                                float ty = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(pobj, po + 4));
-                                float tz = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(pobj, po + 8));
-                                bool plausible = !float.IsNaN(tx) && !float.IsNaN(ty) && !float.IsNaN(tz) &&
-                                                 !float.IsInfinity(tx) && !float.IsInfinity(ty) && !float.IsInfinity(tz) &&
-                                                 Math.Abs(tx) < 1_000_000f && Math.Abs(ty) < 1_000_000f && Math.Abs(tz) < 1_000_000f &&
-                                                 !(Math.Abs(tx) < 0.001f && Math.Abs(ty) < 0.001f && Math.Abs(tz) < 0.001f);
-                                if (!plausible) continue;
-
-                                float score = 0f;
-                                if (mo == 0x9D4518) score += 2f;
-                                if (oo == 0x4C) score += 1f;
-                                if (po == 0x94) score += 1f;
-                                if (directPosHasCache)
-                                {
-                                    double dxy = Math.Sqrt(Math.Pow(tx - directPosCacheX, 2) + Math.Pow(ty - directPosCacheY, 2));
-                                    if (dxy <= 20f) score += 4f;
-                                    else if (dxy <= 300f) score += 2f;
-                                    else if (dxy > 3000f) score -= 3f;
-                                }
-
-                                if (score > bestScore)
-                                {
-                                    bestScore = score;
-                                    x = tx; y = ty; z = tz;
-                                    bestMgr = mo; bestObj = oo; bestPos = po;
-                                    found = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (!found) return false;
-
-                directPosCacheX = x;
-                directPosCacheY = y;
-                directPosHasCache = true;
-                source = $"direct(mgr=0x{bestMgr:X},obj=0x{bestObj:X2},pos=0x{bestPos:X2})";
-                return true;
+                return TryReadDirectPlayerPos(hProcess, moduleBase, out x, out y, out z, out source);
             }
 
             (float x, float y, float z) ReadPlayerPos()
