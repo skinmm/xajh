@@ -65,6 +65,8 @@ namespace xajh
         int _preferredPosOffset = DefaultPosOffset;
         readonly Dictionary<int, (float x, float y, float z)> _lastPosByOffset = new Dictionary<int, (float x, float y, float z)>();
         int _preferredPosStaticReads = 0;
+        readonly Dictionary<int, (float x, float y, float z)> _lastObjPosByOffset = new Dictionary<int, (float x, float y, float z)>();
+        int _preferredObjStaticReads = 0;
         IntPtr _dbgPlayerObj = IntPtr.Zero;
         int _dbgObjOffset = 0;
         int _dbgPosOffset = 0;
@@ -244,33 +246,8 @@ namespace xajh
             int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), ListOffset));
             if (list == 0) return false;
 
-            // Fast path: historical default (+0x4C) first.
-            int rawDefault = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), DefaultPlayerObjOffset));
-            if (rawDefault != 0)
-            {
-                var pDefault = new IntPtr((uint)rawDefault);
-                float xDef = MemoryHelper.ReadFloat(_h, IntPtr.Add(pDefault, 0x94));
-                float yDef = MemoryHelper.ReadFloat(_h, IntPtr.Add(pDefault, 0x98));
-                float zDef = MemoryHelper.ReadFloat(_h, IntPtr.Add(pDefault, 0x9C));
-                bool defValid = IsCoordinatePlausible(xDef, yDef, zDef) &&
-                                !(Math.Abs(xDef) < 0.001f && Math.Abs(yDef) < 0.001f && Math.Abs(zDef) < 0.001f);
-                if (defValid)
-                {
-                    _preferredObjOffset = DefaultPlayerObjOffset;
-                    playerObj = pDefault;
-                    _dbgPlayerObj = pDefault;
-                    _dbgObjOffset = DefaultPlayerObjOffset;
-                    _dbgRawX = xDef; _dbgRawY = yDef; _dbgRawZ = zDef;
-                    _dbgSource = "default";
-                    return true;
-                }
-            }
-
-            // Fallback: probe nearby offsets with continuity checks.
-            float bestScore = float.MinValue;
-            IntPtr bestPtr = IntPtr.Zero;
-            int bestOffset = _preferredObjOffset;
-            float bestX = float.NaN, bestY = float.NaN, bestZ = float.NaN;
+            // Probe nearby offsets with continuity and anti-stale scoring.
+            var candidates = new List<(int off, IntPtr p, float x, float y, float z)>();
             var seen = new HashSet<int>();
             foreach (int off in _candidateObjOffsets)
             {
@@ -278,39 +255,84 @@ namespace xajh
                 if (raw == 0 || !seen.Add(raw)) continue;
 
                 var p = new IntPtr((uint)raw);
-                float x = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x94));
-                float y = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x98));
-                float z = MemoryHelper.ReadFloat(_h, IntPtr.Add(p, 0x9C));
-                if (!IsCoordinatePlausible(x, y, z)) continue;
-                if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) continue;
+                if (!TryReadPosAtOffset(p, _preferredPosOffset, out float x, out float y, out float z) &&
+                    !TryReadPosAtOffset(p, DefaultPosOffset, out x, out y, out z))
+                    continue;
 
-                float score = off == _preferredObjOffset ? 1.0f : 0f;
+                candidates.Add((off, p, x, y, z));
+            }
+
+            if (candidates.Count == 0)
+                return false;
+
+            bool preferredLooksStatic = false;
+            bool anyAltMovedFromCache = false;
+            if (_hasCache)
+            {
+                foreach (var c in candidates)
+                {
+                    double dCache = DistXY(c.x, c.y, _cx, _cy);
+                    if (c.off == _preferredObjOffset && dCache < 0.01)
+                        preferredLooksStatic = true;
+                    if (c.off != _preferredObjOffset && dCache > 0.20 && dCache <= 300.0)
+                        anyAltMovedFromCache = true;
+                }
+            }
+            if (preferredLooksStatic && anyAltMovedFromCache)
+                _preferredObjStaticReads++;
+            else
+                _preferredObjStaticReads = 0;
+
+            float bestScore = float.MinValue;
+            IntPtr bestPtr = IntPtr.Zero;
+            int bestOffset = _preferredObjOffset;
+            float bestX = float.NaN, bestY = float.NaN, bestZ = float.NaN;
+            foreach (var c in candidates)
+            {
+                float score = 0f;
+                if (c.off == _preferredObjOffset) score += 2f;
+                if (c.off == DefaultPlayerObjOffset) score += 1f;
                 if (_hasCache)
                 {
-                    double dxy = Math.Sqrt(Math.Pow(x - _cx, 2) + Math.Pow(y - _cy, 2));
-                    if (dxy <= 8f) score += 3f;
-                    else if (dxy <= 120f) score += 1.5f;
-                    else score -= 2f;
+                    double dxy = DistXY(c.x, c.y, _cx, _cy);
+                    if (dxy <= 10f) score += 2f;
+                    else if (dxy <= 300f) score += 1f;
+                    else if (dxy > 3000f) score -= 3f;
+
+                    if (dxy > 0.20f && dxy <= 300f) score += 1f;
                 }
+
+                if (_lastObjPosByOffset.TryGetValue(c.off, out var lastObj))
+                {
+                    double dSelf = DistXY(c.x, c.y, lastObj.x, lastObj.y);
+                    if (dSelf > 0.05f && dSelf <= 300f) score += 1.5f;
+                    else if (dSelf < 0.005f) score -= 0.5f;
+                }
+
+                if (c.off == _preferredObjOffset && _preferredObjStaticReads >= 2)
+                    score -= 6f;
 
                 if (score > bestScore)
                 {
                     bestScore = score;
-                    bestPtr = p;
-                    bestOffset = off;
-                    bestX = x; bestY = y; bestZ = z;
+                    bestPtr = c.p;
+                    bestOffset = c.off;
+                    bestX = c.x; bestY = c.y; bestZ = c.z;
                 }
             }
 
             if (bestPtr == IntPtr.Zero)
                 return false;
 
+            foreach (var c in candidates)
+                _lastObjPosByOffset[c.off] = (c.x, c.y, c.z);
+
             _preferredObjOffset = bestOffset;
             playerObj = bestPtr;
             _dbgPlayerObj = bestPtr;
             _dbgObjOffset = bestOffset;
             _dbgRawX = bestX; _dbgRawY = bestY; _dbgRawZ = bestZ;
-            _dbgSource = "scan";
+            _dbgSource = bestOffset == DefaultPlayerObjOffset ? "default" : "scan";
             return true;
         }
 
