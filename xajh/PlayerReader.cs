@@ -5,6 +5,9 @@ namespace xajh
 {
     class PlayerReader
     {
+        static IntPtr Ptr32(int value) => new IntPtr(value);
+        static IntPtr Ptr32Add(int baseValue, int offset) => new IntPtr(unchecked(baseValue + offset));
+
         readonly struct PosSample
         {
             public readonly int Offset;
@@ -172,14 +175,14 @@ namespace xajh
 
                 foreach (int lo in _candidateListOffsets)
                 {
-                    int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), lo));
+                    int list = MemoryHelper.ReadInt32(_h, Ptr32Add(mgr, lo));
                     if (list == 0) continue;
 
                     foreach (int oo in _candidateObjOffsets)
                     {
-                        int raw = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), oo));
+                        int raw = MemoryHelper.ReadInt32(_h, Ptr32Add(list, oo));
                         if (raw == 0) continue;
-                        var p = new IntPtr((uint)raw);
+                        var p = Ptr32(raw);
 
                         foreach (int po in _candidatePosOffsets)
                         {
@@ -359,7 +362,7 @@ namespace xajh
                 {
                     foreach (int listOff in _candidateListOffsets)
                     {
-                        int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), listOff));
+                        int list = MemoryHelper.ReadInt32(_h, Ptr32Add(mgr, listOff));
                         if (list != 0 && TryResolveFromList(list, "main", _preferredMgrOffset, out playerObj))
                             return true;
                     }
@@ -426,7 +429,7 @@ namespace xajh
 
                 foreach (int listOff in _candidateListOffsets)
                 {
-                    int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), listOff));
+                    int list = MemoryHelper.ReadInt32(_h, Ptr32Add(mgr, listOff));
                     if (list == 0 || !seenLists.Add(list)) continue;
                     if (TryResolveFromList(list, $"mgrscan({mgrOff:X},{listOff:X})", mgrOff, out playerObj))
                         return true;
@@ -447,7 +450,7 @@ namespace xajh
 
                 foreach (int listOff in _candidateListOffsets)
                 {
-                    int list = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)mgr), listOff));
+                    int list = MemoryHelper.ReadInt32(_h, Ptr32Add(mgr, listOff));
                     if (list < 0x00100000 || !seenLists.Add(list)) continue;
                     if (TryResolveFromList(list, $"deepscan({mgrOff:X},{listOff:X})", mgrOff, out playerObj))
                         return true;
@@ -623,10 +626,10 @@ namespace xajh
             var seen = new HashSet<int>();
             foreach (int off in _candidateObjOffsets)
             {
-                int raw = MemoryHelper.ReadInt32(_h, IntPtr.Add(new IntPtr((uint)list), off));
+                int raw = MemoryHelper.ReadInt32(_h, Ptr32Add(list, off));
                 if (raw == 0 || !seen.Add(raw)) continue;
 
-                var p = new IntPtr((uint)raw);
+                var p = Ptr32(raw);
                 rawCandidates.Add((off, p));
                 if (!TrySampleObjectPosition(p, out float x, out float y, out float z, out _))
                     continue;
