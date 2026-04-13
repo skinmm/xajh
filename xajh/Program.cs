@@ -120,6 +120,16 @@ namespace Xajh
                 return true;
             }
 
+            bool TryReadGlobalXYModule(out float x, out float y)
+            {
+                x = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(moduleBase, 0x0B201ABC));
+                y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(moduleBase, 0x0B201ABC + 4));
+                if (float.IsNaN(x) || float.IsNaN(y) || float.IsInfinity(x) || float.IsInfinity(y)) return false;
+                if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f) return false;
+                if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f) return false;
+                return true;
+            }
+
             bool TryAutoLockGlobalXY(float currentX, float currentY)
             {
                 try
@@ -836,6 +846,14 @@ namespace Xajh
                         directCx = gx; directCy = gy; directCz = dz; hasDirectCache = true;
                         lastDirectSource = $"{lastDirectSource},glob=use";
                         return (gx, gy, dz);
+                    }
+
+                    // Final fallback: known global mirror static from module base.
+                    if (fallbackStaticReads >= 2 && TryReadGlobalXYModule(out float mx, out float my))
+                    {
+                        directCx = mx; directCy = my; directCz = dz; hasDirectCache = true;
+                        lastDirectSource = $"{lastDirectSource},glob=module";
+                        return (mx, my, dz);
                     }
 
                     return (dx, dy, dz);
