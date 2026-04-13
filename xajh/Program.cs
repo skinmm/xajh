@@ -21,6 +21,8 @@ namespace Xajh
         static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
         static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool SetForegroundWindow(IntPtr hWnd);
         [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
         struct RECT { public int Left, Top, Right, Bottom; }
 
@@ -29,11 +31,20 @@ namespace Xajh
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
             static IntPtr Ptr32(int value) => new IntPtr(value);
             static IntPtr Ptr32Add(int baseValue, int offset) => new IntPtr(unchecked(baseValue + offset));
+            static string LinkCodeToTag(int linkCode)
+            {
+                if (linkCode == -1) return "root";
+                if ((linkCode & 0x10000) == 0) return $"sub+0x{(linkCode & 0xFF):X2}";
+                int l1 = (linkCode >> 8) & 0xFF;
+                int l2 = linkCode & 0xFF;
+                return $"sub+0x{l1:X2}>+0x{l2:X2}";
+            }
             int[] directMgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D4524, 0x9D450C };
             int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
             int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
             int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0xA4, 0xB4, 0xD4, 0xE4, 0x104, 0x114 };
             int[] directPtrOffsets = { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C };
+            int[] directPtrOffsetsL2 = { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40 };
             int[] directSubPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30 };
             int preferredDirectMgr = 0x9D4518;
             int preferredDirectList = 0x08;
@@ -93,7 +104,8 @@ namespace Xajh
 
             void CollectPosCandidatesFromAddress(
                 IntPtr hProcess, IntPtr objAddr, int scanLength, int[] seedOffsets,
-                List<(int po, float x, float y, float z, bool seeded)> outList)
+                List<(int po, float x, float y, float z, bool seeded)> outList,
+                bool includeWideScan = true)
             {
                 var buf = new byte[scanLength];
                 if (!MemoryHelper.ReadProcessMemory(hProcess, objAddr, buf, scanLength, out int read) || read < 0x40)
@@ -106,6 +118,8 @@ namespace Xajh
                     if (TryReadTripletFromBuffer(buf, read, po, out float x, out float y, out float z))
                         outList.Add((po, x, y, z, true));
                 }
+
+                if (!includeWideScan) return;
 
                 // Wider scan to discover moving coordinates that are not at known offsets.
                 for (int po = 0x20; po + 12 <= read; po += 4)
@@ -749,8 +763,14 @@ namespace Xajh
             void RunDirectMovementCalibration()
             {
                 Console.WriteLine("[M] Calibrating fallback source. Move your character for ~3 seconds...");
+                IntPtr calibHwnd = GetGameHwnd();
+                if (calibHwnd != IntPtr.Zero)
+                {
+                    SetForegroundWindow(calibHwnd);
+                    Thread.Sleep(120);
+                }
                 directCalibrating = true;
-                directCalibEndTicks = Environment.TickCount64 + 3200;
+                directCalibEndTicks = Environment.TickCount64 + 4200;
                 directCalibStartByKey.Clear();
                 directMotionByKey.Clear();
                 directCalibLock = null;
@@ -798,27 +818,41 @@ namespace Xajh
 
                 if (!bestKey.HasValue || bestMotion < 0.25f)
                 {
-                    // If movement was too small to differentiate candidates, still choose
-                    // a deterministic best available candidate instead of failing hard.
+                    // If movement is weak, choose candidate by motion-first score and
+                    // discourage known static anchors (root +0x94 / +0x4C).
                     float fallbackScore = float.MinValue;
                     (int mgr, int list, int obj, int link, int pos)? fallbackKey = null;
                     foreach (var kv in directLastByKey)
                     {
                         float s = 0f;
-                        if (kv.Key.mgr == preferredDirectMgr) s += 2f;
-                        if (kv.Key.list == preferredDirectList) s += 1f;
-                        if (kv.Key.obj == preferredDirectObj) s += 1f;
-                        if (kv.Key.link == preferredDirectLink) s += 1f;
-                        if (kv.Key.pos == preferredDirectPos) s += 2f;
-                        if (kv.Key.list == 0x08) s += 1f;
-                        if (kv.Key.obj == 0x4C) s += 1f;
+
+                        if (directCalibStartByKey.TryGetValue(kv.Key, out var start))
+                        {
+                            double dStartEnd = Math.Sqrt(
+                                Math.Pow(kv.Value.x - start.x, 2) +
+                                Math.Pow(kv.Value.y - start.y, 2));
+                            s += (float)Math.Min(dStartEnd, 80.0) * 4.0f;
+                        }
+
+                        if (directMotionByKey.TryGetValue(kv.Key, out float mv))
+                            s += Math.Min(mv, 40f) * 2.0f;
+
+                        // Prefer linked sub-objects and non-default triplets when motion is weak.
+                        if (kv.Key.link != -1) s += 2.0f;
+                        if (kv.Key.pos != 0x94) s += 1.5f;
+                        if (kv.Key.obj != 0x4C) s += 1.0f;
+
+                        // Penalize the historical static anchor shape.
+                        if (kv.Key.link == -1 && kv.Key.obj == 0x4C && kv.Key.pos == 0x94)
+                            s -= 6.0f;
+
                         if (hasDirectCache)
                         {
                             double d = Math.Sqrt(Math.Pow(kv.Value.x - directCx, 2) + Math.Pow(kv.Value.y - directCy, 2));
-                            if (d <= 30f) s += 3f;
-                            else if (d <= 300f) s += 1.5f;
-                            else if (d > 3000f) s -= 2f;
+                            if (d <= 300f) s += 1.0f;
+                            else if (d > 5000f) s -= 2.0f;
                         }
+
                         if (s > fallbackScore)
                         {
                             fallbackScore = s;
@@ -834,7 +868,7 @@ namespace Xajh
 
                     bestKey = fallbackKey.Value;
                     bestMotion = 0f;
-                    Console.WriteLine("[M] No strong movement detected; locking best-available fallback candidate.");
+                    Console.WriteLine("[M] No strong movement detected; locking best motion-biased fallback candidate.");
                 }
 
                 var bk = bestKey.Value;
