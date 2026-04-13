@@ -49,6 +49,7 @@ namespace Xajh
             var directCalibStartByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), (float x, float y)>();
             (int mgr, int list, int obj, int link, int pos)? directCalibLock = null;
             var directMotionByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), float>();
+            IntPtr directGlobalXYLock = IntPtr.Zero;
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
@@ -677,6 +678,36 @@ namespace Xajh
             float aimRadius = 300f;
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
             string lastDirectSource = "";
+            double lastNpcCloudCenterX = 0d, lastNpcCloudCenterY = 0d;
+            bool hasLastNpcCloudCenter = false;
+
+            void UpdateNpcCloudCenter()
+            {
+                var npcs = GetTrackedNpcs();
+                if (npcs.Count == 0) return;
+                double sx = 0d, sy = 0d;
+                int count = 0;
+                foreach (var n in npcs)
+                {
+                    if (float.IsNaN(n.X) || float.IsNaN(n.Y) || float.IsInfinity(n.X) || float.IsInfinity(n.Y))
+                        continue;
+                    sx += n.X;
+                    sy += n.Y;
+                    count++;
+                }
+                if (count <= 0) return;
+                lastNpcCloudCenterX = sx / count;
+                lastNpcCloudCenterY = sy / count;
+                hasLastNpcCloudCenter = true;
+            }
+
+            bool IsDirectFallbackLikelyWrong(float px, float py)
+            {
+                if (!hasLastNpcCloudCenter) return false;
+                double d = Math.Sqrt(Math.Pow(px - lastNpcCloudCenterX, 2) + Math.Pow(py - lastNpcCloudCenterY, 2));
+                // If player estimate is implausibly far from current NPC cloud center, it is usually a stale map anchor.
+                return d > 15000.0;
+            }
 
             bool IsUnresolvedSource(string src)
                 => src == "none" || src == "mgr=0" || src == "list/obj=0" || src == "obj-ex";
@@ -688,11 +719,26 @@ namespace Xajh
 
             (float x, float y, float z) ReadPlayerPos()
             {
+                UpdateNpcCloudCenter();
                 var p = playerReader.Get();
                 var dbg = playerReader.GetDebugSnapshot();
                 if (IsUnresolvedSource(dbg.Source) &&
                     TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc))
                 {
+                    if (IsDirectFallbackLikelyWrong(dx, dy))
+                    {
+                        if (directCalibLock.HasValue)
+                        {
+                            directCalibLock = null;
+                            preferredDirectStaticReads = 0;
+                            lastDirectSource = "direct(lock-cleared:npc-cloud)";
+                        }
+                        if (TryReadPlayerDirect(out dx, out dy, out dz, out dsrc) && !IsDirectFallbackLikelyWrong(dx, dy))
+                        {
+                            lastDirectSource = dsrc;
+                            return (dx, dy, dz);
+                        }
+                    }
                     lastDirectSource = dsrc;
                     return (dx, dy, dz);
                 }
