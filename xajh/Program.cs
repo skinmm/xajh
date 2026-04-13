@@ -169,7 +169,7 @@ namespace Xajh
                                     if (lockPosCandidates.Count > 0)
                                     {
                                         float best = float.MinValue;
-                                        int bestPos = lk.pos;
+                                        int lockBestPos = lk.pos;
                                         float bx = 0f, by = 0f, bz = 0f;
                                         foreach (var c in lockPosCandidates)
                                         {
@@ -188,7 +188,7 @@ namespace Xajh
                                             if (s > best)
                                             {
                                                 best = s;
-                                                bestPos = c.po;
+                                                lockBestPos = c.po;
                                                 bx = c.x; by = c.y; bz = c.z;
                                             }
                                         }
@@ -198,11 +198,11 @@ namespace Xajh
                                         preferredDirectList = lk.list;
                                         preferredDirectObj = lk.obj;
                                         preferredDirectLink = lk.link;
-                                        preferredDirectPos = bestPos;
-                                        directCalibLock = (lk.mgr, lk.list, lk.obj, lk.link, bestPos);
+                                        preferredDirectPos = lockBestPos;
+                                        directCalibLock = (lk.mgr, lk.list, lk.obj, lk.link, lockBestPos);
                                         directCx = x; directCy = y; directCz = z; hasDirectCache = true;
                                         string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
-                                        source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{bestPos:X2},pref-lock-relaxed)";
+                                        source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lockBestPos:X2},pref-lock-relaxed)";
                                         return true;
                                     }
                                 }
