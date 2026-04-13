@@ -806,6 +806,21 @@ namespace Xajh
                 UpdateNpcCloudCenter();
                 var p = playerReader.Get();
                 var dbg = playerReader.GetDebugSnapshot();
+                bool simpleStatic =
+                    dbg.Source == "simple" &&
+                    hasDirectCache &&
+                    Math.Sqrt(Math.Pow(p.x - directCx, 2) + Math.Pow(p.y - directCy, 2)) < 0.01;
+
+                if (!IsUnresolvedSource(dbg.Source) && !simpleStatic)
+                {
+                    directCx = p.x;
+                    directCy = p.y;
+                    directCz = p.z;
+                    hasDirectCache = true;
+                    lastDirectSource = "";
+                    return p;
+                }
+
                 if (IsUnresolvedSource(dbg.Source) &&
                     TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc))
                 {
@@ -857,6 +872,15 @@ namespace Xajh
                     }
 
                     return (dx, dy, dz);
+                }
+
+                // If simple source exists but appears numerically frozen, still route
+                // through direct fallback path to escape static map-anchor coordinates.
+                if (simpleStatic &&
+                    TryReadPlayerDirect(out float sx, out float sy, out float sz, out string ssrc))
+                {
+                    lastDirectSource = $"simple-static,{ssrc}";
+                    return (sx, sy, sz);
                 }
                 lastDirectSource = "";
                 return p;
