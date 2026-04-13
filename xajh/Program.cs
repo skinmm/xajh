@@ -752,8 +752,43 @@ namespace Xajh
 
                 if (!bestKey.HasValue || bestMotion < 0.25f)
                 {
-                    Console.WriteLine("[M] Calibration failed: no moving candidate detected.");
-                    return;
+                    // If movement was too small to differentiate candidates, still choose
+                    // a deterministic best available candidate instead of failing hard.
+                    float fallbackScore = float.MinValue;
+                    (int mgr, int list, int obj, int link, int pos)? fallbackKey = null;
+                    foreach (var kv in directLastByKey)
+                    {
+                        float s = 0f;
+                        if (kv.Key.mgr == preferredDirectMgr) s += 2f;
+                        if (kv.Key.list == preferredDirectList) s += 1f;
+                        if (kv.Key.obj == preferredDirectObj) s += 1f;
+                        if (kv.Key.link == preferredDirectLink) s += 1f;
+                        if (kv.Key.pos == preferredDirectPos) s += 2f;
+                        if (kv.Key.list == 0x08) s += 1f;
+                        if (kv.Key.obj == 0x4C) s += 1f;
+                        if (hasDirectCache)
+                        {
+                            double d = Math.Sqrt(Math.Pow(kv.Value.x - directCx, 2) + Math.Pow(kv.Value.y - directCy, 2));
+                            if (d <= 30f) s += 3f;
+                            else if (d <= 300f) s += 1.5f;
+                            else if (d > 3000f) s -= 2f;
+                        }
+                        if (s > fallbackScore)
+                        {
+                            fallbackScore = s;
+                            fallbackKey = kv.Key;
+                        }
+                    }
+
+                    if (!fallbackKey.HasValue)
+                    {
+                        Console.WriteLine("[M] Calibration failed: no candidate available.");
+                        return;
+                    }
+
+                    bestKey = fallbackKey.Value;
+                    bestMotion = 0f;
+                    Console.WriteLine("[M] No strong movement detected; locking best-available fallback candidate.");
                 }
 
                 var bk = bestKey.Value;
