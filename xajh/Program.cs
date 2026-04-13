@@ -724,16 +724,33 @@ namespace Xajh
                 directCalibrating = false;
                 (int mgr, int list, int obj, int link, int pos)? bestKey = null;
                 float bestMotion = 0f;
-                foreach (var kv in directMotionByKey)
+
+                // Primary metric: start-vs-end displacement during calibration window.
+                foreach (var kv in directLastByKey)
                 {
-                    if (kv.Value > bestMotion)
+                    if (!directCalibStartByKey.TryGetValue(kv.Key, out var start))
+                        continue;
+                    double d = Math.Sqrt(Math.Pow(kv.Value.x - start.x, 2) + Math.Pow(kv.Value.y - start.y, 2));
+                    float motion = (float)Math.Min(d, 500f);
+                    if (motion > bestMotion)
                     {
-                        bestMotion = kv.Value;
+                        bestMotion = motion;
                         bestKey = kv.Key;
                     }
                 }
 
-                if (!bestKey.HasValue || bestMotion < 1.0f)
+                // Secondary metric: accumulated per-read motion (kept for backup).
+                foreach (var kv in directMotionByKey)
+                {
+                    float motion = kv.Value;
+                    if (motion > bestMotion)
+                    {
+                        bestMotion = motion;
+                        bestKey = kv.Key;
+                    }
+                }
+
+                if (!bestKey.HasValue || bestMotion < 0.25f)
                 {
                     Console.WriteLine("[M] Calibration failed: no moving candidate detected.");
                     return;
