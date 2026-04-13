@@ -61,6 +61,9 @@ namespace Xajh
             (int mgr, int list, int obj, int link, int pos)? directCalibLock = null;
             var directMotionByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), float>();
             IntPtr directGlobalXYLock = IntPtr.Zero;
+            int fallbackStaticReads = 0;
+            (int mgr, int list, int obj, int link, int pos)? lastAutoLock = null;
+            int autoLockCooldown = 0;
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
@@ -100,6 +103,63 @@ namespace Xajh
                 if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f || Math.Abs(z) > 1_000_000f) return false;
                 if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f && Math.Abs(z) < 0.001f) return false;
                 return true;
+            }
+
+            bool TryReadGlobalXYLocked(out float x, out float y)
+            {
+                x = 0f; y = 0f;
+                if (directGlobalXYLock == IntPtr.Zero) return false;
+                x = MemoryHelper.ReadFloat(hProcess, directGlobalXYLock);
+                y = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(directGlobalXYLock, 4));
+                if (float.IsNaN(x) || float.IsNaN(y) || float.IsInfinity(x) || float.IsInfinity(y)) return false;
+                if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f) return false;
+                if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f) return false;
+                return true;
+            }
+
+            bool TryAutoLockGlobalXY(float currentX, float currentY)
+            {
+                try
+                {
+                    if (autoLockCooldown > 0)
+                    {
+                        autoLockCooldown--;
+                        return false;
+                    }
+
+                    var hitsX = MemoryHelper.ScanForFloat(hProcess, currentX, 0.2f);
+                    if (hitsX.Count == 0) { autoLockCooldown = 8; return false; }
+
+                    IntPtr best = IntPtr.Zero;
+                    int bestScore = int.MinValue;
+                    foreach (var a in hitsX)
+                    {
+                        float ny = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(a, 4));
+                        if (float.IsNaN(ny) || float.IsInfinity(ny)) continue;
+                        if (Math.Abs(ny - currentY) > 0.2f) continue;
+
+                        int score = 0;
+                        if (a == directGlobalXYLock) score += 4;
+                        long addr = a.ToInt64();
+                        if (addr >= 0x01000000 && addr <= 0x7FFFFFFF) score += 1;
+
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            best = a;
+                        }
+                    }
+
+                    autoLockCooldown = 8;
+                    if (best == IntPtr.Zero) return false;
+                    directGlobalXYLock = best;
+                    return true;
+                }
+                catch
+                {
+                    autoLockCooldown = 8;
+                    return false;
+                }
             }
 
             void CollectPosCandidatesFromAddress(
@@ -753,7 +813,31 @@ namespace Xajh
                             return (dx, dy, dz);
                         }
                     }
-                    lastDirectSource = dsrc;
+                    // Detect static fallback and escalate to global XY lock.
+                    if (hasDirectCache)
+                    {
+                        double dd = Math.Sqrt(Math.Pow(dx - directCx, 2) + Math.Pow(dy - directCy, 2));
+                        if (dd < 0.01) fallbackStaticReads++;
+                        else fallbackStaticReads = 0;
+                    }
+
+                    if (fallbackStaticReads >= 2 && TryAutoLockGlobalXY(dx, dy))
+                    {
+                        lastDirectSource = $"{dsrc},glob=lock";
+                    }
+                    else
+                    {
+                        lastDirectSource = dsrc;
+                    }
+
+                    if (fallbackStaticReads >= 2 && TryReadGlobalXYLocked(out float gx, out float gy))
+                    {
+                        // Keep Z from fallback candidate; override XY with locked global world coords.
+                        directCx = gx; directCy = gy; directCz = dz; hasDirectCache = true;
+                        lastDirectSource = $"{lastDirectSource},glob=use";
+                        return (gx, gy, dz);
+                    }
+
                     return (dx, dy, dz);
                 }
                 lastDirectSource = "";
@@ -873,12 +957,14 @@ namespace Xajh
 
                 var bk = bestKey.Value;
                 directCalibLock = bk;
+                lastAutoLock = bk;
                 preferredDirectMgr = bk.mgr;
                 preferredDirectList = bk.list;
                 preferredDirectObj = bk.obj;
                 preferredDirectLink = bk.link;
                 preferredDirectPos = bk.pos;
                 preferredDirectStaticReads = 0;
+                fallbackStaticReads = 0;
                 if (directLastByKey.TryGetValue(bk, out var last))
                 {
                     directCx = last.x;
