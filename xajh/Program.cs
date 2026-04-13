@@ -64,6 +64,9 @@ namespace Xajh
             int fallbackStaticReads = 0;
             (int mgr, int list, int obj, int link, int pos)? lastAutoLock = null;
             int autoLockCooldown = 0;
+            Process game = null;
+            IntPtr moduleBase = IntPtr.Zero;
+            IntPtr hProcess = IntPtr.Zero;
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
@@ -601,9 +604,6 @@ namespace Xajh
             }
 
             Console.WriteLine("[*] Waiting for game process (vrchat1) ...");
-            Process game = null;
-            IntPtr moduleBase = IntPtr.Zero;
-            IntPtr hProcess = IntPtr.Zero;
             for (int i = 0; i < 120; i++)
             {
                 var procs = Process.GetProcessesByName("vrchat1");
