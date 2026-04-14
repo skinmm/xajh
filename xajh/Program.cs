@@ -1454,7 +1454,7 @@ namespace Xajh
             bool IsStrictPlausiblePos(float x, float y)
             {
                 if (!IsPlausibleWorldPos(x, y)) return false;
-                if (Math.Abs(x) < 10f && Math.Abs(y) < 10f) return false;
+                if (Math.Abs(x) < 10f || Math.Abs(y) < 10f) return false;
                 return true;
             }
 
