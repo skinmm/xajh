@@ -1185,22 +1185,83 @@ namespace Xajh
                 Console.WriteLine("[!] Injection failed.");
                 Console.ReadKey(); return;
             }
-            string zxxyPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "zxxy.dll");
-            if (File.Exists(zxxyPath))
+            // Search for zxxy.dll: check if already loaded, then try multiple paths.
+            bool zxxyAlreadyLoaded = TryGetGameModule("zxxy.dll", out _, out _);
+            if (zxxyAlreadyLoaded)
             {
-                if (!DllInjector.Inject(hProcess, zxxyPath))
-                {
-                    Console.WriteLine("[*] Optional zxxy.dll injection failed; continuing with existing resolvers.");
-                }
-                else
-                {
-                    TryRefreshZxxyModule(force: true);
-                    Console.WriteLine("[*] Optional zxxy.dll injected for map-specific position fallback.");
-                }
+                TryRefreshZxxyModule(force: true);
+                Console.WriteLine("[*] zxxy.dll already loaded in game process (e.g. by xajhtoy).");
             }
             else
             {
-                Console.WriteLine("[*] Optional zxxy.dll not found next to executable; continuing without it.");
+                // Search multiple locations for zxxy.dll
+                var zxxySearchPaths = new List<string>();
+                string appBase = AppDomain.CurrentDomain.BaseDirectory;
+                zxxySearchPaths.Add(Path.Combine(appBase, "zxxy.dll"));
+                try
+                {
+                    // Game directory (where vrchat1.exe lives)
+                    game.Refresh();
+                    string gameDir = Path.GetDirectoryName(game.MainModule.FileName);
+                    if (!string.IsNullOrEmpty(gameDir))
+                    {
+                        zxxySearchPaths.Add(Path.Combine(gameDir, "zxxy.dll"));
+                        // Check parent and sibling directories
+                        string parentDir = Path.GetDirectoryName(gameDir);
+                        if (!string.IsNullOrEmpty(parentDir))
+                        {
+                            zxxySearchPaths.Add(Path.Combine(parentDir, "zxxy.dll"));
+                            foreach (var sub in Directory.GetDirectories(parentDir))
+                                zxxySearchPaths.Add(Path.Combine(sub, "zxxy.dll"));
+                        }
+                    }
+                }
+                catch { }
+                // Parent of our own directory
+                try
+                {
+                    string appParent = Path.GetDirectoryName(appBase.TrimEnd(Path.DirectorySeparatorChar));
+                    if (!string.IsNullOrEmpty(appParent))
+                    {
+                        zxxySearchPaths.Add(Path.Combine(appParent, "zxxy.dll"));
+                        foreach (var sub in Directory.GetDirectories(appParent))
+                            zxxySearchPaths.Add(Path.Combine(sub, "zxxy.dll"));
+                    }
+                }
+                catch { }
+
+                string zxxyPath = null;
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var candidate in zxxySearchPaths)
+                {
+                    if (!seen.Add(candidate)) continue;
+                    if (File.Exists(candidate))
+                    {
+                        zxxyPath = candidate;
+                        break;
+                    }
+                }
+
+                if (zxxyPath != null)
+                {
+                    Console.WriteLine($"[*] Found zxxy.dll at: {zxxyPath}");
+                    if (!DllInjector.Inject(hProcess, zxxyPath))
+                    {
+                        Console.WriteLine("[*] Optional zxxy.dll injection failed; continuing with existing resolvers.");
+                    }
+                    else
+                    {
+                        TryRefreshZxxyModule(force: true);
+                        Console.WriteLine("[*] zxxy.dll injected for map-specific position fallback.");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("[*] zxxy.dll not found. Searched:");
+                    foreach (var sp in seen)
+                        Console.WriteLine($"      {sp}");
+                    Console.WriteLine("    Place zxxy.dll next to xajh.exe or in the game directory for correct position on all maps.");
+                }
             }
 
             // --- Step 3: Combat overlay control ---
@@ -1360,6 +1421,14 @@ namespace Xajh
             bool IsUnresolvedSource(string src)
                 => src == "none" || src == "mgr=0" || src == "list/obj=0" || src == "obj-ex";
 
+            bool IsPlausibleWorldPos(float x, float y)
+            {
+                if (float.IsNaN(x) || float.IsNaN(y)) return false;
+                if ((Math.Abs(x) + Math.Abs(y)) < 10f) return false;
+                if (IsDirectFallbackLikelyWrong(x, y)) return false;
+                return true;
+            }
+
             bool TryReadPlayerDirect(out float x, out float y, out float z, out string source)
             {
                 return TryReadDirectPlayerPos(hProcess, moduleBase, out x, out y, out z, out source);
@@ -1443,35 +1512,17 @@ namespace Xajh
                 // candidate that matches them so we can find the REAL moving position.
                 // The result must have significant magnitude to avoid near-zero garbage.
                 if (simpleStatic &&
-                    TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc))
+                    TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc) &&
+                    IsPlausibleWorldPos(rdx, rdy))
                 {
-                    bool plausible = (Math.Abs(rdx) + Math.Abs(rdy)) > 10f &&
-                                     !IsDirectFallbackLikelyWrong(rdx, rdy);
-                    if (plausible)
-                    {
-                        lastDirectSource = $"reject-static({p.x:F0},{p.y:F0})->{rdsrc}";
-                        return (rdx, rdy, rdz);
-                    }
+                    lastDirectSource = $"reject-static({p.x:F0},{p.y:F0})->{rdsrc}";
+                    return (rdx, rdy, rdz);
                 }
 
                 if ((IsUnresolvedSource(dbg.Source) || simpleStatic) &&
-                    TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc))
+                    TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc) &&
+                    IsPlausibleWorldPos(dx, dy))
                 {
-                    if (IsDirectFallbackLikelyWrong(dx, dy))
-                    {
-                        if (directCalibLock.HasValue)
-                        {
-                            directCalibLock = null;
-                            preferredDirectStaticReads = 0;
-                            lastDirectSource = "direct(lock-cleared:npc-cloud)";
-                        }
-                        if (TryReadPlayerDirect(out dx, out dy, out dz, out dsrc) && !IsDirectFallbackLikelyWrong(dx, dy))
-                        {
-                            lastDirectSource = dsrc;
-                            return (dx, dy, dz);
-                        }
-                    }
-
                     // If the regular direct path returns the same static coords, skip it.
                     bool directAlsoStatic = simpleStatic &&
                         Math.Abs(dx - p.x) < 1f && Math.Abs(dy - p.y) < 1f;
@@ -1494,21 +1545,27 @@ namespace Xajh
                         else
                             lastDirectSource = dsrc;
 
-                        if (fallbackStaticReads >= 2 && TryReadGlobalXYLocked(out float gx, out float gy))
+                        if (fallbackStaticReads >= 2 && TryReadGlobalXYLocked(out float gx, out float gy) &&
+                            IsPlausibleWorldPos(gx, gy))
                         {
                             directCx = gx; directCy = gy; directCz = dz; hasDirectCache = true;
                             lastDirectSource = $"{lastDirectSource},glob=use";
                             return (gx, gy, dz);
                         }
 
-                        if (fallbackStaticReads >= 2 && TryReadGlobalXYModule(out float mx, out float my))
+                        if (fallbackStaticReads >= 2 && TryReadGlobalXYModule(out float mx, out float my) &&
+                            IsPlausibleWorldPos(mx, my))
                         {
                             directCx = mx; directCy = my; directCz = dz; hasDirectCache = true;
                             lastDirectSource = $"{lastDirectSource},glob=module";
                             return (mx, my, dz);
                         }
 
-                        return (dx, dy, dz);
+                        if (!directAlsoStatic)
+                        {
+                            lastDirectSource = dsrc;
+                            return (dx, dy, dz);
+                        }
                     }
                 }
 
