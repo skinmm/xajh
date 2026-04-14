@@ -1447,10 +1447,23 @@ namespace Xajh
             bool IsPlausibleWorldPos(float x, float y)
             {
                 if (float.IsNaN(x) || float.IsNaN(y)) return false;
-                // Both X and Y must individually have some magnitude —
-                // a real world position is never (4475, 0, 0) or (0, 200, 0).
                 if (Math.Abs(x) < 1f || Math.Abs(y) < 1f) return false;
                 if (IsDirectFallbackLikelyWrong(x, y)) return false;
+                return true;
+            }
+
+            // Stricter check: position must be near a known reference (frozen simple
+            // chain or directCache).  Prevents accepting garbage like (1,1,255) that
+            // technically passes IsPlausibleWorldPos but is thousands of units from
+            // the last known good position.
+            bool IsNearKnownPosition(float x, float y)
+            {
+                if (!IsPlausibleWorldPos(x, y)) return false;
+                if (hasDirectCache)
+                {
+                    double d = Math.Sqrt(Math.Pow(x - directCx, 2) + Math.Pow(y - directCy, 2));
+                    if (d > 2000.0) return false;
+                }
                 return true;
             }
 
@@ -1594,7 +1607,7 @@ namespace Xajh
 
                 // --- Phase 2: zxxy.dll pointer chain scan (existing approach) ---
                 if (TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc) &&
-                    IsPlausibleWorldPos(zx, zy))
+                    IsNearKnownPosition(zx, zy))
                 {
                     lastDirectSource = zxsrc;
                     return (zx, zy, zz);
@@ -1715,7 +1728,7 @@ namespace Xajh
                 // --- Phase 3: direct fallback with known-wrong coordinate rejection ---
                 if (simpleStatic && simplePlausible &&
                     TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc) &&
-                    IsPlausibleWorldPos(rdx, rdy))
+                    IsNearKnownPosition(rdx, rdy))
                 {
                     lastDirectSource = $"reject-static({p.x:F0},{p.y:F0})->{rdsrc}";
                     return (rdx, rdy, rdz);
@@ -1723,7 +1736,7 @@ namespace Xajh
 
                 if ((!simplePlausible || simpleStatic) &&
                     TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc) &&
-                    IsPlausibleWorldPos(dx, dy))
+                    IsNearKnownPosition(dx, dy))
                 {
                     bool directAlsoStatic = simpleStatic && simplePlausible &&
                         Math.Abs(dx - p.x) < 1f && Math.Abs(dy - p.y) < 1f;
