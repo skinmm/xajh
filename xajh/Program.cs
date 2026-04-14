@@ -1714,72 +1714,132 @@ namespace Xajh
                 // Deep scan revealed live coords at mgr+0x9D4520[+0x0C]+0x4C>+0x0C>+0x4C
                 // at position offsets +0x064 and +0x094. Probe this specific chain
                 // with a double-read to detect movement, bypassing generic scoring.
+                // --- Phase 2c: targeted probe for known deep chains ---
+                // Deep scan revealed moving coords at multiple chain paths under
+                // mgr+0x9D4520. Try 2-link and 3-link chains with movement detection.
                 if (simpleStatic || !simplePlausible)
                 {
-                    int[][] targetedChains = {
+                    // 2-link chains: mgr→list→obj→sub1→pos
+                    int[][] chains2 = {
+                        new[] { 0x9D4520, 0x0C, 0x4C, 0x0C },
+                        new[] { 0x9D4520, 0x0C, 0x48, 0x0C },
+                        new[] { 0x9D4520, 0x0C, 0x58, 0x04 },
+                        new[] { 0x9D4520, 0x0C, 0x58, 0xB8 },
+                        new[] { 0x9D4520, 0x0C, 0x58, 0xBC },
+                        new[] { 0x9D4520, 0x08, 0x4C, 0x0C },
+                        new[] { 0x9D4520, 0x08, 0x48, 0x0C },
+                    };
+                    // 3-link chains: mgr→list→obj→sub1→sub2→pos
+                    int[][] chains3 = {
                         new[] { 0x9D4520, 0x0C, 0x4C, 0x0C, 0x4C },
                         new[] { 0x9D4520, 0x0C, 0x48, 0x0C, 0x4C },
-                        new[] { 0x9D4520, 0x0C, 0x4C, 0x0C, 0x48 },
-                        new[] { 0x9D4520, 0x08, 0x4C, 0x0C, 0x4C },
+                        new[] { 0x9D4520, 0x0C, 0x58, 0x04, 0x70 },
+                        new[] { 0x9D4520, 0x0C, 0x58, 0xB8, 0x54 },
+                        new[] { 0x9D4520, 0x0C, 0x58, 0xB8, 0x58 },
+                        new[] { 0x9D4520, 0x0C, 0x58, 0xBC, 0x38 },
+                        new[] { 0x9D4520, 0x0C, 0x58, 0xBC, 0x70 },
+                        new[] { 0x9D4520, 0x0C, 0x40, 0xB8, 0x24 },
                     };
-                    int[] probePosOffsets = { 0x94, 0x64, 0x34, 0xC4, 0x20, 0x24, 0x28 };
+                    int[] probePosOffsets = { 0x94, 0x64, 0x34, 0xC4, 0x20, 0x24, 0x28, 0x4C, 0x68 };
 
-                    float bestTargetedScore = float.MinValue;
-                    float bestTX = 0f, bestTY = 0f, bestTZ = 0f;
-                    string bestTSrc = "";
+                    var probeResults = new List<(float x, float y, float z, double mv, string src)>();
 
-                    foreach (var chain in targetedChains)
+                    // Resolve all chain endpoints and collect first reads.
+                    var endpoints = new List<(IntPtr ptr, string tag)>();
+
+                    foreach (var c in chains2)
                     {
-                        int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, chain[0]));
+                        int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, c[0]));
                         if (mgr == 0) continue;
-                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, chain[1]));
+                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, c[1]));
                         if (list == 0) continue;
-                        int obj = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, chain[2]));
+                        int obj = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, c[2]));
                         if (obj == 0 || obj < 0x00100000) continue;
-                        int sub1 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(obj, chain[3]));
+                        int sub = MemoryHelper.ReadInt32(hProcess, Ptr32Add(obj, c[3]));
+                        if (sub == 0 || sub == obj || sub < 0x00100000) continue;
+                        endpoints.Add((Ptr32(sub), $"mgr+0x{c[0]:X}[+0x{c[1]:X2}]+0x{c[2]:X2}>+0x{c[3]:X2}"));
+                    }
+                    foreach (var c in chains3)
+                    {
+                        int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, c[0]));
+                        if (mgr == 0) continue;
+                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, c[1]));
+                        if (list == 0) continue;
+                        int obj = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, c[2]));
+                        if (obj == 0 || obj < 0x00100000) continue;
+                        int sub1 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(obj, c[3]));
                         if (sub1 == 0 || sub1 == obj || sub1 < 0x00100000) continue;
-                        int sub2 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(sub1, chain[4]));
+                        int sub2 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(sub1, c[4]));
                         if (sub2 == 0 || sub2 == sub1 || sub2 == obj || sub2 < 0x00100000) continue;
+                        endpoints.Add((Ptr32(sub2), $"mgr+0x{c[0]:X}[+0x{c[1]:X2}]+0x{c[2]:X2}>+0x{c[3]:X2}>+0x{c[4]:X2}"));
+                    }
 
-                        var targetObj = Ptr32(sub2);
+                    // First read from all endpoints.
+                    var firstReads = new List<(IntPtr ptr, int po, float x, float y, float z, string tag)>();
+                    var seenEndpoints = new HashSet<long>();
+                    foreach (var ep in endpoints)
+                    {
+                        if (!seenEndpoints.Add(ep.ptr.ToInt64())) continue;
                         foreach (int po in probePosOffsets)
                         {
-                            if (!TryReadStablePos(hProcess, targetObj, po, out float tx, out float ty, out float tz))
-                                continue;
-                            if (!IsStrictPlausiblePos(tx, ty)) continue;
-
-                            // Double-read with delay to detect movement.
-                            Thread.Sleep(50);
-                            if (!TryReadStablePos(hProcess, targetObj, po, out float tx2, out float ty2, out _))
-                                continue;
-                            double movement = Math.Sqrt(Math.Pow(tx2 - tx, 2) + Math.Pow(ty2 - ty, 2));
-
-                            float score = 0f;
-                            if (movement > 0.05) score += 10f;
-                            if (hasLastNpcCloudCenter)
-                            {
-                                double dNpc = Math.Sqrt(Math.Pow(tx - lastNpcCloudCenterX, 2) + Math.Pow(ty - lastNpcCloudCenterY, 2));
-                                if (dNpc <= 3000.0) score += 3f;
-                                else if (dNpc > 15000.0) score -= 5f;
-                            }
-                            if (po == 0x94 || po == 0x64) score += 1f;
-
-                            if (score > bestTargetedScore)
-                            {
-                                bestTargetedScore = score;
-                                bestTX = movement > 0.05 ? tx2 : tx;
-                                bestTY = movement > 0.05 ? ty2 : ty;
-                                bestTZ = tz;
-                                bestTSrc = $"targeted(mgr=0x{chain[0]:X}[+0x{chain[1]:X2}]+0x{chain[2]:X2}>+0x{chain[3]:X2}>+0x{chain[4]:X2},pos=0x{po:X2},mv={movement:F1},score={score:F1})";
-                            }
+                            if (TryReadStablePos(hProcess, ep.ptr, po, out float x, out float y, out float z) &&
+                                IsStrictPlausiblePos(x, y))
+                                firstReads.Add((ep.ptr, po, x, y, z, ep.tag));
                         }
                     }
 
-                    if (bestTargetedScore > 0f && IsStrictPlausiblePos(bestTX, bestTY))
+                    if (firstReads.Count > 0)
                     {
-                        directCx = bestTX; directCy = bestTY; directCz = bestTZ; hasDirectCache = true;
-                        lastDirectSource = bestTSrc;
-                        return (bestTX, bestTY, bestTZ);
+                        Thread.Sleep(200);
+
+                        float bestScore = float.MinValue;
+                        foreach (var fr in firstReads)
+                        {
+                            if (!TryReadStablePos(hProcess, fr.ptr, fr.po, out float x2, out float y2, out float z2))
+                                continue;
+                            double mv = Math.Sqrt(Math.Pow(x2 - fr.x, 2) + Math.Pow(y2 - fr.y, 2));
+
+                            float score = 0f;
+                            if (mv > 0.5) score += 15f;
+                            else if (mv > 0.05) score += 8f;
+                            if (IsStrictPlausiblePos(x2, y2)) score += 2f;
+                            if (hasLastNpcCloudCenter)
+                            {
+                                double dNpc = Math.Sqrt(Math.Pow(x2 - lastNpcCloudCenterX, 2) + Math.Pow(y2 - lastNpcCloudCenterY, 2));
+                                if (dNpc <= 3000.0) score += 3f;
+                            }
+
+                            float useX = mv > 0.05 ? x2 : fr.x;
+                            float useY = mv > 0.05 ? y2 : fr.y;
+                            string src = $"targeted({fr.tag},pos=0x{fr.po:X2},v=({useX:F0},{useY:F0}),mv={mv:F1})";
+                            probeResults.Add((useX, useY, fr.z, mv, src));
+
+                            if (score > bestScore)
+                                bestScore = score;
+                        }
+
+                        // Pick the result with the most movement.
+                        probeResults.Sort((a, b) => b.mv.CompareTo(a.mv));
+
+                        if (probeResults.Count > 0 && probeResults[0].mv > 0.5 &&
+                            IsStrictPlausiblePos(probeResults[0].x, probeResults[0].y))
+                        {
+                            var best = probeResults[0];
+                            directCx = best.x; directCy = best.y; directCz = best.z; hasDirectCache = true;
+                            lastDirectSource = best.src;
+                            return (best.x, best.y, best.z);
+                        }
+
+                        // Log top candidates for debugging.
+                        if (probeResults.Count > 0)
+                        {
+                            int show = Math.Min(5, probeResults.Count);
+                            for (int i = 0; i < show; i++)
+                            {
+                                var r = probeResults[i];
+                                Console.WriteLine($"  [DBG] targeted#{i}: ({r.x:F1},{r.y:F1},{r.z:F1}) mv={r.mv:F2} {r.src}");
+                            }
+                        }
                     }
                 }
 
