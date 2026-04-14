@@ -1813,7 +1813,14 @@ namespace Xajh
                             if (zxxyDirectLockedAddr != 0)
                                 Console.WriteLine($"  [DBG] zxxy-direct locked=0x{zxxyDirectLockedAddr:X8} cand={zxxyDirectCandidates.Count}");
                             else if (zxxyDirectCandidates.Count > 0)
+                            {
                                 Console.WriteLine($"  [DBG] zxxy-direct cand={zxxyDirectCandidates.Count} (no lock yet)");
+                                var topCand = zxxyDirectCandidates
+                                    .OrderByDescending(c => c.motion)
+                                    .Take(8);
+                                foreach (var c in topCand)
+                                    Console.WriteLine($"    0x{c.addr:X8} ({c.lastX:F1},{c.lastY:F1},{c.lastZ:F1}) motion={c.motion:F2}");
+                            }
 
                             // NPC list
                             var allNpcs = GetTrackedNpcs();
