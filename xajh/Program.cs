@@ -352,13 +352,15 @@ namespace Xajh
                 return true;
             }
 
+            int zxxyDirectStaleReads = 0;
+
             bool TryReadPlayerPosViaZxxyDirect(out float x, out float y, out float z, out string source)
             {
                 x = 0f; y = 0f; z = 0f;
                 source = "zxxy-direct:none";
                 if (!TryRefreshZxxyModule()) return false;
 
-                // If we have a locked address, read directly from it.
+                // If we have a locked address, read it — but unlock if stale.
                 if (zxxyDirectLockedAddr != 0)
                 {
                     var addr = new IntPtr(zxxyDirectLockedAddr);
@@ -368,28 +370,43 @@ namespace Xajh
                     if (!float.IsNaN(rx) && !float.IsNaN(ry) && !float.IsNaN(rz) &&
                         !float.IsInfinity(rx) && !float.IsInfinity(ry) && !float.IsInfinity(rz) &&
                         Math.Abs(rx) < 1_000_000f && Math.Abs(ry) < 1_000_000f && Math.Abs(rz) < 1_000_000f &&
-                        (Math.Abs(rx) > 0.001f || Math.Abs(ry) > 0.001f))
+                        (Math.Abs(rx) + Math.Abs(ry)) > 10f)
                     {
-                        // Confirm it's still moving (not a stale lock) by checking
-                        // for change since last read over consecutive calls.
                         bool moved = !float.IsNaN(zxxyDirectLockedLastX) &&
                             (Math.Abs(rx - zxxyDirectLockedLastX) > 0.01f || Math.Abs(ry - zxxyDirectLockedLastY) > 0.01f);
                         zxxyDirectLockedLastX = rx;
                         zxxyDirectLockedLastY = ry;
 
+                        if (!moved)
+                        {
+                            zxxyDirectStaleReads++;
+                            if (zxxyDirectStaleReads >= 4)
+                            {
+                                zxxyDirectLockedAddr = 0;
+                                zxxyDirectStaleReads = 0;
+                                zxxyDirectCandidates.Clear();
+                                nextZxxyDirectScanTicks = 0;
+                                source = "zxxy-direct:unlocked-stale";
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            zxxyDirectStaleReads = 0;
+                        }
+
                         x = rx; y = ry; z = rz;
-                        directCx = x; directCy = y; directCz = z; hasDirectCache = true;
-                        source = $"zxxy-direct(addr=0x{zxxyDirectLockedAddr:X8},moved={moved})";
+                        source = $"zxxy-direct(addr=0x{zxxyDirectLockedAddr:X8},moved={moved},stale={zxxyDirectStaleReads})";
                         return true;
                     }
                     zxxyDirectLockedAddr = 0;
+                    zxxyDirectStaleReads = 0;
                 }
 
                 long now = Environment.TickCount64;
                 if (now < nextZxxyDirectScanTicks && zxxyDirectCandidates.Count == 0)
                     return false;
 
-                // Full re-scan of zxxy.dll data for coordinate triplets.
                 if (zxxyDirectCandidates.Count == 0 || now >= nextZxxyDirectScanTicks)
                 {
                     nextZxxyDirectScanTicks = now + 3000;
@@ -433,7 +450,8 @@ namespace Xajh
                                         if (float.IsNaN(fx) || float.IsNaN(fy) || float.IsNaN(fz)) continue;
                                         if (float.IsInfinity(fx) || float.IsInfinity(fy) || float.IsInfinity(fz)) continue;
                                         if (Math.Abs(fx) > 1_000_000f || Math.Abs(fy) > 1_000_000f || Math.Abs(fz) > 1_000_000f) continue;
-                                        if (Math.Abs(fx) < 0.5f && Math.Abs(fy) < 0.5f) continue;
+                                        // Both X and Y must have significant magnitude
+                                        if ((Math.Abs(fx) + Math.Abs(fy)) < 10f) continue;
 
                                         long absAddr = scanStart + i;
                                         float prevMotion = 0f;
@@ -461,26 +479,20 @@ namespace Xajh
 
                 if (zxxyDirectCandidates.Count == 0) return false;
 
-                // Score each candidate: motion is king, proximity to NPC cloud center is
-                // the tiebreaker, proximity to cached position helps too.
+                // Only consider candidates with confirmed motion (motion > 0).
+                // Without motion we cannot distinguish real position from random data.
                 float bestScore = float.MinValue;
                 long bestAddr = 0;
                 float bestX = 0f, bestY = 0f, bestZ = 0f;
                 foreach (var c in zxxyDirectCandidates)
                 {
+                    if (c.motion < 0.1f) continue;
                     float score = c.motion * 3f;
                     if (hasLastNpcCloudCenter)
                     {
                         double d = Math.Sqrt(Math.Pow(c.lastX - lastNpcCloudCenterX, 2) + Math.Pow(c.lastY - lastNpcCloudCenterY, 2));
                         if (d <= 5000.0) score += 2f;
                         else if (d > 20000.0) score -= 3f;
-                    }
-                    if (hasDirectCache)
-                    {
-                        double d = Math.Sqrt(Math.Pow(c.lastX - directCx, 2) + Math.Pow(c.lastY - directCy, 2));
-                        if (d <= 50f) score += 3f;
-                        else if (d <= 500f) score += 1f;
-                        else if (d > 5000f) score -= 2f;
                     }
                     if (score > bestScore)
                     {
@@ -490,20 +502,19 @@ namespace Xajh
                     }
                 }
 
-                if (bestAddr == 0) return false;
-
-                // Only lock if we have meaningful motion or NPC cloud confirms proximity.
-                bool worthLocking = bestScore > 1f;
-                if (worthLocking)
+                if (bestAddr == 0)
                 {
-                    zxxyDirectLockedAddr = bestAddr;
-                    zxxyDirectLockedLastX = bestX;
-                    zxxyDirectLockedLastY = bestY;
+                    source = $"zxxy-direct:no-motion(cand={zxxyDirectCandidates.Count})";
+                    return false;
                 }
 
+                zxxyDirectLockedAddr = bestAddr;
+                zxxyDirectLockedLastX = bestX;
+                zxxyDirectLockedLastY = bestY;
+                zxxyDirectStaleReads = 0;
+
                 x = bestX; y = bestY; z = bestZ;
-                directCx = x; directCy = y; directCz = z; hasDirectCache = true;
-                source = $"zxxy-direct(addr=0x{bestAddr:X8},score={bestScore:F1},cand={zxxyDirectCandidates.Count},lock={worthLocking})";
+                source = $"zxxy-direct(addr=0x{bestAddr:X8},score={bestScore:F1},cand={zxxyDirectCandidates.Count})";
                 return true;
             }
 
