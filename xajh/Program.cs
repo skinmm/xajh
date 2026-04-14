@@ -1456,27 +1456,19 @@ namespace Xajh
                 UpdateNpcCloudCenter();
 
                 // --- Phase 1: zxxy.dll direct float scan (authoritative, like xajhtoy.exe) ---
-                // zxxy.dll stores world coordinates as direct floats in its data section.
-                // This is how xajhtoy.exe reads position and it works on all maps.
-                if (TryReadPlayerPosViaZxxyDirect(out float zdx, out float zdy, out float zdz, out string zdsrc))
+                if (TryReadPlayerPosViaZxxyDirect(out float zdx, out float zdy, out float zdz, out string zdsrc) &&
+                    IsPlausibleWorldPos(zdx, zdy))
                 {
-                    if (!IsDirectFallbackLikelyWrong(zdx, zdy))
-                    {
-                        lastDirectSource = zdsrc;
-                        simpleStaticReads = 0;
-                        return (zdx, zdy, zdz);
-                    }
+                    lastDirectSource = zdsrc;
+                    return (zdx, zdy, zdz);
                 }
 
                 // --- Phase 2: zxxy.dll pointer chain scan (existing approach) ---
-                if (TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc))
+                if (TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc) &&
+                    IsPlausibleWorldPos(zx, zy))
                 {
-                    if (!IsDirectFallbackLikelyWrong(zx, zy))
-                    {
-                        lastDirectSource = zxsrc;
-                        simpleStaticReads = 0;
-                        return (zx, zy, zz);
-                    }
+                    lastDirectSource = zxsrc;
+                    return (zx, zy, zz);
                 }
 
                 // --- Phase 3: main module chain (PlayerReader) ---
