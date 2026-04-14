@@ -1139,6 +1139,19 @@ namespace Xajh
             (float x, float y, float z) ReadPlayerPos()
             {
                 UpdateNpcCloudCenter();
+
+                // zxxy.dll is the authoritative position source (same as xajhtoy.exe).
+                // Try it first — it works correctly on all maps, unlike the main-module
+                // pointer chains which return map-static anchors on some maps.
+                if (TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc))
+                {
+                    if (!IsDirectFallbackLikelyWrong(zx, zy))
+                    {
+                        lastDirectSource = zxsrc;
+                        return (zx, zy, zz);
+                    }
+                }
+
                 var p = playerReader.Get();
                 var dbg = playerReader.GetDebugSnapshot();
                 bool simpleStatic =
@@ -1154,13 +1167,6 @@ namespace Xajh
                     hasDirectCache = true;
                     lastDirectSource = "";
                     return p;
-                }
-
-                if (IsUnresolvedSource(dbg.Source) &&
-                    TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc))
-                {
-                    lastDirectSource = zxsrc;
-                    return (zx, zy, zz);
                 }
 
                 if (IsUnresolvedSource(dbg.Source) &&
@@ -1180,7 +1186,6 @@ namespace Xajh
                             return (dx, dy, dz);
                         }
                     }
-                    // Detect static fallback and escalate to global XY lock.
                     if (hasDirectCache)
                     {
                         double dd = Math.Sqrt(Math.Pow(dx - directCx, 2) + Math.Pow(dy - directCy, 2));
@@ -1199,25 +1204,16 @@ namespace Xajh
 
                     if (fallbackStaticReads >= 2 && TryReadGlobalXYLocked(out float gx, out float gy))
                     {
-                        // Keep Z from fallback candidate; override XY with locked global world coords.
                         directCx = gx; directCy = gy; directCz = dz; hasDirectCache = true;
                         lastDirectSource = $"{lastDirectSource},glob=use";
                         return (gx, gy, dz);
                     }
 
-                    // Final fallback: known global mirror static from module base.
                     if (fallbackStaticReads >= 2 && TryReadGlobalXYModule(out float mx, out float my))
                     {
                         directCx = mx; directCy = my; directCz = dz; hasDirectCache = true;
                         lastDirectSource = $"{lastDirectSource},glob=module";
                         return (mx, my, dz);
-                    }
-
-                    if (fallbackStaticReads >= 1 &&
-                        TryReadPlayerPosViaZxxy(out float zfx, out float zfy, out float zfz, out string zfsrc))
-                    {
-                        lastDirectSource = $"{lastDirectSource},{zfsrc}";
-                        return (zfx, zfy, zfz);
                     }
 
                     if (fallbackStaticReads >= 1 &&
@@ -1228,15 +1224,6 @@ namespace Xajh
                     }
 
                     return (dx, dy, dz);
-                }
-
-                // If simple source exists but appears numerically frozen, still route
-                // through direct fallback path to escape static map-anchor coordinates.
-                if (simpleStatic &&
-                    TryReadPlayerPosViaZxxy(out float ssx, out float ssy, out float ssz, out string sssrc))
-                {
-                    lastDirectSource = $"simple-static,{sssrc}";
-                    return (ssx, ssy, ssz);
                 }
 
                 if (simpleStatic &&
