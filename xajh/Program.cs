@@ -1822,6 +1822,33 @@ namespace Xajh
                                     Console.WriteLine($"    0x{c.addr:X8} ({c.lastX:F1},{c.lastY:F1},{c.lastZ:F1}) motion={c.motion:F2}");
                             }
 
+                            // Dump zxxy pointer chain entity if available
+                            if (zxxyModuleBase != IntPtr.Zero && zxxyMgrCandidates.Count > 0)
+                            {
+                                Console.WriteLine($"\n── zxxy chain entity dump ──");
+                                int shown = 0;
+                                foreach (var c in zxxyMgrCandidates)
+                                {
+                                    if (shown >= 3) break;
+                                    int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(zxxyModuleBase, c.mgrOff));
+                                    if (mgr < 0x00100000) continue;
+                                    int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, c.listOff));
+                                    if (list < 0x00100000) continue;
+                                    int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, c.objOff));
+                                    if (raw < 0x00100000) continue;
+                                    var objPtr = Ptr32(raw);
+                                    Console.WriteLine($"  chain mgr=0x{c.mgrOff:X} obj=0x{raw:X8}:");
+                                    for (int off = 0; off <= 0x120; off += 4)
+                                    {
+                                        float fv = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(objPtr, off));
+                                        if (float.IsNaN(fv) || float.IsInfinity(fv)) continue;
+                                        if (Math.Abs(fv) > 100f && Math.Abs(fv) < 100000f)
+                                            Console.WriteLine($"    +0x{off:X3} = {fv,12:F1}");
+                                    }
+                                    shown++;
+                                }
+                            }
+
                             // NPC list
                             var allNpcs = GetTrackedNpcs();
                             Console.WriteLine($"\n── All NPCs from NpcReader ({allNpcs.Count} total) ──");
