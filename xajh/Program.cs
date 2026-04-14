@@ -344,10 +344,7 @@ namespace Xajh
                 preferredZxxyListOffset = bestListOff;
                 preferredZxxyObjOffset = bestObjOff;
                 preferredZxxyPosOffset = bestPosOff;
-                directCx = x;
-                directCy = y;
-                directCz = z;
-                hasDirectCache = true;
+                // Do NOT update directCache here — let ReadPlayerPos() validate first.
                 source = $"zxxy(base=0x{zxxyModuleBase.ToInt64():X8},mgr=0x{bestMgrOff:X},list=0x{bestListOff:X2},obj=0x{bestObjOff:X2},pos=0x{bestPosOff:X2},cand={valid})";
                 return true;
             }
@@ -1609,6 +1606,7 @@ namespace Xajh
                 if (TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc) &&
                     IsNearKnownPosition(zx, zy))
                 {
+                    directCx = zx; directCy = zy; directCz = zz; hasDirectCache = true;
                     lastDirectSource = zxsrc;
                     return (zx, zy, zz);
                 }
