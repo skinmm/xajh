@@ -68,6 +68,7 @@ namespace Xajh
             IntPtr moduleBase = IntPtr.Zero;
             IntPtr hProcess = IntPtr.Zero;
             int simpleStaticReads = 0;
+            float simpleLastX = float.NaN, simpleLastY = float.NaN;
             IntPtr zxxyModuleBase = IntPtr.Zero;
             int zxxyModuleSize = 0;
             long nextZxxyModuleRefreshTicks = 0;
@@ -77,6 +78,16 @@ namespace Xajh
             int preferredZxxyObjOffset = 0x4C;
             int preferredZxxyPosOffset = 0x94;
             var zxxyMgrCandidates = new List<(int mgrOff, int listOff, int objOff, int posOff)>();
+
+            // zxxy.dll direct float scan state: scan the DLL's data for raw XYZ triplets
+            // that look like world coordinates, tracking which ones move over time.
+            long nextZxxyDirectScanTicks = 0;
+            var zxxyDirectCandidates = new List<(long addr, float lastX, float lastY, float lastZ, float motion)>();
+            long zxxyDirectLockedAddr = 0;
+            float zxxyDirectLockedLastX = float.NaN, zxxyDirectLockedLastY = float.NaN;
+
+            double lastNpcCloudCenterX = 0d, lastNpcCloudCenterY = 0d;
+            bool hasLastNpcCloudCenter = false;
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
@@ -338,6 +349,161 @@ namespace Xajh
                 directCz = z;
                 hasDirectCache = true;
                 source = $"zxxy(base=0x{zxxyModuleBase.ToInt64():X8},mgr=0x{bestMgrOff:X},list=0x{bestListOff:X2},obj=0x{bestObjOff:X2},pos=0x{bestPosOff:X2},cand={valid})";
+                return true;
+            }
+
+            bool TryReadPlayerPosViaZxxyDirect(out float x, out float y, out float z, out string source)
+            {
+                x = 0f; y = 0f; z = 0f;
+                source = "zxxy-direct:none";
+                if (!TryRefreshZxxyModule()) return false;
+
+                // If we have a locked address, read directly from it.
+                if (zxxyDirectLockedAddr != 0)
+                {
+                    var addr = new IntPtr(zxxyDirectLockedAddr);
+                    float rx = MemoryHelper.ReadFloat(hProcess, addr);
+                    float ry = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
+                    float rz = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 8));
+                    if (!float.IsNaN(rx) && !float.IsNaN(ry) && !float.IsNaN(rz) &&
+                        !float.IsInfinity(rx) && !float.IsInfinity(ry) && !float.IsInfinity(rz) &&
+                        Math.Abs(rx) < 1_000_000f && Math.Abs(ry) < 1_000_000f && Math.Abs(rz) < 1_000_000f &&
+                        (Math.Abs(rx) > 0.001f || Math.Abs(ry) > 0.001f))
+                    {
+                        // Confirm it's still moving (not a stale lock) by checking
+                        // for change since last read over consecutive calls.
+                        bool moved = !float.IsNaN(zxxyDirectLockedLastX) &&
+                            (Math.Abs(rx - zxxyDirectLockedLastX) > 0.01f || Math.Abs(ry - zxxyDirectLockedLastY) > 0.01f);
+                        zxxyDirectLockedLastX = rx;
+                        zxxyDirectLockedLastY = ry;
+
+                        x = rx; y = ry; z = rz;
+                        directCx = x; directCy = y; directCz = z; hasDirectCache = true;
+                        source = $"zxxy-direct(addr=0x{zxxyDirectLockedAddr:X8},moved={moved})";
+                        return true;
+                    }
+                    zxxyDirectLockedAddr = 0;
+                }
+
+                long now = Environment.TickCount64;
+                if (now < nextZxxyDirectScanTicks && zxxyDirectCandidates.Count == 0)
+                    return false;
+
+                // Full re-scan of zxxy.dll data for coordinate triplets.
+                if (zxxyDirectCandidates.Count == 0 || now >= nextZxxyDirectScanTicks)
+                {
+                    nextZxxyDirectScanTicks = now + 3000;
+                    var newCandidates = new List<(long addr, float lastX, float lastY, float lastZ, float motion)>();
+                    long modBase = zxxyModuleBase.ToInt64();
+                    long modEnd = modBase + zxxyModuleSize;
+                    IntPtr cursor = zxxyModuleBase;
+
+                    while (cursor.ToInt64() < modEnd)
+                    {
+                        if (!MemoryHelper.VirtualQueryEx(
+                            hProcess, cursor, out var mbi,
+                            (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryHelper.MEMORY_BASIC_INFORMATION>()))
+                            break;
+
+                        long regionBase = mbi.BaseAddress.ToInt64();
+                        long regionSize = mbi.RegionSize.ToInt64();
+                        long regionEnd = regionBase + regionSize;
+                        bool intersects = regionEnd > modBase && regionBase < modEnd;
+                        bool readable = mbi.State == MemoryHelper.MEM_COMMIT &&
+                            (mbi.Protect == MemoryHelper.PAGE_READWRITE ||
+                             mbi.Protect == MemoryHelper.PAGE_WRITECOPY ||
+                             mbi.Protect == MemoryHelper.PAGE_EXECUTE_READWRITE ||
+                             mbi.Protect == MemoryHelper.PAGE_EXECUTE_WRITECOPY);
+
+                        if (intersects && readable)
+                        {
+                            long scanStart = Math.Max(regionBase, modBase);
+                            long scanEnd = Math.Min(regionEnd, modEnd);
+                            int scanSize = (int)(scanEnd - scanStart);
+                            if (scanSize >= 12)
+                            {
+                                var buf = new byte[scanSize];
+                                if (MemoryHelper.ReadProcessMemory(hProcess, new IntPtr(scanStart), buf, scanSize, out int read) && read >= 12)
+                                {
+                                    for (int i = 0; i + 12 <= read; i += 4)
+                                    {
+                                        float fx = BitConverter.ToSingle(buf, i);
+                                        float fy = BitConverter.ToSingle(buf, i + 4);
+                                        float fz = BitConverter.ToSingle(buf, i + 8);
+                                        if (float.IsNaN(fx) || float.IsNaN(fy) || float.IsNaN(fz)) continue;
+                                        if (float.IsInfinity(fx) || float.IsInfinity(fy) || float.IsInfinity(fz)) continue;
+                                        if (Math.Abs(fx) > 1_000_000f || Math.Abs(fy) > 1_000_000f || Math.Abs(fz) > 1_000_000f) continue;
+                                        if (Math.Abs(fx) < 0.5f && Math.Abs(fy) < 0.5f) continue;
+
+                                        long absAddr = scanStart + i;
+                                        float prevMotion = 0f;
+                                        foreach (var old in zxxyDirectCandidates)
+                                        {
+                                            if (old.addr == absAddr)
+                                            {
+                                                double d = Math.Sqrt(Math.Pow(fx - old.lastX, 2) + Math.Pow(fy - old.lastY, 2));
+                                                float impulse = d > 0.05 ? (float)Math.Min(d, 50.0) : 0f;
+                                                prevMotion = old.motion * 0.7f + impulse;
+                                                break;
+                                            }
+                                        }
+                                        newCandidates.Add((absAddr, fx, fy, fz, prevMotion));
+                                    }
+                                }
+                            }
+                        }
+                        long next = regionBase + regionSize;
+                        if (next <= cursor.ToInt64() || next >= long.MaxValue) break;
+                        cursor = new IntPtr(next);
+                    }
+                    zxxyDirectCandidates = newCandidates;
+                }
+
+                if (zxxyDirectCandidates.Count == 0) return false;
+
+                // Score each candidate: motion is king, proximity to NPC cloud center is
+                // the tiebreaker, proximity to cached position helps too.
+                float bestScore = float.MinValue;
+                long bestAddr = 0;
+                float bestX = 0f, bestY = 0f, bestZ = 0f;
+                foreach (var c in zxxyDirectCandidates)
+                {
+                    float score = c.motion * 3f;
+                    if (hasLastNpcCloudCenter)
+                    {
+                        double d = Math.Sqrt(Math.Pow(c.lastX - lastNpcCloudCenterX, 2) + Math.Pow(c.lastY - lastNpcCloudCenterY, 2));
+                        if (d <= 5000.0) score += 2f;
+                        else if (d > 20000.0) score -= 3f;
+                    }
+                    if (hasDirectCache)
+                    {
+                        double d = Math.Sqrt(Math.Pow(c.lastX - directCx, 2) + Math.Pow(c.lastY - directCy, 2));
+                        if (d <= 50f) score += 3f;
+                        else if (d <= 500f) score += 1f;
+                        else if (d > 5000f) score -= 2f;
+                    }
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestAddr = c.addr;
+                        bestX = c.lastX; bestY = c.lastY; bestZ = c.lastZ;
+                    }
+                }
+
+                if (bestAddr == 0) return false;
+
+                // Only lock if we have meaningful motion or NPC cloud confirms proximity.
+                bool worthLocking = bestScore > 1f;
+                if (worthLocking)
+                {
+                    zxxyDirectLockedAddr = bestAddr;
+                    zxxyDirectLockedLastX = bestX;
+                    zxxyDirectLockedLastY = bestY;
+                }
+
+                x = bestX; y = bestY; z = bestZ;
+                directCx = x; directCy = y; directCz = z; hasDirectCache = true;
+                source = $"zxxy-direct(addr=0x{bestAddr:X8},score={bestScore:F1},cand={zxxyDirectCandidates.Count},lock={worthLocking})";
                 return true;
             }
 
@@ -1037,6 +1203,10 @@ namespace Xajh
                         combat = new CombatOverlay(hProcess, moduleBase);
                         turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
                         TryRefreshZxxyModule(force: true);
+                        zxxyDirectCandidates.Clear();
+                        zxxyDirectLockedAddr = 0;
+                        simpleStaticReads = 0;
+                        simpleLastX = float.NaN; simpleLastY = float.NaN;
 
                         Console.WriteLine($"[REATTACH] {reason} -> PID={game.Id} Base=0x{moduleBase.ToInt64():X8} (refresh)");
                         return true;
@@ -1053,6 +1223,10 @@ namespace Xajh
                     combat = new CombatOverlay(hProcess, moduleBase);
                     turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
                     TryRefreshZxxyModule(force: true);
+                    zxxyDirectCandidates.Clear();
+                    zxxyDirectLockedAddr = 0;
+                    simpleStaticReads = 0;
+                    simpleLastX = float.NaN; simpleLastY = float.NaN;
 
                     Console.WriteLine($"[REATTACH] {reason} -> PID={game.Id} Base=0x{moduleBase.ToInt64():X8}");
                     return true;
@@ -1092,8 +1266,6 @@ namespace Xajh
             float aimRadius = 300f;
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
             string lastDirectSource = "";
-            double lastNpcCloudCenterX = 0d, lastNpcCloudCenterY = 0d;
-            bool hasLastNpcCloudCenter = false;
 
             void UpdateNpcCloudCenter()
             {
@@ -1140,26 +1312,54 @@ namespace Xajh
             {
                 UpdateNpcCloudCenter();
 
-                // zxxy.dll is the authoritative position source (same as xajhtoy.exe).
-                // Try it first — it works correctly on all maps, unlike the main-module
-                // pointer chains which return map-static anchors on some maps.
+                // --- Phase 1: zxxy.dll direct float scan (authoritative, like xajhtoy.exe) ---
+                // zxxy.dll stores world coordinates as direct floats in its data section.
+                // This is how xajhtoy.exe reads position and it works on all maps.
+                if (TryReadPlayerPosViaZxxyDirect(out float zdx, out float zdy, out float zdz, out string zdsrc))
+                {
+                    if (!IsDirectFallbackLikelyWrong(zdx, zdy))
+                    {
+                        lastDirectSource = zdsrc;
+                        simpleStaticReads = 0;
+                        return (zdx, zdy, zdz);
+                    }
+                }
+
+                // --- Phase 2: zxxy.dll pointer chain scan (existing approach) ---
                 if (TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc))
                 {
                     if (!IsDirectFallbackLikelyWrong(zx, zy))
                     {
                         lastDirectSource = zxsrc;
+                        simpleStaticReads = 0;
                         return (zx, zy, zz);
                     }
                 }
 
+                // --- Phase 3: main module chain (PlayerReader) ---
                 var p = playerReader.Get();
                 var dbg = playerReader.GetDebugSnapshot();
-                bool simpleStatic =
-                    dbg.Source == "simple" &&
-                    hasDirectCache &&
-                    Math.Sqrt(Math.Pow(p.x - directCx, 2) + Math.Pow(p.y - directCy, 2)) < 0.01;
 
-                if (!IsUnresolvedSource(dbg.Source) && !simpleStatic)
+                // Detect frozen simple chain: same coords as last read.
+                bool simpleResolved = !IsUnresolvedSource(dbg.Source);
+                if (simpleResolved)
+                {
+                    bool unchanged = !float.IsNaN(simpleLastX) &&
+                        Math.Abs(p.x - simpleLastX) < 0.01f &&
+                        Math.Abs(p.y - simpleLastY) < 0.01f;
+                    if (unchanged) simpleStaticReads++;
+                    else simpleStaticReads = 0;
+                    simpleLastX = p.x; simpleLastY = p.y;
+                }
+
+                bool simpleStatic =
+                    (dbg.Source == "simple" && hasDirectCache &&
+                     Math.Sqrt(Math.Pow(p.x - directCx, 2) + Math.Pow(p.y - directCy, 2)) < 0.01) ||
+                    simpleStaticReads >= 3;
+
+                // If simple chain is resolved, not static, and not implausibly far
+                // from NPC cloud, trust it.
+                if (simpleResolved && !simpleStatic && !IsDirectFallbackLikelyWrong(p.x, p.y))
                 {
                     directCx = p.x;
                     directCy = p.y;
@@ -1169,7 +1369,8 @@ namespace Xajh
                     return p;
                 }
 
-                if (IsUnresolvedSource(dbg.Source) &&
+                // --- Phase 4: direct fallback paths ---
+                if ((IsUnresolvedSource(dbg.Source) || simpleStatic) &&
                     TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc))
                 {
                     if (IsDirectFallbackLikelyWrong(dx, dy))
@@ -1461,9 +1662,13 @@ namespace Xajh
                             Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
                             Console.WriteLine(
                                 $"  [DBG] src={dbg.Source} mgr=0x{dbg.MgrOffset:X} off=0x{dbg.ObjOffset:X2} pos=0x{dbg.PosOffset:X2} obj=0x{dbg.PlayerObj.ToInt64():X8} " +
-                                $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1})");
+                                $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1}) simpleStatic={simpleStaticReads}");
                             if (!string.IsNullOrEmpty(lastDirectSource))
                                 Console.WriteLine($"  [DBG] fallback={lastDirectSource}");
+                            if (zxxyDirectLockedAddr != 0)
+                                Console.WriteLine($"  [DBG] zxxy-direct locked=0x{zxxyDirectLockedAddr:X8} cand={zxxyDirectCandidates.Count}");
+                            else if (zxxyDirectCandidates.Count > 0)
+                                Console.WriteLine($"  [DBG] zxxy-direct cand={zxxyDirectCandidates.Count} (no lock yet)");
 
                             // NPC list
                             var allNpcs = GetTrackedNpcs();
