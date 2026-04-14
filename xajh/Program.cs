@@ -1404,21 +1404,27 @@ namespace Xajh
                 var dbg = playerReader.GetDebugSnapshot();
 
                 // Detect frozen simple chain: same coords as last read.
+                // simpleStaticReads only resets when the simple chain values actually CHANGE.
                 bool simpleResolved = !IsUnresolvedSource(dbg.Source);
                 if (simpleResolved)
                 {
                     bool unchanged = !float.IsNaN(simpleLastX) &&
                         Math.Abs(p.x - simpleLastX) < 0.01f &&
                         Math.Abs(p.y - simpleLastY) < 0.01f;
-                    if (unchanged) simpleStaticReads++;
-                    else simpleStaticReads = 0;
-                    simpleLastX = p.x; simpleLastY = p.y;
+                    if (unchanged)
+                        simpleStaticReads++;
+                    else
+                    {
+                        simpleStaticReads = 0;
+                        simpleLastX = p.x; simpleLastY = p.y;
+                    }
+                    if (float.IsNaN(simpleLastX))
+                    {
+                        simpleLastX = p.x; simpleLastY = p.y;
+                    }
                 }
 
-                bool simpleStatic =
-                    (dbg.Source == "simple" && hasDirectCache &&
-                     Math.Sqrt(Math.Pow(p.x - directCx, 2) + Math.Pow(p.y - directCy, 2)) < 0.01) ||
-                    simpleStaticReads >= 3;
+                bool simpleStatic = simpleStaticReads >= 2;
 
                 // If simple chain is resolved, not static, and not implausibly far
                 // from NPC cloud, trust it.
@@ -1435,12 +1441,14 @@ namespace Xajh
                 // --- Phase 4: direct fallback with known-wrong coordinate rejection ---
                 // When simpleStatic, we know the exact wrong coordinates. Reject any
                 // candidate that matches them so we can find the REAL moving position.
+                // The result must have significant magnitude to avoid near-zero garbage.
                 if (simpleStatic &&
                     TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc))
                 {
-                    if (!IsDirectFallbackLikelyWrong(rdx, rdy))
+                    bool plausible = (Math.Abs(rdx) + Math.Abs(rdy)) > 10f &&
+                                     !IsDirectFallbackLikelyWrong(rdx, rdy);
+                    if (plausible)
                     {
-                        directCx = rdx; directCy = rdy; directCz = rdz; hasDirectCache = true;
                         lastDirectSource = $"reject-static({p.x:F0},{p.y:F0})->{rdsrc}";
                         return (rdx, rdy, rdz);
                     }
@@ -1503,7 +1511,10 @@ namespace Xajh
                         return (dx, dy, dz);
                     }
                 }
-                lastDirectSource = "";
+
+                // All fallbacks exhausted or returned static/garbage — return simple
+                // chain value. It's wrong but at least stable.
+                lastDirectSource = simpleStatic ? "simple-static(no-alt-found)" : "";
                 return p;
             }
 
