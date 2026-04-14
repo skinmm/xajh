@@ -57,7 +57,7 @@ namespace xajh
         const int DefaultPosOffset = 0x94;
         readonly int[] _candidateMgrOffsets =
         {
-            0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D451C, 0x9D4524, 0x9D450C
+            0x9D4520, 0x9D4518, 0x9D4514, 0x9D4510, 0x9D451C, 0x9D4524, 0x9D450C
         };
         readonly int[] _candidateListOffsets =
         {
