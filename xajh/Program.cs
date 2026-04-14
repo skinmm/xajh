@@ -67,12 +67,277 @@ namespace Xajh
             Process game = null;
             IntPtr moduleBase = IntPtr.Zero;
             IntPtr hProcess = IntPtr.Zero;
+            IntPtr zxxyModuleBase = IntPtr.Zero;
+            int zxxyModuleSize = 0;
+            long nextZxxyModuleRefreshTicks = 0;
+            long nextZxxyRescanTicks = 0;
+            int preferredZxxyMgrOffset = -1;
+            int preferredZxxyListOffset = 0x08;
+            int preferredZxxyObjOffset = 0x4C;
+            int preferredZxxyPosOffset = 0x94;
+            var zxxyMgrCandidates = new List<(int mgrOff, int listOff, int objOff, int posOff)>();
 
             (bool hasPlayerMgr, bool hasNpcMgr) ProbeStatics(IntPtr hProcess, IntPtr moduleBase)
             {
                 int playerMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
                 int npcMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D451C));
                 return (playerMgr != 0, npcMgr != 0);
+            }
+
+            bool TryGetGameModule(string moduleName, out IntPtr baseAddr, out int moduleSize)
+            {
+                baseAddr = IntPtr.Zero;
+                moduleSize = 0;
+                if (game == null) return false;
+                try
+                {
+                    game.Refresh();
+                    foreach (ProcessModule mod in game.Modules)
+                    {
+                        if (!string.Equals(mod.ModuleName, moduleName, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        baseAddr = mod.BaseAddress;
+                        moduleSize = mod.ModuleMemorySize;
+                        return baseAddr != IntPtr.Zero && moduleSize > 0;
+                    }
+                }
+                catch
+                {
+                }
+                return false;
+            }
+
+            bool TryRefreshZxxyModule(bool force = false)
+            {
+                long now = Environment.TickCount64;
+                if (!force &&
+                    now < nextZxxyModuleRefreshTicks &&
+                    zxxyModuleBase != IntPtr.Zero &&
+                    zxxyModuleSize > 0)
+                    return true;
+
+                nextZxxyModuleRefreshTicks = now + 2000;
+                if (TryGetGameModule("zxxy.dll", out IntPtr mb, out int ms))
+                {
+                    bool changed = mb != zxxyModuleBase || ms != zxxyModuleSize;
+                    zxxyModuleBase = mb;
+                    zxxyModuleSize = ms;
+                    if (changed)
+                    {
+                        zxxyMgrCandidates.Clear();
+                        preferredZxxyMgrOffset = -1;
+                    }
+                    return true;
+                }
+
+                zxxyModuleBase = IntPtr.Zero;
+                zxxyModuleSize = 0;
+                zxxyMgrCandidates.Clear();
+                preferredZxxyMgrOffset = -1;
+                return false;
+            }
+
+            bool TryProbeManagerChain(
+                int mgr,
+                out int listOff,
+                out int objOff,
+                out int posOff,
+                out float x,
+                out float y,
+                out float z)
+            {
+                listOff = 0;
+                objOff = 0;
+                posOff = 0;
+                x = 0f;
+                y = 0f;
+                z = 0f;
+
+                if (mgr < 0x00100000) return false;
+                foreach (int lo in directListOffsets)
+                {
+                    int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lo));
+                    if (list < 0x00100000) continue;
+
+                    foreach (int oo in directObjOffsets)
+                    {
+                        int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, oo));
+                        if (raw < 0x00100000) continue;
+
+                        foreach (int po in directPosOffsets)
+                        {
+                            if (!TryReadStablePos(hProcess, Ptr32(raw), po, out x, out y, out z))
+                                continue;
+                            listOff = lo;
+                            objOff = oo;
+                            posOff = po;
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+
+            void RescanZxxyManagerCandidates()
+            {
+                zxxyMgrCandidates.Clear();
+                if (zxxyModuleBase == IntPtr.Zero || zxxyModuleSize <= 0)
+                    return;
+
+                var seenMgrOffset = new HashSet<int>();
+                var scored = new List<(float score, int mgrOff, int listOff, int objOff, int posOff)>();
+                long modBase = zxxyModuleBase.ToInt64();
+                long modEnd = modBase + zxxyModuleSize;
+                IntPtr cursor = zxxyModuleBase;
+
+                while (cursor.ToInt64() < modEnd)
+                {
+                    if (!MemoryHelper.VirtualQueryEx(
+                        hProcess,
+                        cursor,
+                        out var mbi,
+                        (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryHelper.MEMORY_BASIC_INFORMATION>()))
+                        break;
+
+                    long regionBase = mbi.BaseAddress.ToInt64();
+                    long regionSize = mbi.RegionSize.ToInt64();
+                    long regionEnd = regionBase + regionSize;
+                    bool intersects = regionEnd > modBase && regionBase < modEnd;
+                    bool writable = mbi.State == MemoryHelper.MEM_COMMIT &&
+                        (mbi.Protect == MemoryHelper.PAGE_READWRITE ||
+                         mbi.Protect == MemoryHelper.PAGE_WRITECOPY ||
+                         mbi.Protect == MemoryHelper.PAGE_EXECUTE_READWRITE ||
+                         mbi.Protect == MemoryHelper.PAGE_EXECUTE_WRITECOPY);
+
+                    if (intersects && writable)
+                    {
+                        long scanStart = Math.Max(regionBase, modBase);
+                        long scanEnd = Math.Min(regionEnd, modEnd);
+                        int scanSize = (int)(scanEnd - scanStart);
+                        if (scanSize >= 4)
+                        {
+                            var buf = new byte[scanSize];
+                            if (MemoryHelper.ReadProcessMemory(hProcess, new IntPtr(scanStart), buf, scanSize, out int read) && read >= 4)
+                            {
+                                for (int i = 0; i + 4 <= read; i += 4)
+                                {
+                                    int mgr = BitConverter.ToInt32(buf, i);
+                                    if (mgr < 0x00100000 || mgr > 0x7FFFFFFF) continue;
+                                    int mgrOff = (int)(scanStart - modBase + i);
+                                    if (!seenMgrOffset.Add(mgrOff)) continue;
+                                    if (!TryProbeManagerChain(mgr, out int lo, out int oo, out int po, out float x, out float y, out _))
+                                        continue;
+
+                                    float score = 0f;
+                                    if (mgrOff == preferredZxxyMgrOffset) score += 3f;
+                                    if (lo == preferredZxxyListOffset) score += 1.5f;
+                                    if (oo == preferredZxxyObjOffset) score += 1.5f;
+                                    if (po == preferredZxxyPosOffset) score += 2f;
+                                    if (hasDirectCache)
+                                    {
+                                        double d = Math.Sqrt(Math.Pow(x - directCx, 2) + Math.Pow(y - directCy, 2));
+                                        if (d <= 40f) score += 4f;
+                                        else if (d <= 400f) score += 2f;
+                                        else if (d > 4000f) score -= 3f;
+                                    }
+                                    scored.Add((score, mgrOff, lo, oo, po));
+                                }
+                            }
+                        }
+                    }
+
+                    long next = regionBase + regionSize;
+                    if (next <= cursor.ToInt64() || next >= long.MaxValue) break;
+                    cursor = new IntPtr(next);
+                }
+
+                scored.Sort((a, b) => b.score.CompareTo(a.score));
+                int keep = Math.Min(24, scored.Count);
+                for (int i = 0; i < keep; i++)
+                {
+                    var c = scored[i];
+                    zxxyMgrCandidates.Add((c.mgrOff, c.listOff, c.objOff, c.posOff));
+                }
+
+                if (zxxyMgrCandidates.Count > 0)
+                {
+                    preferredZxxyMgrOffset = zxxyMgrCandidates[0].mgrOff;
+                    preferredZxxyListOffset = zxxyMgrCandidates[0].listOff;
+                    preferredZxxyObjOffset = zxxyMgrCandidates[0].objOff;
+                    preferredZxxyPosOffset = zxxyMgrCandidates[0].posOff;
+                }
+            }
+
+            bool TryReadPlayerPosViaZxxy(out float x, out float y, out float z, out string source)
+            {
+                x = 0f;
+                y = 0f;
+                z = 0f;
+                source = "zxxy:none";
+
+                if (!TryRefreshZxxyModule()) return false;
+                long now = Environment.TickCount64;
+                if (zxxyMgrCandidates.Count == 0 || now >= nextZxxyRescanTicks)
+                {
+                    nextZxxyRescanTicks = now + 2000;
+                    RescanZxxyManagerCandidates();
+                }
+                if (zxxyMgrCandidates.Count == 0) return false;
+
+                float bestScore = float.MinValue;
+                int bestMgrOff = 0, bestListOff = 0, bestObjOff = 0, bestPosOff = 0;
+                int valid = 0;
+
+                foreach (var c in zxxyMgrCandidates)
+                {
+                    int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(zxxyModuleBase, c.mgrOff));
+                    if (mgr < 0x00100000 || mgr > 0x7FFFFFFF) continue;
+                    int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, c.listOff));
+                    if (list < 0x00100000 || list > 0x7FFFFFFF) continue;
+                    int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, c.objOff));
+                    if (raw < 0x00100000 || raw > 0x7FFFFFFF) continue;
+                    if (!TryReadStablePos(hProcess, Ptr32(raw), c.posOff, out float tx, out float ty, out float tz))
+                        continue;
+
+                    valid++;
+                    float score = 0f;
+                    if (c.mgrOff == preferredZxxyMgrOffset) score += 3f;
+                    if (c.listOff == preferredZxxyListOffset) score += 1.5f;
+                    if (c.objOff == preferredZxxyObjOffset) score += 1.5f;
+                    if (c.posOff == preferredZxxyPosOffset) score += 2f;
+                    if (hasDirectCache)
+                    {
+                        double d = Math.Sqrt(Math.Pow(tx - directCx, 2) + Math.Pow(ty - directCy, 2));
+                        if (d <= 25f) score += 4f;
+                        else if (d <= 400f) score += 2f;
+                        else if (d > 4000f) score -= 3f;
+                    }
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        x = tx;
+                        y = ty;
+                        z = tz;
+                        bestMgrOff = c.mgrOff;
+                        bestListOff = c.listOff;
+                        bestObjOff = c.objOff;
+                        bestPosOff = c.posOff;
+                    }
+                }
+
+                if (bestScore == float.MinValue) return false;
+
+                preferredZxxyMgrOffset = bestMgrOff;
+                preferredZxxyListOffset = bestListOff;
+                preferredZxxyObjOffset = bestObjOff;
+                preferredZxxyPosOffset = bestPosOff;
+                directCx = x;
+                directCy = y;
+                directCz = z;
+                hasDirectCache = true;
+                source = $"zxxy(base=0x{zxxyModuleBase.ToInt64():X8},mgr=0x{bestMgrOff:X},list=0x{bestListOff:X2},obj=0x{bestObjOff:X2},pos=0x{bestPosOff:X2},cand={valid})";
+                return true;
             }
 
             bool TryReadStablePos(IntPtr hProcess, IntPtr playerObj, int posOff, out float x, out float y, out float z)
@@ -822,6 +1087,13 @@ namespace Xajh
                 }
 
                 if (IsUnresolvedSource(dbg.Source) &&
+                    TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc))
+                {
+                    lastDirectSource = zxsrc;
+                    return (zx, zy, zz);
+                }
+
+                if (IsUnresolvedSource(dbg.Source) &&
                     TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc))
                 {
                     if (IsDirectFallbackLikelyWrong(dx, dy))
@@ -871,11 +1143,25 @@ namespace Xajh
                         return (mx, my, dz);
                     }
 
+                    if (fallbackStaticReads >= 1 &&
+                        TryReadPlayerPosViaZxxy(out float zfx, out float zfy, out float zfz, out string zfsrc))
+                    {
+                        lastDirectSource = $"{lastDirectSource},{zfsrc}";
+                        return (zfx, zfy, zfz);
+                    }
+
                     return (dx, dy, dz);
                 }
 
                 // If simple source exists but appears numerically frozen, still route
                 // through direct fallback path to escape static map-anchor coordinates.
+                if (simpleStatic &&
+                    TryReadPlayerPosViaZxxy(out float ssx, out float ssy, out float ssz, out string sssrc))
+                {
+                    lastDirectSource = $"simple-static,{sssrc}";
+                    return (ssx, ssy, ssz);
+                }
+
                 if (simpleStatic &&
                     TryReadPlayerDirect(out float sx, out float sy, out float sz, out string ssrc))
                 {
