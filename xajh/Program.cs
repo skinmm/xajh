@@ -370,7 +370,7 @@ namespace Xajh
                     if (!float.IsNaN(rx) && !float.IsNaN(ry) && !float.IsNaN(rz) &&
                         !float.IsInfinity(rx) && !float.IsInfinity(ry) && !float.IsInfinity(rz) &&
                         Math.Abs(rx) < 1_000_000f && Math.Abs(ry) < 1_000_000f && Math.Abs(rz) < 1_000_000f &&
-                        (Math.Abs(rx) + Math.Abs(ry)) > 10f)
+                        Math.Abs(rx) >= 1f && Math.Abs(ry) >= 1f)
                     {
                         bool moved = !float.IsNaN(zxxyDirectLockedLastX) &&
                             (Math.Abs(rx - zxxyDirectLockedLastX) > 0.01f || Math.Abs(ry - zxxyDirectLockedLastY) > 0.01f);
@@ -450,8 +450,7 @@ namespace Xajh
                                         if (float.IsNaN(fx) || float.IsNaN(fy) || float.IsNaN(fz)) continue;
                                         if (float.IsInfinity(fx) || float.IsInfinity(fy) || float.IsInfinity(fz)) continue;
                                         if (Math.Abs(fx) > 1_000_000f || Math.Abs(fy) > 1_000_000f || Math.Abs(fz) > 1_000_000f) continue;
-                                        // Both X and Y must have significant magnitude
-                                        if ((Math.Abs(fx) + Math.Abs(fy)) < 10f) continue;
+                                        if (Math.Abs(fx) < 1f || Math.Abs(fy) < 1f) continue;
 
                                         long absAddr = scanStart + i;
                                         float prevMotion = 0f;
@@ -1435,7 +1434,9 @@ namespace Xajh
             bool IsPlausibleWorldPos(float x, float y)
             {
                 if (float.IsNaN(x) || float.IsNaN(y)) return false;
-                if ((Math.Abs(x) + Math.Abs(y)) < 10f) return false;
+                // Both X and Y must individually have some magnitude —
+                // a real world position is never (4475, 0, 0) or (0, 200, 0).
+                if (Math.Abs(x) < 1f || Math.Abs(y) < 1f) return false;
                 if (IsDirectFallbackLikelyWrong(x, y)) return false;
                 return true;
             }
