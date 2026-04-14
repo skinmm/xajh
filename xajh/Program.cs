@@ -67,6 +67,7 @@ namespace Xajh
             Process game = null;
             IntPtr moduleBase = IntPtr.Zero;
             IntPtr hProcess = IntPtr.Zero;
+            int simpleStaticReads = 0;
             IntPtr zxxyModuleBase = IntPtr.Zero;
             int zxxyModuleSize = 0;
             long nextZxxyModuleRefreshTicks = 0;
@@ -472,7 +473,8 @@ namespace Xajh
 
             bool TryReadDirectPlayerPos(
                 IntPtr hProcess, IntPtr moduleBase,
-                out float x, out float y, out float z, out string source)
+                out float x, out float y, out float z, out string source,
+                bool avoidKnownStaticRoot = false)
             {
                 x = 0f; y = 0f; z = 0f; source = "direct:none";
 
@@ -492,8 +494,27 @@ namespace Xajh
                                 int targetRaw = raw;
                                 if (lk.link != -1)
                                 {
-                                    int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, lk.link));
-                                    targetRaw = (subRaw != 0 && subRaw != raw) ? subRaw : 0;
+                                    if ((lk.link & 0x10000) == 0)
+                                    {
+                                        int link1 = lk.link & 0xFF;
+                                        int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, link1));
+                                        targetRaw = (subRaw != 0 && subRaw != raw) ? subRaw : 0;
+                                    }
+                                    else
+                                    {
+                                        int link1 = (lk.link >> 8) & 0xFF;
+                                        int link2 = lk.link & 0xFF;
+                                        int subRaw1 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, link1));
+                                        if (subRaw1 != 0 && subRaw1 != raw)
+                                        {
+                                            int subRaw2 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(subRaw1, link2));
+                                            targetRaw = (subRaw2 != 0 && subRaw2 != subRaw1 && subRaw2 != raw) ? subRaw2 : 0;
+                                        }
+                                        else
+                                        {
+                                            targetRaw = 0;
+                                        }
+                                    }
                                 }
 
                                 if (targetRaw != 0)
@@ -509,7 +530,7 @@ namespace Xajh
                                         preferredDirectLink = lk.link;
                                         preferredDirectPos = lk.pos;
                                         directCx = x; directCy = y; directCz = z; hasDirectCache = true;
-                                        string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
+                                        string lockTag = LinkCodeToTag(lk.link);
                                         source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lk.pos:X2},pref-lock)";
                                         return true;
                                     }
@@ -554,7 +575,7 @@ namespace Xajh
                                         preferredDirectPos = lockBestPos;
                                         directCalibLock = (lk.mgr, lk.list, lk.obj, lk.link, lockBestPos);
                                         directCx = x; directCy = y; directCz = z; hasDirectCache = true;
-                                        string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
+                                        string lockTag = LinkCodeToTag(lk.link);
                                         source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lockBestPos:X2},pref-lock-relaxed)";
                                         return true;
                                     }
@@ -567,7 +588,7 @@ namespace Xajh
                     if (hasDirectCache)
                     {
                         x = directCx; y = directCy; z = directCz;
-                        string lockTag = lk.link == -1 ? "root" : $"sub+0x{lk.link:X2}";
+                        string lockTag = LinkCodeToTag(lk.link);
                         source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lk.pos:X2},pref-lock-cache)";
                         return true;
                     }
@@ -616,6 +637,24 @@ namespace Xajh
                                     CollectPosCandidatesFromAddress(hProcess, subObj, 0x180, directSubPosOffsets, subPosCandidates);
                                     foreach (var c in subPosCandidates)
                                         samples.Add((mo, lo, oo, linkOff, c.po, c.x, c.y, c.z, c.seeded));
+
+                                    // Optional second-level pointer walk to escape map-static root anchors.
+                                    if (avoidKnownStaticRoot)
+                                    {
+                                        foreach (int linkOff2 in directPtrOffsetsL2)
+                                        {
+                                            int subRaw2 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(subRaw, linkOff2));
+                                            if (subRaw2 == 0 || subRaw2 == subRaw || subRaw2 == raw) continue;
+                                            if (subRaw2 < 0x00100000) continue;
+
+                                            var subObj2 = Ptr32(subRaw2);
+                                            var sub2PosCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                                            CollectPosCandidatesFromAddress(hProcess, subObj2, 0x180, directSubPosOffsets, sub2PosCandidates);
+                                            int linkCode = 0x10000 | ((linkOff & 0xFF) << 8) | (linkOff2 & 0xFF);
+                                            foreach (var c in sub2PosCandidates)
+                                                samples.Add((mo, lo, oo, linkCode, c.po, c.x, c.y, c.z, c.seeded));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -638,6 +677,11 @@ namespace Xajh
                 bool anyAltMoved = false;
                 foreach (var s in samples)
                 {
+                    if (avoidKnownStaticRoot &&
+                        s.mo == 0x9D4518 && s.lo == 0x08 && s.oo == 0x4C &&
+                        s.link == -1 && s.po == 0x94)
+                        continue;
+
                     bool isPref = s.mo == preferredDirectMgr &&
                                   s.lo == preferredDirectList &&
                                   s.oo == preferredDirectObj &&
@@ -684,6 +728,8 @@ namespace Xajh
                     if (s.link == -1 && s.po == 0x94) score += 0.5f;
                     if (s.link != -1) score += 0.5f;
                     if (!s.seeded) score -= 0.35f;
+                    if (avoidKnownStaticRoot && s.link != -1) score += 1.5f;
+                    if (avoidKnownStaticRoot && s.link == -1 && s.po == 0x94) score -= 3f;
 
                     if (hasDirectCache)
                     {
@@ -739,7 +785,7 @@ namespace Xajh
                 preferredDirectLink = bestLink;
                 preferredDirectPos = bestPos;
                 directCx = x; directCy = y; directCz = z; hasDirectCache = true;
-                string linkTag = bestLink == -1 ? "root" : $"sub+0x{bestLink:X2}";
+                string linkTag = LinkCodeToTag(bestLink);
                 source = $"direct(mgr=0x{bestMgr:X},list=0x{bestList:X2},obj=0x{bestObj:X2},ln={linkTag},pos=0x{bestPos:X2},st={preferredDirectStaticReads},cand={samples.Count},lock={(directCalibLock.HasValue ? 1 : 0)})";
                 return true;
             }
@@ -911,6 +957,23 @@ namespace Xajh
                 Console.WriteLine("[!] Injection failed.");
                 Console.ReadKey(); return;
             }
+            string zxxyPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "zxxy.dll");
+            if (File.Exists(zxxyPath))
+            {
+                if (!DllInjector.Inject(hProcess, zxxyPath))
+                {
+                    Console.WriteLine("[*] Optional zxxy.dll injection failed; continuing with existing resolvers.");
+                }
+                else
+                {
+                    TryRefreshZxxyModule(force: true);
+                    Console.WriteLine("[*] Optional zxxy.dll injected for map-specific position fallback.");
+                }
+            }
+            else
+            {
+                Console.WriteLine("[*] Optional zxxy.dll not found next to executable; continuing without it.");
+            }
 
             // --- Step 3: Combat overlay control ---
             var npcReader = new NpcReader(hProcess, moduleBase);
@@ -973,6 +1036,7 @@ namespace Xajh
                         playerReader = new PlayerReader(hProcess, moduleBase);
                         combat = new CombatOverlay(hProcess, moduleBase);
                         turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+                        TryRefreshZxxyModule(force: true);
 
                         Console.WriteLine($"[REATTACH] {reason} -> PID={game.Id} Base=0x{moduleBase.ToInt64():X8} (refresh)");
                         return true;
@@ -988,6 +1052,7 @@ namespace Xajh
                     playerReader = new PlayerReader(hProcess, moduleBase);
                     combat = new CombatOverlay(hProcess, moduleBase);
                     turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+                    TryRefreshZxxyModule(force: true);
 
                     Console.WriteLine($"[REATTACH] {reason} -> PID={game.Id} Base=0x{moduleBase.ToInt64():X8}");
                     return true;
@@ -1064,6 +1129,11 @@ namespace Xajh
             bool TryReadPlayerDirect(out float x, out float y, out float z, out string source)
             {
                 return TryReadDirectPlayerPos(hProcess, moduleBase, out x, out y, out z, out source);
+            }
+
+            bool TryReadPlayerDirectAvoidStaticAnchor(out float x, out float y, out float z, out string source)
+            {
+                return TryReadDirectPlayerPos(hProcess, moduleBase, out x, out y, out z, out source, avoidKnownStaticRoot: true);
             }
 
             (float x, float y, float z) ReadPlayerPos()
@@ -1150,6 +1220,13 @@ namespace Xajh
                         return (zfx, zfy, zfz);
                     }
 
+                    if (fallbackStaticReads >= 1 &&
+                        TryReadPlayerDirectAvoidStaticAnchor(out float adx, out float ady, out float adz, out string adsrc))
+                    {
+                        lastDirectSource = $"{lastDirectSource},skip-static-anchor->{adsrc}";
+                        return (adx, ady, adz);
+                    }
+
                     return (dx, dy, dz);
                 }
 
@@ -1160,6 +1237,13 @@ namespace Xajh
                 {
                     lastDirectSource = $"simple-static,{sssrc}";
                     return (ssx, ssy, ssz);
+                }
+
+                if (simpleStatic &&
+                    TryReadPlayerDirectAvoidStaticAnchor(out float sax, out float say, out float saz, out string sasrc))
+                {
+                    lastDirectSource = $"simple-static,skip-static-anchor->{sasrc}";
+                    return (sax, say, saz);
                 }
 
                 if (simpleStatic &&
@@ -1192,7 +1276,7 @@ namespace Xajh
 
                 while (Environment.TickCount64 < directCalibEndTicks)
                 {
-                    TryReadDirectPlayerPos(hProcess, moduleBase, out _, out _, out _, out _);
+                    TryReadDirectPlayerPos(hProcess, moduleBase, out _, out _, out _, out _, avoidKnownStaticRoot: true);
                     foreach (var kv in directLastByKey)
                         if (!directCalibStartByKey.ContainsKey(kv.Key))
                             directCalibStartByKey[kv.Key] = kv.Value;
