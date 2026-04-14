@@ -1821,7 +1821,7 @@ namespace Xajh
                         // Pick the result with the most movement.
                         probeResults.Sort((a, b) => b.mv.CompareTo(a.mv));
 
-                        if (probeResults.Count > 0 && probeResults[0].mv > 0.5 &&
+                        if (probeResults.Count > 0 && probeResults[0].mv > 0.05 &&
                             IsStrictPlausiblePos(probeResults[0].x, probeResults[0].y))
                         {
                             var best = probeResults[0];
