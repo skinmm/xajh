@@ -1446,18 +1446,15 @@ namespace Xajh
                 return true;
             }
 
-            // Stricter check: position must be near a known reference (frozen simple
-            // chain or directCache).  Prevents accepting garbage like (1,1,255) that
-            // technically passes IsPlausibleWorldPos but is thousands of units from
-            // the last known good position.
-            bool IsNearKnownPosition(float x, float y)
+            // Stricter plausibility check for fallback phases: in addition to
+            // the basic IsPlausibleWorldPos, reject candidates with both X and Y
+            // near zero — real world positions have significant coordinate values
+            // (|X| > 10 AND |Y| > 10), while garbage like (1,1,255) or (2,2,0)
+            // from 255-filled entities has near-zero world coords.
+            bool IsStrictPlausiblePos(float x, float y)
             {
                 if (!IsPlausibleWorldPos(x, y)) return false;
-                if (hasDirectCache)
-                {
-                    double d = Math.Sqrt(Math.Pow(x - directCx, 2) + Math.Pow(y - directCy, 2));
-                    if (d > 2000.0) return false;
-                }
+                if (Math.Abs(x) < 10f && Math.Abs(y) < 10f) return false;
                 return true;
             }
 
@@ -1530,15 +1527,8 @@ namespace Xajh
                     return p;
                 }
 
-                // Seed directCache from simple chain if we have nothing better yet,
-                // even when simple is static — this gives zxxy phases a reference.
-                if (simplePlausible && !hasDirectCache)
-                {
-                    directCx = p.x;
-                    directCy = p.y;
-                    directCz = p.z;
-                    hasDirectCache = true;
-                }
+                // Note: do NOT seed directCache from frozen simple chain — the spawn
+                // position can be thousands of units from the real position.
 
                 // --- Phase 1: zxxy.dll direct float scan (authoritative, like xajhtoy.exe) ---
                 if (TryReadPlayerPosViaZxxyDirect(out float zdx, out float zdy, out float zdz, out string zdsrc) &&
@@ -1601,7 +1591,7 @@ namespace Xajh
 
                 // --- Phase 2: zxxy.dll pointer chain scan (existing approach) ---
                 if (TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc) &&
-                    IsNearKnownPosition(zx, zy))
+                    IsStrictPlausiblePos(zx, zy))
                 {
                     directCx = zx; directCy = zy; directCz = zz; hasDirectCache = true;
                     lastDirectSource = zxsrc;
@@ -1712,7 +1702,7 @@ namespace Xajh
                         }
                     }
 
-                    if (bestZxxyEntityScore > 2f && IsNearKnownPosition(bestZxxyEntityX, bestZxxyEntityY))
+                    if (bestZxxyEntityScore > 2f && IsStrictPlausiblePos(bestZxxyEntityX, bestZxxyEntityY))
                     {
                         lastDirectSource = bestZxxyEntitySrc;
                         directCx = bestZxxyEntityX; directCy = bestZxxyEntityY; directCz = bestZxxyEntityZ; hasDirectCache = true;
@@ -1723,7 +1713,7 @@ namespace Xajh
                 // --- Phase 3: direct fallback with known-wrong coordinate rejection ---
                 if (simpleStatic && simplePlausible &&
                     TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc) &&
-                    IsNearKnownPosition(rdx, rdy))
+                    IsStrictPlausiblePos(rdx, rdy))
                 {
                     directCx = rdx; directCy = rdy; directCz = rdz; hasDirectCache = true;
                     lastDirectSource = $"reject-static({p.x:F0},{p.y:F0})->{rdsrc}";
@@ -1732,7 +1722,7 @@ namespace Xajh
 
                 if ((!simplePlausible || simpleStatic) &&
                     TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc) &&
-                    IsNearKnownPosition(dx, dy))
+                    IsStrictPlausiblePos(dx, dy))
                 {
                     bool directAlsoStatic = simpleStatic && simplePlausible &&
                         Math.Abs(dx - p.x) < 1f && Math.Abs(dy - p.y) < 1f;
