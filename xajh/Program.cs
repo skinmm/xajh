@@ -715,7 +715,6 @@ namespace Xajh
                                         preferredDirectObj = lk.obj;
                                         preferredDirectLink = lk.link;
                                         preferredDirectPos = lk.pos;
-                                        directCx = x; directCy = y; directCz = z; hasDirectCache = true;
                                         string lockTag = LinkCodeToTag(lk.link);
                                         source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lk.pos:X2},pref-lock)";
                                         return true;
@@ -760,7 +759,6 @@ namespace Xajh
                                         preferredDirectLink = lk.link;
                                         preferredDirectPos = lockBestPos;
                                         directCalibLock = (lk.mgr, lk.list, lk.obj, lk.link, lockBestPos);
-                                        directCx = x; directCy = y; directCz = z; hasDirectCache = true;
                                         string lockTag = LinkCodeToTag(lk.link);
                                         source = $"direct(mgr=0x{lk.mgr:X},list=0x{lk.list:X2},obj=0x{lk.obj:X2},ln={lockTag},pos=0x{lockBestPos:X2},pref-lock-relaxed)";
                                         return true;
@@ -1029,7 +1027,6 @@ namespace Xajh
                 preferredDirectObj = bestObj;
                 preferredDirectLink = bestLink;
                 preferredDirectPos = bestPos;
-                directCx = x; directCy = y; directCz = z; hasDirectCache = true;
                 string linkTag = LinkCodeToTag(bestLink);
                 source = $"direct(mgr=0x{bestMgr:X},list=0x{bestList:X2},obj=0x{bestObj:X2},ln={linkTag},pos=0x{bestPos:X2},st={preferredDirectStaticReads},cand={samples.Count},lock={(directCalibLock.HasValue ? 1 : 0)})";
                 return true;
@@ -1715,7 +1712,7 @@ namespace Xajh
                         }
                     }
 
-                    if (bestZxxyEntityScore > 2f && IsPlausibleWorldPos(bestZxxyEntityX, bestZxxyEntityY))
+                    if (bestZxxyEntityScore > 2f && IsNearKnownPosition(bestZxxyEntityX, bestZxxyEntityY))
                     {
                         lastDirectSource = bestZxxyEntitySrc;
                         directCx = bestZxxyEntityX; directCy = bestZxxyEntityY; directCz = bestZxxyEntityZ; hasDirectCache = true;
@@ -1728,6 +1725,7 @@ namespace Xajh
                     TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc) &&
                     IsNearKnownPosition(rdx, rdy))
                 {
+                    directCx = rdx; directCy = rdy; directCz = rdz; hasDirectCache = true;
                     lastDirectSource = $"reject-static({p.x:F0},{p.y:F0})->{rdsrc}";
                     return (rdx, rdy, rdz);
                 }
@@ -1775,6 +1773,7 @@ namespace Xajh
 
                         if (!directAlsoStatic)
                         {
+                            directCx = dx; directCy = dy; directCz = dz; hasDirectCache = true;
                             lastDirectSource = dsrc;
                             return (dx, dy, dz);
                         }
