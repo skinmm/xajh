@@ -1710,6 +1710,79 @@ namespace Xajh
                     }
                 }
 
+                // --- Phase 2c: targeted probe for known deep chains ---
+                // Deep scan revealed live coords at mgr+0x9D4520[+0x0C]+0x4C>+0x0C>+0x4C
+                // at position offsets +0x064 and +0x094. Probe this specific chain
+                // with a double-read to detect movement, bypassing generic scoring.
+                if (simpleStatic || !simplePlausible)
+                {
+                    int[][] targetedChains = {
+                        new[] { 0x9D4520, 0x0C, 0x4C, 0x0C, 0x4C },
+                        new[] { 0x9D4520, 0x0C, 0x48, 0x0C, 0x4C },
+                        new[] { 0x9D4520, 0x0C, 0x4C, 0x0C, 0x48 },
+                        new[] { 0x9D4520, 0x08, 0x4C, 0x0C, 0x4C },
+                    };
+                    int[] probePosOffsets = { 0x94, 0x64, 0x34, 0xC4, 0x20, 0x24, 0x28 };
+
+                    float bestTargetedScore = float.MinValue;
+                    float bestTX = 0f, bestTY = 0f, bestTZ = 0f;
+                    string bestTSrc = "";
+
+                    foreach (var chain in targetedChains)
+                    {
+                        int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, chain[0]));
+                        if (mgr == 0) continue;
+                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, chain[1]));
+                        if (list == 0) continue;
+                        int obj = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, chain[2]));
+                        if (obj == 0 || obj < 0x00100000) continue;
+                        int sub1 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(obj, chain[3]));
+                        if (sub1 == 0 || sub1 == obj || sub1 < 0x00100000) continue;
+                        int sub2 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(sub1, chain[4]));
+                        if (sub2 == 0 || sub2 == sub1 || sub2 == obj || sub2 < 0x00100000) continue;
+
+                        var targetObj = Ptr32(sub2);
+                        foreach (int po in probePosOffsets)
+                        {
+                            if (!TryReadStablePos(hProcess, targetObj, po, out float tx, out float ty, out float tz))
+                                continue;
+                            if (!IsStrictPlausiblePos(tx, ty)) continue;
+
+                            // Double-read with delay to detect movement.
+                            Thread.Sleep(50);
+                            if (!TryReadStablePos(hProcess, targetObj, po, out float tx2, out float ty2, out _))
+                                continue;
+                            double movement = Math.Sqrt(Math.Pow(tx2 - tx, 2) + Math.Pow(ty2 - ty, 2));
+
+                            float score = 0f;
+                            if (movement > 0.05) score += 10f;
+                            if (hasLastNpcCloudCenter)
+                            {
+                                double dNpc = Math.Sqrt(Math.Pow(tx - lastNpcCloudCenterX, 2) + Math.Pow(ty - lastNpcCloudCenterY, 2));
+                                if (dNpc <= 3000.0) score += 3f;
+                                else if (dNpc > 15000.0) score -= 5f;
+                            }
+                            if (po == 0x94 || po == 0x64) score += 1f;
+
+                            if (score > bestTargetedScore)
+                            {
+                                bestTargetedScore = score;
+                                bestTX = movement > 0.05 ? tx2 : tx;
+                                bestTY = movement > 0.05 ? ty2 : ty;
+                                bestTZ = tz;
+                                bestTSrc = $"targeted(mgr=0x{chain[0]:X}[+0x{chain[1]:X2}]+0x{chain[2]:X2}>+0x{chain[3]:X2}>+0x{chain[4]:X2},pos=0x{po:X2},mv={movement:F1},score={score:F1})";
+                            }
+                        }
+                    }
+
+                    if (bestTargetedScore > 0f && IsStrictPlausiblePos(bestTX, bestTY))
+                    {
+                        directCx = bestTX; directCy = bestTY; directCz = bestTZ; hasDirectCache = true;
+                        lastDirectSource = bestTSrc;
+                        return (bestTX, bestTY, bestTZ);
+                    }
+                }
+
                 // --- Phase 3: direct fallback with known-wrong coordinate rejection ---
                 float rdx = 0f, rdy = 0f, rdz = 0f;
                 string rdsrc = "";
