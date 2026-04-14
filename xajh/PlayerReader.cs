@@ -34,8 +34,9 @@ namespace xajh
             public readonly float RawY;
             public readonly float RawZ;
             public readonly string Source;
+            public readonly int SimpleChainStaticReads;
 
-            public DebugSnapshot(int mgrOffset, IntPtr playerObj, int objOffset, int posOffset, float rawX, float rawY, float rawZ, string source)
+            public DebugSnapshot(int mgrOffset, IntPtr playerObj, int objOffset, int posOffset, float rawX, float rawY, float rawZ, string source, int simpleChainStaticReads = 0)
             {
                 MgrOffset = mgrOffset;
                 PlayerObj = playerObj;
@@ -45,6 +46,7 @@ namespace xajh
                 RawY = rawY;
                 RawZ = rawZ;
                 Source = source;
+                SimpleChainStaticReads = simpleChainStaticReads;
             }
         }
 
@@ -72,6 +74,18 @@ namespace xajh
             0x94, 0x34, 0x64, 0xC4, 0x4C, 0x7C, 0x84, 0x8C
         };
 
+        readonly int[] _candidateSubPtrOffsets =
+        {
+            0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24,
+            0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44,
+            0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64,
+            0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C
+        };
+        readonly int[] _candidateSubPosOffsets =
+        {
+            0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x4C, 0x7C, 0x84, 0x8C
+        };
+
         readonly IntPtr _h, _m;
         float _cx, _cy, _cz;
         bool _hasCache;
@@ -92,10 +106,17 @@ namespace xajh
         float _dbgRawX = float.NaN, _dbgRawY = float.NaN, _dbgRawZ = float.NaN;
         string _dbgSource = "none";
 
+        // Per-key motion tracking for TryReadSimpleChainPos to detect frozen candidates.
+        readonly Dictionary<(int mgr, int obj, int pos), (float x, float y)> _simpleLastByKey =
+            new Dictionary<(int mgr, int obj, int pos), (float x, float y)>();
+        readonly Dictionary<(int mgr, int obj, int pos), float> _simpleMotionByKey =
+            new Dictionary<(int mgr, int obj, int pos), float>();
+        int _simplePreferredStaticReads = 0;
+
         public PlayerReader(IntPtr h, IntPtr m) { _h = h; _m = m; }
 
         public DebugSnapshot GetDebugSnapshot()
-            => new DebugSnapshot(_dbgMgrOffset, _dbgPlayerObj, _dbgObjOffset, _dbgPosOffset, _dbgRawX, _dbgRawY, _dbgRawZ, _dbgSource);
+            => new DebugSnapshot(_dbgMgrOffset, _dbgPlayerObj, _dbgObjOffset, _dbgPosOffset, _dbgRawX, _dbgRawY, _dbgRawZ, _dbgSource, _simplePreferredStaticReads);
 
         public (float x, float y, float z) Get()
         {
@@ -165,6 +186,8 @@ namespace xajh
             mgrOff = 0; objOff = 0; posOff = 0; playerObj = IntPtr.Zero;
             float bestScore = float.MinValue;
 
+            var samples = new List<(int mo, int oo, int po, float x, float y, float z, IntPtr ptr, bool isSub)>();
+
             var mgrOrder = new List<int> { _preferredMgrOffset };
             foreach (int mo in _candidateMgrOffsets)
                 if (mo != _preferredMgrOffset) mgrOrder.Add(mo);
@@ -189,32 +212,130 @@ namespace xajh
                         {
                             if (!TryReadPosAtOffset(p, po, out float tx, out float ty, out float tz))
                                 continue;
+                            samples.Add((mo, oo, po, tx, ty, tz, p, false));
+                        }
 
-                            float score = 0f;
-                            if (mo == _preferredMgrOffset) score += 2f;
-                            if (oo == _preferredObjOffset) score += 1f;
-                            if (po == _preferredPosOffset) score += 2f;
-                            if (oo == DefaultPlayerObjOffset) score += 1f;
-                            if (po == DefaultPosOffset) score += 1f;
-                            if (_hasCache)
+                        // When the preferred root chain looks frozen, probe
+                        // one-level sub-objects to find moving world coords.
+                        if (_simplePreferredStaticReads >= 2)
+                        {
+                            foreach (int ptrOff in _candidateSubPtrOffsets)
                             {
-                                double d = DistXY(tx, ty, _cx, _cy);
-                                if (d <= 20f) score += 4f;
-                                else if (d <= 300f) score += 2f;
-                                else if (d <= 3000f) score -= 1f;
-                                else score -= 4f;
-                            }
+                                int subRaw = MemoryHelper.ReadInt32(_h, Ptr32Add(raw, ptrOff));
+                                if (subRaw == 0 || subRaw == raw || subRaw < 0x00100000) continue;
+                                var subPtr = Ptr32(subRaw);
 
-                            if (score > bestScore)
-                            {
-                                bestScore = score;
-                                x = tx; y = ty; z = tz;
-                                mgrOff = mo; objOff = oo; posOff = po;
-                                playerObj = p;
+                                foreach (int po in _candidateSubPosOffsets)
+                                {
+                                    if (!TryReadPosAtOffset(subPtr, po, out float sx, out float sy, out float sz))
+                                        continue;
+                                    samples.Add((mo, oo, po, sx, sy, sz, subPtr, true));
+                                }
                             }
                         }
                     }
                 }
+            }
+
+            if (samples.Count == 0) return false;
+
+            // Detect whether the current preferred key looks frozen while alternatives moved.
+            bool preferredLooksStatic = false;
+            bool anyAltMoved = false;
+            foreach (var s in samples)
+            {
+                var key = (s.mo, s.oo, s.po);
+                bool isPref = s.mo == _preferredMgrOffset &&
+                              s.oo == _preferredObjOffset &&
+                              s.po == _preferredPosOffset && !s.isSub;
+
+                if (isPref && _simpleLastByKey.TryGetValue(key, out var last))
+                {
+                    double dSelf = DistXY(s.x, s.y, last.x, last.y);
+                    if (dSelf < 0.01) preferredLooksStatic = true;
+                }
+                if (!isPref && _simpleLastByKey.TryGetValue(key, out var altLast))
+                {
+                    double dSelf = DistXY(s.x, s.y, altLast.x, altLast.y);
+                    if (dSelf > 0.2 && dSelf <= 3000.0) anyAltMoved = true;
+                }
+            }
+            if (preferredLooksStatic && anyAltMoved)
+                _simplePreferredStaticReads++;
+            else if (!preferredLooksStatic)
+                _simplePreferredStaticReads = 0;
+
+            foreach (var s in samples)
+            {
+                var key = (s.mo, s.oo, s.po);
+
+                float score = 0f;
+                if (!s.isSub)
+                {
+                    if (s.mo == _preferredMgrOffset) score += 2f;
+                    if (s.oo == _preferredObjOffset) score += 1f;
+                    if (s.po == _preferredPosOffset) score += 2f;
+                    if (s.oo == DefaultPlayerObjOffset) score += 1f;
+                    if (s.po == DefaultPosOffset) score += 1f;
+                }
+                else
+                {
+                    score += 0.5f;
+                }
+
+                if (_hasCache)
+                {
+                    double d = DistXY(s.x, s.y, _cx, _cy);
+                    if (d <= 20f) score += 4f;
+                    else if (d <= 300f) score += 2f;
+                    else if (d <= 3000f) score -= 1f;
+                    else score -= 4f;
+                }
+
+                if (_simpleLastByKey.TryGetValue(key, out var prev))
+                {
+                    double dSelf = DistXY(s.x, s.y, prev.x, prev.y);
+                    if (dSelf > 0.2 && dSelf <= 3000.0) score += 3f;
+                    else if (dSelf < 0.01) score -= 0.5f;
+                }
+
+                if (_simpleMotionByKey.TryGetValue(key, out float mv))
+                    score += Math.Min(mv, 8f);
+
+                bool isPref = s.mo == _preferredMgrOffset &&
+                              s.oo == _preferredObjOffset &&
+                              s.po == _preferredPosOffset && !s.isSub;
+                if (isPref && _simplePreferredStaticReads >= 2)
+                    score -= 10f;
+                if (!isPref && _simplePreferredStaticReads >= 2 && s.isSub)
+                    score += 2f;
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    x = s.x; y = s.y; z = s.z;
+                    mgrOff = s.mo; objOff = s.oo; posOff = s.po;
+                    playerObj = s.ptr;
+                }
+            }
+
+            // Update per-key motion tracking.
+            foreach (var s in samples)
+            {
+                var key = (s.mo, s.oo, s.po);
+                if (_simpleLastByKey.TryGetValue(key, out var prev))
+                {
+                    float old = _simpleMotionByKey.TryGetValue(key, out float om) ? om : 0f;
+                    double dSelf = DistXY(s.x, s.y, prev.x, prev.y);
+                    float impulse = dSelf > 0.05 ? (float)Math.Min(dSelf, 25.0) : 0f;
+                    _simpleMotionByKey[key] = old * 0.85f + impulse;
+                }
+                else
+                {
+                    if (!_simpleMotionByKey.ContainsKey(key))
+                        _simpleMotionByKey[key] = 0f;
+                }
+                _simpleLastByKey[key] = (s.x, s.y);
             }
 
             return playerObj != IntPtr.Zero;

@@ -1490,7 +1490,7 @@ namespace Xajh
                     }
                 }
 
-                bool simpleStatic = simpleStaticReads >= 2;
+                bool simpleStatic = simpleStaticReads >= 2 || dbg.SimpleChainStaticReads >= 2;
 
                 // If simple chain is resolved, moving, and plausible, trust it immediately.
                 if (simpleResolved && !simpleStatic && !IsDirectFallbackLikelyWrong(p.x, p.y))
@@ -1972,7 +1972,7 @@ namespace Xajh
                             Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
                             Console.WriteLine(
                                 $"  [DBG] src={dbg.Source} mgr=0x{dbg.MgrOffset:X} off=0x{dbg.ObjOffset:X2} pos=0x{dbg.PosOffset:X2} obj=0x{dbg.PlayerObj.ToInt64():X8} " +
-                                $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1}) simpleStatic={simpleStaticReads}");
+                                $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1}) simpleStatic={simpleStaticReads} chainStatic={dbg.SimpleChainStaticReads}");
                             if (!string.IsNullOrEmpty(lastDirectSource))
                                 Console.WriteLine($"  [DBG] fallback={lastDirectSource}");
                             if (zxxyDirectLockedAddr != 0)
