@@ -367,10 +367,11 @@ namespace Xajh
                     float rx = MemoryHelper.ReadFloat(hProcess, addr);
                     float ry = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 4));
                     float rz = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(addr, 8));
+                    int rSig = (Math.Abs(rx) >= 1f ? 1 : 0) + (Math.Abs(ry) >= 1f ? 1 : 0) + (Math.Abs(rz) >= 1f ? 1 : 0);
                     if (!float.IsNaN(rx) && !float.IsNaN(ry) && !float.IsNaN(rz) &&
                         !float.IsInfinity(rx) && !float.IsInfinity(ry) && !float.IsInfinity(rz) &&
                         Math.Abs(rx) < 1_000_000f && Math.Abs(ry) < 1_000_000f && Math.Abs(rz) < 1_000_000f &&
-                        Math.Abs(rx) >= 1f && Math.Abs(ry) >= 1f)
+                        rSig >= 2)
                     {
                         bool moved = !float.IsNaN(zxxyDirectLockedLastX) &&
                             (Math.Abs(rx - zxxyDirectLockedLastX) > 0.01f || Math.Abs(ry - zxxyDirectLockedLastY) > 0.01f);
@@ -450,7 +451,12 @@ namespace Xajh
                                         if (float.IsNaN(fx) || float.IsNaN(fy) || float.IsNaN(fz)) continue;
                                         if (float.IsInfinity(fx) || float.IsInfinity(fy) || float.IsInfinity(fz)) continue;
                                         if (Math.Abs(fx) > 1_000_000f || Math.Abs(fy) > 1_000_000f || Math.Abs(fz) > 1_000_000f) continue;
-                                        if (Math.Abs(fx) < 1f || Math.Abs(fy) < 1f) continue;
+                                        // At least 2 of 3 floats must have magnitude > 1
+                                        // (allows one axis to be near zero, e.g. height on flat ground)
+                                        int sigCount = (Math.Abs(fx) >= 1f ? 1 : 0) +
+                                                       (Math.Abs(fy) >= 1f ? 1 : 0) +
+                                                       (Math.Abs(fz) >= 1f ? 1 : 0);
+                                        if (sigCount < 2) continue;
 
                                         long absAddr = scanStart + i;
                                         float prevMotion = 0f;
@@ -458,7 +464,7 @@ namespace Xajh
                                         {
                                             if (old.addr == absAddr)
                                             {
-                                                double d = Math.Sqrt(Math.Pow(fx - old.lastX, 2) + Math.Pow(fy - old.lastY, 2));
+                                                double d = Math.Sqrt(Math.Pow(fx - old.lastX, 2) + Math.Pow(fy - old.lastY, 2) + Math.Pow(fz - old.lastZ, 2));
                                                 float impulse = d > 0.05 ? (float)Math.Min(d, 50.0) : 0f;
                                                 prevMotion = old.motion * 0.7f + impulse;
                                                 break;
