@@ -408,9 +408,13 @@ namespace Xajh
                 if (now < nextZxxyDirectScanTicks && zxxyDirectCandidates.Count == 0)
                     return false;
 
-                if (zxxyDirectCandidates.Count == 0 || now >= nextZxxyDirectScanTicks)
+                // Always rescan when not yet locked — we need consecutive scans
+                // to detect motion. Use short interval (500ms) to accumulate motion quickly.
+                bool shouldRescan = zxxyDirectCandidates.Count == 0 ||
+                    now >= nextZxxyDirectScanTicks;
+                if (shouldRescan)
                 {
-                    nextZxxyDirectScanTicks = now + 3000;
+                    nextZxxyDirectScanTicks = now + 500;
                     var newCandidates = new List<(long addr, float lastX, float lastY, float lastZ, float motion)>();
                     long modBase = zxxyModuleBase.ToInt64();
                     long modEnd = modBase + zxxyModuleSize;
