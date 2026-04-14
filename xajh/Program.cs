@@ -1742,10 +1742,7 @@ namespace Xajh
                     };
                     int[] probePosOffsets = { 0x94, 0x64, 0x34, 0xC4, 0x20, 0x24, 0x28, 0x4C, 0x68 };
 
-                    var probeResults = new List<(float x, float y, float z, double mv, string src)>();
-
-                    // Resolve all chain endpoints and collect first reads.
-                    var endpoints = new List<(IntPtr ptr, string tag)>();
+                    var endpoints = new List<(IntPtr ptr, string tag, bool is2link)>();
 
                     foreach (var c in chains2)
                     {
@@ -1757,7 +1754,7 @@ namespace Xajh
                         if (obj == 0 || obj < 0x00100000) continue;
                         int sub = MemoryHelper.ReadInt32(hProcess, Ptr32Add(obj, c[3]));
                         if (sub == 0 || sub == obj || sub < 0x00100000) continue;
-                        endpoints.Add((Ptr32(sub), $"mgr+0x{c[0]:X}[+0x{c[1]:X2}]+0x{c[2]:X2}>+0x{c[3]:X2}"));
+                        endpoints.Add((Ptr32(sub), $"mgr+0x{c[0]:X}[+0x{c[1]:X2}]+0x{c[2]:X2}>+0x{c[3]:X2}", true));
                     }
                     foreach (var c in chains3)
                     {
@@ -1771,11 +1768,10 @@ namespace Xajh
                         if (sub1 == 0 || sub1 == obj || sub1 < 0x00100000) continue;
                         int sub2 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(sub1, c[4]));
                         if (sub2 == 0 || sub2 == sub1 || sub2 == obj || sub2 < 0x00100000) continue;
-                        endpoints.Add((Ptr32(sub2), $"mgr+0x{c[0]:X}[+0x{c[1]:X2}]+0x{c[2]:X2}>+0x{c[3]:X2}>+0x{c[4]:X2}"));
+                        endpoints.Add((Ptr32(sub2), $"mgr+0x{c[0]:X}[+0x{c[1]:X2}]+0x{c[2]:X2}>+0x{c[3]:X2}>+0x{c[4]:X2}", false));
                     }
 
-                    // First read from all endpoints.
-                    var firstReads = new List<(IntPtr ptr, int po, float x, float y, float z, string tag)>();
+                    var firstReads = new List<(IntPtr ptr, int po, float x, float y, float z, string tag, bool is2link)>();
                     var seenEndpoints = new HashSet<long>();
                     foreach (var ep in endpoints)
                     {
@@ -1784,7 +1780,7 @@ namespace Xajh
                         {
                             if (TryReadStablePos(hProcess, ep.ptr, po, out float x, out float y, out float z) &&
                                 IsStrictPlausiblePos(x, y))
-                                firstReads.Add((ep.ptr, po, x, y, z, ep.tag));
+                                firstReads.Add((ep.ptr, po, x, y, z, ep.tag, ep.is2link));
                         }
                     }
 
@@ -1792,39 +1788,21 @@ namespace Xajh
                     {
                         Thread.Sleep(200);
 
-                        float bestScore = float.MinValue;
+                        var probeResults = new List<(float x, float y, float z, double mv, bool is2link, string src)>();
                         foreach (var fr in firstReads)
                         {
                             if (!TryReadStablePos(hProcess, fr.ptr, fr.po, out float x2, out float y2, out float z2))
                                 continue;
                             double mv = Math.Sqrt(Math.Pow(x2 - fr.x, 2) + Math.Pow(y2 - fr.y, 2));
-
-                            float score = 0f;
-                            if (mv > 0.5) score += 15f;
-                            else if (mv > 0.05) score += 8f;
-                            if (IsStrictPlausiblePos(x2, y2)) score += 2f;
-                            if (hasLastNpcCloudCenter)
-                            {
-                                double dNpc = Math.Sqrt(Math.Pow(x2 - lastNpcCloudCenterX, 2) + Math.Pow(y2 - lastNpcCloudCenterY, 2));
-                                if (dNpc <= 3000.0) score += 3f;
-                            }
-
                             float useX = mv > 0.05 ? x2 : fr.x;
                             float useY = mv > 0.05 ? y2 : fr.y;
                             string src = $"targeted({fr.tag},pos=0x{fr.po:X2},v=({useX:F0},{useY:F0}),mv={mv:F1})";
-                            probeResults.Add((useX, useY, fr.z, mv, src));
-
-                            if (score > bestScore)
-                                bestScore = score;
+                            probeResults.Add((useX, useY, fr.z, mv, fr.is2link, src));
                         }
 
-                        // Pick the result with the most movement.
-                        probeResults.Sort((a, b) => b.mv.CompareTo(a.mv));
+                        (float x, float y, float z, double mv, bool is2link, string src)? bestProbe = null;
 
-                        // Pick best: prefer movement, then magnitude.
-                        (float x, float y, float z, double mv, string src)? bestProbe = null;
-
-                        // First: any candidate with confirmed movement.
+                        // Priority 1: any candidate with confirmed movement.
                         foreach (var r in probeResults)
                         {
                             if (r.mv > 0.05 && IsStrictPlausiblePos(r.x, r.y))
@@ -1834,21 +1812,21 @@ namespace Xajh
                             }
                         }
 
-                        // Fallback: when standing still (no movement detected),
-                        // pick the candidate with the largest coordinate magnitude.
-                        // Real world positions have |X| or |Z| in hundreds/thousands;
-                        // garbage like (20,20,0) has much smaller values.
+                        // Priority 2 (standing still): first 2-link candidate with
+                        // coordinate magnitude > 100. 2-link chains are stable direct
+                        // sub-objects; 3-link chains traverse linked lists returning
+                        // random entities with potentially large but wrong values.
                         if (!bestProbe.HasValue)
                         {
-                            float bestMag = 0f;
                             foreach (var r in probeResults)
                             {
+                                if (!r.is2link) continue;
                                 if (!IsStrictPlausiblePos(r.x, r.y)) continue;
                                 float mag = Math.Max(Math.Abs(r.x), Math.Max(Math.Abs(r.y), Math.Abs(r.z)));
-                                if (mag > 100f && mag > bestMag)
+                                if (mag > 100f)
                                 {
-                                    bestMag = mag;
                                     bestProbe = r;
+                                    break;
                                 }
                             }
                         }
@@ -1861,15 +1839,13 @@ namespace Xajh
                             return (bp.x, bp.y, bp.z);
                         }
 
-                        // Log top candidates for debugging when nothing matched.
-                        if (probeResults.Count > 0)
+                        // Log top candidates for debugging.
+                        probeResults.Sort((a, b) => b.mv.CompareTo(a.mv));
+                        int show = Math.Min(5, probeResults.Count);
+                        for (int i = 0; i < show; i++)
                         {
-                            int show = Math.Min(5, probeResults.Count);
-                            for (int i = 0; i < show; i++)
-                            {
-                                var r = probeResults[i];
-                                Console.WriteLine($"  [DBG] targeted#{i}: ({r.x:F1},{r.y:F1},{r.z:F1}) mv={r.mv:F2} {r.src}");
-                            }
+                            var r = probeResults[i];
+                            Console.WriteLine($"  [DBG] targeted#{i}: ({r.x:F1},{r.y:F1},{r.z:F1}) mv={r.mv:F2} 2L={r.is2link} {r.src}");
                         }
                     }
                 }
