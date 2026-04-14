@@ -1702,7 +1702,7 @@ namespace Xajh
                         }
                     }
 
-                    if (bestZxxyEntityScore > 2f && IsStrictPlausiblePos(bestZxxyEntityX, bestZxxyEntityY))
+                    if (bestZxxyEntityScore > 8f && IsStrictPlausiblePos(bestZxxyEntityX, bestZxxyEntityY))
                     {
                         lastDirectSource = bestZxxyEntitySrc;
                         directCx = bestZxxyEntityX; directCy = bestZxxyEntityY; directCz = bestZxxyEntityZ; hasDirectCache = true;
@@ -1711,18 +1711,27 @@ namespace Xajh
                 }
 
                 // --- Phase 3: direct fallback with known-wrong coordinate rejection ---
-                if (simpleStatic && simplePlausible &&
-                    TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc) &&
-                    IsStrictPlausiblePos(rdx, rdy))
+                float rdx = 0f, rdy = 0f, rdz = 0f;
+                string rdsrc = "";
+                bool phase3ok = simpleStatic && simplePlausible &&
+                    TryReadPlayerDirectRejectCoords(p.x, p.y, out rdx, out rdy, out rdz, out rdsrc);
+                if (phase3ok && IsStrictPlausiblePos(rdx, rdy))
                 {
                     directCx = rdx; directCy = rdy; directCz = rdz; hasDirectCache = true;
                     lastDirectSource = $"reject-static({p.x:F0},{p.y:F0})->{rdsrc}";
                     return (rdx, rdy, rdz);
                 }
+                else if (phase3ok)
+                {
+                    // Phase 3 found something but it failed strict plausibility.
+                    Console.WriteLine($"  [DBG] phase3-rejected: ({rdx:F1},{rdy:F1},{rdz:F1}) {rdsrc}");
+                }
 
-                if ((!simplePlausible || simpleStatic) &&
-                    TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc) &&
-                    IsStrictPlausiblePos(dx, dy))
+                float dx = 0f, dy = 0f, dz = 0f;
+                string dsrc = "";
+                bool phase4ok = (!simplePlausible || simpleStatic) &&
+                    TryReadPlayerDirect(out dx, out dy, out dz, out dsrc);
+                if (phase4ok && IsStrictPlausiblePos(dx, dy))
                 {
                     bool directAlsoStatic = simpleStatic && simplePlausible &&
                         Math.Abs(dx - p.x) < 1f && Math.Abs(dy - p.y) < 1f;
@@ -1769,6 +1778,9 @@ namespace Xajh
                         }
                     }
                 }
+
+                if (phase4ok && !IsStrictPlausiblePos(dx, dy))
+                    Console.WriteLine($"  [DBG] phase4-rejected: ({dx:F1},{dy:F1},{dz:F1}) {dsrc}");
 
                 // All fallbacks exhausted. If simple is static, try /loc as last resort.
                 if (simpleStatic && simplePlausible)
