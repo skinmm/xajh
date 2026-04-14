@@ -1472,10 +1472,18 @@ namespace Xajh
                 var dbg = playerReader.GetDebugSnapshot();
 
                 bool simpleResolved = !IsUnresolvedSource(dbg.Source);
+                bool simplePlausible = simpleResolved && IsPlausibleWorldPos(p.x, p.y);
+
+                // Track frozen state. Use dbg.SimpleChainStaticReads which tracks
+                // the actual output of TryReadSimpleChainPos (won't be fooled by
+                // the value changing between calls due to candidate switching).
                 if (simpleResolved)
                 {
-                    bool unchanged = !float.IsNaN(simpleLastX) &&
-                        Math.Abs(p.x - simpleLastX) < 0.01f &&
+                    if (float.IsNaN(simpleLastX))
+                    {
+                        simpleLastX = p.x; simpleLastY = p.y;
+                    }
+                    bool unchanged = Math.Abs(p.x - simpleLastX) < 0.01f &&
                         Math.Abs(p.y - simpleLastY) < 0.01f;
                     if (unchanged)
                         simpleStaticReads++;
@@ -1484,16 +1492,13 @@ namespace Xajh
                         simpleStaticReads = 0;
                         simpleLastX = p.x; simpleLastY = p.y;
                     }
-                    if (float.IsNaN(simpleLastX))
-                    {
-                        simpleLastX = p.x; simpleLastY = p.y;
-                    }
                 }
 
                 bool simpleStatic = simpleStaticReads >= 2 || dbg.SimpleChainStaticReads >= 2;
 
-                // If simple chain is resolved, moving, and plausible, trust it immediately.
-                if (simpleResolved && !simpleStatic && !IsDirectFallbackLikelyWrong(p.x, p.y))
+                // If simple chain is resolved, plausible, moving, and not implausibly far
+                // from NPC cloud, trust it immediately.
+                if (simplePlausible && !simpleStatic && !IsDirectFallbackLikelyWrong(p.x, p.y))
                 {
                     directCx = p.x;
                     directCy = p.y;
@@ -1505,7 +1510,7 @@ namespace Xajh
 
                 // Seed directCache from simple chain if we have nothing better yet,
                 // even when simple is static — this gives zxxy phases a reference.
-                if (simpleResolved && !hasDirectCache && IsPlausibleWorldPos(p.x, p.y))
+                if (simplePlausible && !hasDirectCache)
                 {
                     directCx = p.x;
                     directCy = p.y;
@@ -1528,7 +1533,7 @@ namespace Xajh
                 if (zxxyDirectLockedAddr == 0 && zxxyDirectCandidates.Count > 0)
                 {
                     float refX = float.NaN, refY = float.NaN;
-                    if (simpleResolved && IsPlausibleWorldPos(p.x, p.y))
+                    if (simplePlausible)
                     {
                         refX = p.x; refY = p.y;
                     }
@@ -1585,7 +1590,7 @@ namespace Xajh
                 // +0x4C, +0x7C, +0x84, +0x8C, +0x94 that the chain scanner misses
                 // because the entity's standard chain resolution fails.
                 if (zxxyModuleBase != IntPtr.Zero && zxxyMgrCandidates.Count > 0 &&
-                    (simpleStatic || !simpleResolved))
+                    (simpleStatic || !simplePlausible))
                 {
                     float bestZxxyEntityScore = float.MinValue;
                     float bestZxxyEntityX = 0f, bestZxxyEntityY = 0f, bestZxxyEntityZ = 0f;
@@ -1609,7 +1614,7 @@ namespace Xajh
                             if (!IsPlausibleWorldPos(ex, ey)) continue;
 
                             float score = 0f;
-                            if (simpleResolved && IsPlausibleWorldPos(p.x, p.y))
+                            if (simplePlausible)
                             {
                                 double d = Math.Sqrt(Math.Pow(ex - p.x, 2) + Math.Pow(ey - p.y, 2));
                                 if (d <= 50f) score += 6f;
@@ -1652,7 +1657,7 @@ namespace Xajh
                                 if (!IsPlausibleWorldPos(ex, ey)) continue;
 
                                 float score = 0f;
-                                if (simpleResolved && IsPlausibleWorldPos(p.x, p.y))
+                                if (simplePlausible)
                                 {
                                     double d = Math.Sqrt(Math.Pow(ex - p.x, 2) + Math.Pow(ey - p.y, 2));
                                     if (d <= 50f) score += 6f;
@@ -1672,7 +1677,7 @@ namespace Xajh
                                     else if (d <= 500f) score += 1f;
                                 }
                                 if (po == 0x94) score += 1f;
-                                score += 0.5f; // slight bonus for sub-objects (more likely to hold moving coords)
+                                score += 0.5f;
 
                                 if (score > bestZxxyEntityScore)
                                 {
@@ -1693,7 +1698,7 @@ namespace Xajh
                 }
 
                 // --- Phase 3: direct fallback with known-wrong coordinate rejection ---
-                if (simpleStatic &&
+                if (simpleStatic && simplePlausible &&
                     TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc) &&
                     IsPlausibleWorldPos(rdx, rdy))
                 {
@@ -1701,11 +1706,11 @@ namespace Xajh
                     return (rdx, rdy, rdz);
                 }
 
-                if ((IsUnresolvedSource(dbg.Source) || simpleStatic) &&
+                if ((!simplePlausible || simpleStatic) &&
                     TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc) &&
                     IsPlausibleWorldPos(dx, dy))
                 {
-                    bool directAlsoStatic = simpleStatic &&
+                    bool directAlsoStatic = simpleStatic && simplePlausible &&
                         Math.Abs(dx - p.x) < 1f && Math.Abs(dy - p.y) < 1f;
                     if (directAlsoStatic)
                     {
