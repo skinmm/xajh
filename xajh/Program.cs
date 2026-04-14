@@ -1399,7 +1399,7 @@ namespace Xajh
             Console.WriteLine("=== XAJH Combat Overlay ===");
             Console.WriteLine("[A] Auto-turn+fight toggle    [C] Reset calibration");
             Console.WriteLine("[R] Set radius  [L] List nearby NPCs  [M] Calibrate fallback  [P] Dump player obj");
-            Console.WriteLine("[G] Send /loc command     [W] Refresh window     [End] Exit");
+            Console.WriteLine("[D] Deep scan (move char!)  [G] /loc command  [W] Refresh window  [End] Exit");
             Console.WriteLine();
 
             bool autoFace = false;
@@ -2159,6 +2159,144 @@ namespace Xajh
                                 Console.WriteLine($"[G] /loc result: ({locCmd.LocX:F1}, {locCmd.LocY:F1}, {locCmd.LocZ:F1})");
                             else
                                 Console.WriteLine("[G] /loc: no valid position found in response");
+                        }
+                        else if (key == ConsoleKey.D)
+                        {
+                            // Deep-scan: read the player object tree twice with a delay,
+                            // report every float field that CHANGED. This finds the real
+                            // moving coordinates regardless of which offset they're at.
+                            Console.WriteLine("[D] Deep object scan — move your character NOW...");
+                            IntPtr dsHwnd = GetGameHwnd();
+                            if (dsHwnd != IntPtr.Zero)
+                            {
+                                SetForegroundWindow(dsHwnd);
+                                Thread.Sleep(80);
+                            }
+
+                            // Collect all reachable object addresses from the player chain.
+                            var scanAddrs = new List<(string tag, int addr)>();
+                            foreach (int mo in new[] { 0x9D4518, 0x9D4514 })
+                            {
+                                int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, mo));
+                                if (mgr == 0) continue;
+                                foreach (int lo in new[] { 0x08, 0x0C, 0x04 })
+                                {
+                                    int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, lo));
+                                    if (list == 0) continue;
+                                    foreach (int oo in new[] { 0x4C, 0x48, 0x50, 0x44 })
+                                    {
+                                        int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, oo));
+                                        if (raw == 0 || raw < 0x00100000) continue;
+                                        string rootTag = $"mgr+0x{mo:X}[+0x{lo:X2}]+0x{oo:X2}";
+                                        scanAddrs.Add((rootTag, raw));
+
+                                        // Follow one level of pointers from the root object.
+                                        for (int pOff = 0x04; pOff <= 0x7C; pOff += 4)
+                                        {
+                                            int sub = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, pOff));
+                                            if (sub == 0 || sub == raw || sub < 0x00100000) continue;
+                                            scanAddrs.Add(($"{rootTag}>+0x{pOff:X2}", sub));
+
+                                            // Follow two levels deep.
+                                            for (int pOff2 = 0x04; pOff2 <= 0x40; pOff2 += 4)
+                                            {
+                                                int sub2 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(sub, pOff2));
+                                                if (sub2 == 0 || sub2 == sub || sub2 == raw || sub2 < 0x00100000) continue;
+                                                scanAddrs.Add(($"{rootTag}>+0x{pOff:X2}>+0x{pOff2:X2}", sub2));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Also scan zxxy chain entities.
+                            if (zxxyModuleBase != IntPtr.Zero)
+                            {
+                                foreach (var c in zxxyMgrCandidates)
+                                {
+                                    int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(zxxyModuleBase, c.mgrOff));
+                                    if (mgr < 0x00100000) continue;
+                                    int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, c.listOff));
+                                    if (list < 0x00100000) continue;
+                                    int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, c.objOff));
+                                    if (raw < 0x00100000) continue;
+                                    scanAddrs.Add(($"zxxy:mgr+0x{c.mgrOff:X}", raw));
+                                    for (int pOff = 0x04; pOff <= 0x7C; pOff += 4)
+                                    {
+                                        int sub = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, pOff));
+                                        if (sub == 0 || sub == raw || sub < 0x00100000) continue;
+                                        scanAddrs.Add(($"zxxy:mgr+0x{c.mgrOff:X}>+0x{pOff:X2}", sub));
+                                    }
+                                }
+                            }
+
+                            // Deduplicate by address.
+                            var seen = new HashSet<int>();
+                            var uniqueAddrs = new List<(string tag, int addr)>();
+                            foreach (var a in scanAddrs)
+                            {
+                                if (seen.Add(a.addr))
+                                    uniqueAddrs.Add(a);
+                            }
+
+                            Console.WriteLine($"[D] Scanning {uniqueAddrs.Count} objects (0x200 bytes each)...");
+                            const int ScanLen = 0x200;
+
+                            // Snapshot 1
+                            var snap1 = new Dictionary<int, byte[]>();
+                            foreach (var a in uniqueAddrs)
+                            {
+                                var buf = new byte[ScanLen];
+                                if (MemoryHelper.ReadProcessMemory(hProcess, Ptr32(a.addr), buf, ScanLen, out int rd) && rd >= 0x40)
+                                    snap1[a.addr] = buf;
+                            }
+
+                            Console.WriteLine("[D] Waiting 1.5s — keep moving...");
+                            Thread.Sleep(1500);
+
+                            // Snapshot 2
+                            var snap2 = new Dictionary<int, byte[]>();
+                            foreach (var a in uniqueAddrs)
+                            {
+                                var buf = new byte[ScanLen];
+                                if (MemoryHelper.ReadProcessMemory(hProcess, Ptr32(a.addr), buf, ScanLen, out int rd) && rd >= 0x40)
+                                    snap2[a.addr] = buf;
+                            }
+
+                            // Diff: find floats that changed.
+                            Console.WriteLine("\n── Deep scan: CHANGED float fields ──");
+                            int totalChanged = 0;
+                            foreach (var a in uniqueAddrs)
+                            {
+                                if (!snap1.ContainsKey(a.addr) || !snap2.ContainsKey(a.addr)) continue;
+                                var b1 = snap1[a.addr];
+                                var b2 = snap2[a.addr];
+                                int len = Math.Min(b1.Length, b2.Length);
+                                var changes = new List<string>();
+                                for (int off = 0; off + 4 <= len; off += 4)
+                                {
+                                    float f1 = BitConverter.ToSingle(b1, off);
+                                    float f2 = BitConverter.ToSingle(b2, off);
+                                    if (float.IsNaN(f1) || float.IsNaN(f2)) continue;
+                                    if (float.IsInfinity(f1) || float.IsInfinity(f2)) continue;
+                                    if (Math.Abs(f1) > 1_000_000f || Math.Abs(f2) > 1_000_000f) continue;
+                                    double delta = Math.Abs(f2 - f1);
+                                    if (delta > 0.01 && delta < 50000)
+                                    {
+                                        changes.Add($"    +0x{off:X3}: {f1,12:F1} → {f2,12:F1}  (Δ={delta:F1})");
+                                        totalChanged++;
+                                    }
+                                }
+                                if (changes.Count > 0)
+                                {
+                                    Console.WriteLine($"  {a.tag} obj=0x{a.addr:X8}:");
+                                    foreach (var c in changes)
+                                        Console.WriteLine(c);
+                                }
+                            }
+                            if (totalChanged == 0)
+                                Console.WriteLine("  (no float changes detected — were you moving?)");
+                            Console.WriteLine($"[D] Total changed fields: {totalChanged}\n");
                         }
                         else if (key == ConsoleKey.A)
                         {
