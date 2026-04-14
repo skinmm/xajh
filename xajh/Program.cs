@@ -1301,6 +1301,7 @@ namespace Xajh
             }
 
             var turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+            var locCmd = new LocCommand(hProcess, moduleBase, GetGameHwnd);
             var npcSnapshotLock = new object();
             var npcSnapshot = new List<Npc>();
             try
@@ -1345,6 +1346,7 @@ namespace Xajh
                         playerReader = new PlayerReader(hProcess, moduleBase);
                         combat = new CombatOverlay(hProcess, moduleBase);
                         turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+                        locCmd = new LocCommand(hProcess, moduleBase, GetGameHwnd);
                         TryRefreshZxxyModule(force: true);
                         zxxyDirectCandidates.Clear();
                         zxxyDirectLockedAddr = 0;
@@ -1365,6 +1367,7 @@ namespace Xajh
                     playerReader = new PlayerReader(hProcess, moduleBase);
                     combat = new CombatOverlay(hProcess, moduleBase);
                     turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+                    locCmd = new LocCommand(hProcess, moduleBase, GetGameHwnd);
                     TryRefreshZxxyModule(force: true);
                     zxxyDirectCandidates.Clear();
                     zxxyDirectLockedAddr = 0;
@@ -1402,7 +1405,7 @@ namespace Xajh
             Console.WriteLine("=== XAJH Combat Overlay ===");
             Console.WriteLine("[A] Auto-turn+fight toggle    [C] Reset calibration");
             Console.WriteLine("[R] Set radius  [L] List nearby NPCs  [M] Calibrate fallback  [P] Dump player obj");
-            Console.WriteLine("[W] Refresh window     [End] Exit");
+            Console.WriteLine("[G] Send /loc command     [W] Refresh window     [End] Exit");
             Console.WriteLine();
 
             bool autoFace = false;
@@ -1465,6 +1468,18 @@ namespace Xajh
             (float x, float y, float z) ReadPlayerPos()
             {
                 UpdateNpcCloudCenter();
+
+                // --- Phase 0: /loc command result (authoritative server-side position) ---
+                if (locCmd.HasLoc && locCmd.LocAge < 10000 &&
+                    IsPlausibleWorldPos(locCmd.LocX, locCmd.LocY))
+                {
+                    directCx = locCmd.LocX;
+                    directCy = locCmd.LocY;
+                    directCz = locCmd.LocZ;
+                    hasDirectCache = true;
+                    lastDirectSource = $"loc(age={locCmd.LocAge}ms)";
+                    return (locCmd.LocX, locCmd.LocY, locCmd.LocZ);
+                }
 
                 // --- Pre-evaluate simple chain for reference position & static detection ---
                 // Knowing whether simple is static informs all subsequent phases.
@@ -1755,6 +1770,22 @@ namespace Xajh
                     }
                 }
 
+                // All fallbacks exhausted. If simple is static, try /loc as last resort.
+                if (simpleStatic && simplePlausible)
+                {
+                    locCmd.SendAndRead();
+                    if (locCmd.HasLoc && locCmd.LocAge < 10000 &&
+                        IsPlausibleWorldPos(locCmd.LocX, locCmd.LocY))
+                    {
+                        directCx = locCmd.LocX;
+                        directCy = locCmd.LocY;
+                        directCz = locCmd.LocZ;
+                        hasDirectCache = true;
+                        lastDirectSource = $"loc-auto(age={locCmd.LocAge}ms)";
+                        return (locCmd.LocX, locCmd.LocY, locCmd.LocZ);
+                    }
+                }
+
                 lastDirectSource = simpleStatic ? "simple-static(no-alt-found)" : "";
                 return p;
             }
@@ -1980,6 +2011,8 @@ namespace Xajh
                                 $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1}) simpleStatic={simpleStaticReads} chainStatic={dbg.SimpleChainStaticReads}");
                             if (!string.IsNullOrEmpty(lastDirectSource))
                                 Console.WriteLine($"  [DBG] fallback={lastDirectSource}");
+                            if (locCmd.HasLoc)
+                                Console.WriteLine($"  [DBG] /loc=({locCmd.LocX:F1},{locCmd.LocY:F1},{locCmd.LocZ:F1}) age={locCmd.LocAge}ms");
                             if (zxxyDirectLockedAddr != 0)
                                 Console.WriteLine($"  [DBG] zxxy-direct locked=0x{zxxyDirectLockedAddr:X8} cand={zxxyDirectCandidates.Count}");
                             else if (zxxyDirectCandidates.Count > 0)
@@ -2107,6 +2140,15 @@ namespace Xajh
                         else if (key == ConsoleKey.P)
                         {
                             combat.DumpPlayerObject();
+                        }
+                        else if (key == ConsoleKey.G)
+                        {
+                            Console.WriteLine("[G] Sending /loc command to game...");
+                            bool ok = locCmd.SendAndRead();
+                            if (ok)
+                                Console.WriteLine($"[G] /loc result: ({locCmd.LocX:F1}, {locCmd.LocY:F1}, {locCmd.LocZ:F1})");
+                            else
+                                Console.WriteLine("[G] /loc: no valid position found in response");
                         }
                         else if (key == ConsoleKey.A)
                         {
