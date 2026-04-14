@@ -43,9 +43,9 @@ namespace Xajh
             int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
             int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
             int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0xA4, 0xB4, 0xD4, 0xE4, 0x104, 0x114, 0x4C, 0x7C, 0x84, 0x8C };
-            int[] directPtrOffsets = { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C };
+            int[] directPtrOffsets = { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C, 0x80, 0x84, 0x88, 0x8C, 0x90, 0x94, 0x98, 0x9C, 0xA0 };
             int[] directPtrOffsetsL2 = { 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C };
-            int[] directSubPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x4C, 0x7C, 0x84, 0x8C };
+            int[] directSubPosOffsets = { 0x230, 0x190, 0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x4C, 0x7C, 0x84, 0x8C };
             int preferredDirectMgr = 0x9D4518;
             int preferredDirectList = 0x08;
             int preferredDirectObj = 0x4C;
@@ -577,6 +577,46 @@ namespace Xajh
                 if (Math.Abs(x) > 1_000_000f || Math.Abs(y) > 1_000_000f) return false;
                 if (Math.Abs(x) < 0.001f && Math.Abs(y) < 0.001f) return false;
                 return true;
+            }
+
+            /// <summary>
+            /// Reads player position from the confirmed sub-object chain:
+            ///   playerObj + 0xBC  →  sub-object ptr
+            ///   sub + 0x020       →  float X
+            ///   sub + 0x024       →  float Z (height)
+            ///   sub + 0x028       →  float Y
+            ///
+            /// Memory layout is (X, Z, Y); we return (X, Y, Z) for caller consistency.
+            /// Accuracy: ~10 units vs /loc (visual interpolation lag); far better than
+            /// the ~30-unit error from a wrong direct-offset read.
+            /// </summary>
+            bool TryReadSubPtrPos(IntPtr playerObj, out float x, out float y, out float z)
+            {
+                x = 0f; y = 0f; z = 0f;
+                try
+                {
+                    const int SubPtrOffset = 0xBC;
+                    const int PosInSub = 0x020;
+
+                    int subRaw = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(playerObj, SubPtrOffset));
+                    if (subRaw == 0 || subRaw < 0x00100000) return false;
+
+                    var sub = new IntPtr(unchecked((uint)subRaw));
+
+                    // Storage order in memory: (X, Z/height, Y) — swap back to (X, Y, Z)
+                    float rx = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(sub, PosInSub));
+                    float rz = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(sub, PosInSub + 4));  // height
+                    float ry = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(sub, PosInSub + 8));
+
+                    if (float.IsNaN(rx) || float.IsNaN(ry) || float.IsNaN(rz)) return false;
+                    if (float.IsInfinity(rx) || float.IsInfinity(ry) || float.IsInfinity(rz)) return false;
+                    if (Math.Abs(rx) > 1_000_000f || Math.Abs(ry) > 1_000_000f || Math.Abs(rz) > 1_000_000f) return false;
+                    if (Math.Abs(rx) < 1f && Math.Abs(ry) < 1f) return false;
+
+                    x = rx; y = ry; z = rz;
+                    return true;
+                }
+                catch { return false; }
             }
 
             bool TryAutoLockGlobalXY(float currentX, float currentY)
@@ -1485,6 +1525,39 @@ namespace Xajh
                     return (locCmd.LocX, locCmd.LocY, locCmd.LocZ);
                 }
 
+                // --- Phase 0.5: sub-object at playerObj+0xBC (confirmed by dump, ~10u accuracy) ---
+                // Probe both list offsets (+0x08 and +0x0C) and both obj offsets (+0x4C and +0x50).
+                // Deep scan confirmed the LIVE player object is on list+0x0C/obj+0x50, while
+                // list+0x08/obj+0x4C can be stale when the simple chain freezes.
+                {
+                    int sub05Mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                    if (sub05Mgr != 0)
+                    {
+                        // Probe order: try +0x0C first (confirmed live), then +0x08 (standard)
+                        int[] sub05ListOffs = { 0x0C, 0x08 };
+                        int[] sub05ObjOffs = { 0x50, 0x4C };
+                        foreach (int sub05Lo in sub05ListOffs)
+                        {
+                            int sub05List = MemoryHelper.ReadInt32(hProcess, Ptr32Add(sub05Mgr, sub05Lo));
+                            if (sub05List == 0 || sub05List < 0x00100000) continue;
+                            foreach (int sub05Oo in sub05ObjOffs)
+                            {
+                                int sub05ObjRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(sub05List, sub05Oo));
+                                if (sub05ObjRaw == 0 || sub05ObjRaw < 0x00100000) continue;
+                                var sub05Obj = Ptr32(sub05ObjRaw);
+                                if (TryReadSubPtrPos(sub05Obj, out float spx, out float spy, out float spz) &&
+                                    IsPlausibleWorldPos(spx, spy) &&
+                                    !IsDirectFallbackLikelyWrong(spx, spy))
+                                {
+                                    directCx = spx; directCy = spy; directCz = spz; hasDirectCache = true;
+                                    lastDirectSource = $"sub-0xBC(list=0x{sub05Lo:X2},obj=0x{sub05Oo:X2},ptr=0x{sub05ObjRaw:X8})";
+                                    return (spx, spy, spz);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // --- Pre-evaluate simple chain for reference position & static detection ---
                 // Knowing whether simple is static informs all subsequent phases.
                 var p = playerReader.Get();
@@ -1721,6 +1794,7 @@ namespace Xajh
                 {
                     // 2-link chains: mgr→list→obj→sub1→pos
                     int[][] chains2 = {
+                        new[] { 0x9D4518, 0x08, 0x4C, 0xBC },   // standard player chain → sub-0xBC (confirmed)
                         new[] { 0x9D4520, 0x0C, 0x4C, 0x0C },
                         new[] { 0x9D4520, 0x0C, 0x48, 0x0C },
                         new[] { 0x9D4520, 0x0C, 0x58, 0x04 },
@@ -1731,6 +1805,7 @@ namespace Xajh
                     };
                     // 3-link chains: mgr→list→obj→sub1→sub2→pos
                     int[][] chains3 = {
+                        new[] { 0x9D4518, 0x0C, 0x50, 0x04, 0x90 },   // CONFIRMED: deep scan live pos at +0x230
                         new[] { 0x9D4520, 0x0C, 0x4C, 0x0C, 0x4C },
                         new[] { 0x9D4520, 0x0C, 0x48, 0x0C, 0x4C },
                         new[] { 0x9D4520, 0x0C, 0x58, 0x04, 0x70 },
@@ -1740,7 +1815,8 @@ namespace Xajh
                         new[] { 0x9D4520, 0x0C, 0x58, 0xBC, 0x70 },
                         new[] { 0x9D4520, 0x0C, 0x40, 0xB8, 0x24 },
                     };
-                    int[] probePosOffsets = { 0x94, 0x64, 0x34, 0xC4, 0x20, 0x24, 0x28, 0x4C, 0x68 };
+                    // 0x230/0x190 confirmed by deep scan; 0x020 confirmed by focused dump
+                    int[] probePosOffsets = { 0x230, 0x190, 0x020, 0x94, 0x64, 0x34, 0xC4, 0x24, 0x28, 0x4C, 0x68 };
 
                     var endpoints = new List<(IntPtr ptr, string tag, bool is2link)>();
 
@@ -1846,6 +1922,43 @@ namespace Xajh
                         {
                             var r = probeResults[i];
                             Console.WriteLine($"  [DBG] targeted#{i}: ({r.x:F1},{r.y:F1},{r.z:F1}) mv={r.mv:F2} 2L={r.is2link} {r.src}");
+                        }
+                    }
+                }
+
+                // --- Phase 2d: 4-hop backup chain confirmed by deep scan ---
+                // mgr+0x9D4524 → [+0x0C] → [+0x50] → [+0x70] → [+0xA0] → [+0x0C] → +0x190 = (X,Y,Z)
+                // Also probes the companion chain via 0x9D4518[+0x0C]+0x50 at pos +0x230.
+                if (simpleStatic || !simplePlausible)
+                {
+                    // 4-hop chain: { mgrOff, listOff, objOff, sub1Off, sub2Off, sub3Off }
+                    int[][] chains4 = {
+                        new[] { 0x9D4524, 0x0C, 0x50, 0x70, 0xA0, 0x0C },  // CONFIRMED: pos at +0x190
+                    };
+                    int[] p4PosOffs = { 0x190, 0x230, 0x94, 0x64, 0x34 };
+
+                    foreach (var c4 in chains4)
+                    {
+                        int mg4 = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, c4[0]));
+                        if (mg4 == 0) continue;
+                        int li4 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mg4, c4[1]));
+                        if (li4 == 0) continue;
+                        int ob4 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(li4, c4[2]));
+                        if (ob4 == 0 || ob4 < 0x00100000) continue;
+                        int s1 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(ob4, c4[3]));
+                        if (s1 == 0 || s1 == ob4 || s1 < 0x00100000) continue;
+                        int s2 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(s1, c4[4]));
+                        if (s2 == 0 || s2 == s1 || s2 < 0x00100000) continue;
+                        int s3 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(s2, c4[5]));
+                        if (s3 == 0 || s3 == s2 || s3 < 0x00100000) continue;
+                        var ep4 = Ptr32(s3);
+                        foreach (int p4po in p4PosOffs)
+                        {
+                            if (!TryReadStablePos(hProcess, ep4, p4po, out float e4x, out float e4y, out float e4z)) continue;
+                            if (!IsStrictPlausiblePos(e4x, e4y)) continue;
+                            directCx = e4x; directCy = e4y; directCz = e4z; hasDirectCache = true;
+                            lastDirectSource = $"chain4(mgr=0x{c4[0]:X},pos=0x{p4po:X2},ep=0x{s3:X8})";
+                            return (e4x, e4y, e4z);
                         }
                     }
                 }
@@ -2306,6 +2419,7 @@ namespace Xajh
                         {
                             // Focused dump: read the exact +0xBC sub-object from the
                             // known chain and print ALL float triplets for offset comparison.
+                            // sub+0x020 is the confirmed position triplet (X, Z/height, Y).
                             Console.WriteLine("[F] Focused dump of targeted chain endpoint...");
                             int fMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4520));
                             int fList = fMgr != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(fMgr, 0x0C)) : 0;
@@ -2314,6 +2428,27 @@ namespace Xajh
                             {
                                 // Try obj offset 0x4C as fallback
                                 fObj = fList != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(fList, 0x4C)) : 0;
+                            }
+
+                            // Also resolve the primary standard-chain sub-0xBC and print it first.
+                            {
+                                int sMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                                int sList = sMgr != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(sMgr, 0x08)) : 0;
+                                int sObj = sList != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(sList, 0x4C)) : 0;
+                                if (sObj != 0 && sObj >= 0x00100000)
+                                {
+                                    var sObjPtr = Ptr32(sObj);
+                                    if (TryReadSubPtrPos(sObjPtr, out float cpx, out float cpy, out float cpz))
+                                    {
+                                        Console.WriteLine($"\n[F] ★ Standard chain sub-0xBC position:");
+                                        Console.WriteLine($"    playerObj=0x{sObj:X8}  sub+0x020 → X={cpx:F2}  Y={cpy:F2}  Z(h)={cpz:F2}");
+                                        Console.WriteLine($"    (memory order X,Z,Y; ~10u from /loc — render interpolation lag)");
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine($"\n[F] Standard chain sub-0xBC: playerObj=0x{sObj:X8} → sub ptr null/invalid");
+                                    }
+                                }
                             }
                             if (fObj != 0 && fObj >= 0x00100000)
                             {
