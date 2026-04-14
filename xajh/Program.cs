@@ -640,12 +640,15 @@ namespace Xajh
             bool TryReadDirectPlayerPos(
                 IntPtr hProcess, IntPtr moduleBase,
                 out float x, out float y, out float z, out string source,
-                bool avoidKnownStaticRoot = false)
+                bool avoidKnownStaticRoot = false,
+                float rejectX = float.NaN, float rejectY = float.NaN)
             {
                 x = 0f; y = 0f; z = 0f; source = "direct:none";
+                bool hasRejectLock = !float.IsNaN(rejectX) && !float.IsNaN(rejectY);
 
                 // Strict lock mode: when calibration selected a chain, never hop to unrelated chains.
-                if (directCalibLock.HasValue)
+                // However if the lock returns the known-wrong coordinates, break out.
+                if (directCalibLock.HasValue && !hasRejectLock)
                 {
                     var lk = directCalibLock.Value;
                     int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, lk.mgr));
@@ -837,6 +840,47 @@ namespace Xajh
                 if (samples.Count == 0)
                     CollectSamples(mgrOrder.ToArray(), directListOffsets, directObjOffsets);
 
+                // Phase 3: walk linked list nodes (like NpcReader) when rejecting coordinates.
+                // The player entity list may be a linked list where node+0x0C = next, node+0x4C = entity.
+                if (!float.IsNaN(rejectX) && !float.IsNaN(rejectY))
+                {
+                    foreach (int mo in new[] { 0x9D4518, 0x9D4514 })
+                    {
+                        int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, mo));
+                        if (mgr == 0) continue;
+                        int container = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, 0x04));
+                        if (container == 0) continue;
+                        int firstNode = MemoryHelper.ReadInt32(hProcess, Ptr32Add(container, 0x04));
+                        if (firstNode == 0) continue;
+
+                        uint node = (uint)firstNode;
+                        int safety = 0;
+                        while (node != 0 && safety++ < 200)
+                        {
+                            int entRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add((int)node, 0x4C));
+                            if (entRaw != 0 && entRaw > 0x00100000)
+                            {
+                                var entObj = Ptr32(entRaw);
+                                var entCandidates = new List<(int po, float x, float y, float z, bool seeded)>();
+                                CollectPosCandidatesFromAddress(hProcess, entObj, 0x240, directPosOffsets, entCandidates);
+                                foreach (var c in entCandidates)
+                                    samples.Add((mo, 0x08, 0x4C, -1, c.po, c.x, c.y, c.z, c.seeded));
+
+                                foreach (int linkOff in directPtrOffsets)
+                                {
+                                    int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(entRaw, linkOff));
+                                    if (subRaw == 0 || subRaw == entRaw || subRaw < 0x00100000) continue;
+                                    var subCand = new List<(int po, float x, float y, float z, bool seeded)>();
+                                    CollectPosCandidatesFromAddress(hProcess, Ptr32(subRaw), 0x180, directSubPosOffsets, subCand);
+                                    foreach (var c in subCand)
+                                        samples.Add((mo, 0x08, 0x4C, linkOff, c.po, c.x, c.y, c.z, c.seeded));
+                                }
+                            }
+                            node = (uint)MemoryHelper.ReadInt32(hProcess, Ptr32Add((int)node, 0x0C));
+                        }
+                    }
+                }
+
                 if (samples.Count == 0) return false;
 
                 bool preferredLooksStatic = false;
@@ -873,21 +917,31 @@ namespace Xajh
                 else
                     preferredDirectStaticReads = 0;
 
+                bool hasReject = !float.IsNaN(rejectX) && !float.IsNaN(rejectY);
+
                 float bestScore = float.MinValue;
                 int bestMgr = 0, bestList = 0, bestObj = 0, bestLink = -1, bestPos = 0;
                 foreach (var s in samples)
                 {
+                    // Hard reject: skip candidates matching the known-wrong position.
+                    if (hasReject &&
+                        Math.Abs(s.x - rejectX) < 1f && Math.Abs(s.y - rejectY) < 1f)
+                        continue;
+
                     bool isPref = s.mo == preferredDirectMgr &&
                                   s.lo == preferredDirectList &&
                                   s.oo == preferredDirectObj &&
                                   s.link == preferredDirectLink &&
                                   s.po == preferredDirectPos;
                     float score = 0f;
-                    if (s.mo == preferredDirectMgr) score += 2f;
-                    if (s.lo == preferredDirectList) score += 1f;
-                    if (s.oo == preferredDirectObj) score += 1f;
-                    if (s.link == preferredDirectLink) score += 1f;
-                    if (s.po == preferredDirectPos) score += 2f;
+                    if (!hasReject)
+                    {
+                        if (s.mo == preferredDirectMgr) score += 2f;
+                        if (s.lo == preferredDirectList) score += 1f;
+                        if (s.oo == preferredDirectObj) score += 1f;
+                        if (s.link == preferredDirectLink) score += 1f;
+                        if (s.po == preferredDirectPos) score += 2f;
+                    }
                     if (s.lo == 0x08) score += 1f;
                     if (s.oo == 0x4C) score += 1f;
                     if (s.oo == 0x48) score += 0.7f;
@@ -897,7 +951,15 @@ namespace Xajh
                     if (avoidKnownStaticRoot && s.link != -1) score += 1.5f;
                     if (avoidKnownStaticRoot && s.link == -1 && s.po == 0x94) score -= 3f;
 
-                    if (hasDirectCache)
+                    if (hasLastNpcCloudCenter)
+                    {
+                        double dNpc = Math.Sqrt(Math.Pow(s.x - lastNpcCloudCenterX, 2) + Math.Pow(s.y - lastNpcCloudCenterY, 2));
+                        if (dNpc <= 3000.0) score += 3f;
+                        else if (dNpc <= 8000.0) score += 1f;
+                        else if (dNpc > 15000.0) score -= 5f;
+                    }
+
+                    if (hasDirectCache && !hasReject)
                     {
                         double d = Math.Sqrt(Math.Pow(s.x - directCx, 2) + Math.Pow(s.y - directCy, 2));
                         if (d <= 20f) score += 4f;
@@ -1303,9 +1365,10 @@ namespace Xajh
                 return TryReadDirectPlayerPos(hProcess, moduleBase, out x, out y, out z, out source);
             }
 
-            bool TryReadPlayerDirectAvoidStaticAnchor(out float x, out float y, out float z, out string source)
+            bool TryReadPlayerDirectRejectCoords(float rjX, float rjY, out float x, out float y, out float z, out string source)
             {
-                return TryReadDirectPlayerPos(hProcess, moduleBase, out x, out y, out z, out source, avoidKnownStaticRoot: true);
+                return TryReadDirectPlayerPos(hProcess, moduleBase, out x, out y, out z, out source,
+                    avoidKnownStaticRoot: true, rejectX: rjX, rejectY: rjY);
             }
 
             (float x, float y, float z) ReadPlayerPos()
@@ -1369,7 +1432,20 @@ namespace Xajh
                     return p;
                 }
 
-                // --- Phase 4: direct fallback paths ---
+                // --- Phase 4: direct fallback with known-wrong coordinate rejection ---
+                // When simpleStatic, we know the exact wrong coordinates. Reject any
+                // candidate that matches them so we can find the REAL moving position.
+                if (simpleStatic &&
+                    TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc))
+                {
+                    if (!IsDirectFallbackLikelyWrong(rdx, rdy))
+                    {
+                        directCx = rdx; directCy = rdy; directCz = rdz; hasDirectCache = true;
+                        lastDirectSource = $"reject-static({p.x:F0},{p.y:F0})->{rdsrc}";
+                        return (rdx, rdy, rdz);
+                    }
+                }
+
                 if ((IsUnresolvedSource(dbg.Source) || simpleStatic) &&
                     TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc))
                 {
@@ -1387,58 +1463,45 @@ namespace Xajh
                             return (dx, dy, dz);
                         }
                     }
-                    if (hasDirectCache)
-                    {
-                        double dd = Math.Sqrt(Math.Pow(dx - directCx, 2) + Math.Pow(dy - directCy, 2));
-                        if (dd < 0.01) fallbackStaticReads++;
-                        else fallbackStaticReads = 0;
-                    }
 
-                    if (fallbackStaticReads >= 2 && TryAutoLockGlobalXY(dx, dy))
+                    // If the regular direct path returns the same static coords, skip it.
+                    bool directAlsoStatic = simpleStatic &&
+                        Math.Abs(dx - p.x) < 1f && Math.Abs(dy - p.y) < 1f;
+                    if (directAlsoStatic)
                     {
-                        lastDirectSource = $"{dsrc},glob=lock";
+                        fallbackStaticReads++;
+                        lastDirectSource = dsrc;
                     }
                     else
                     {
-                        lastDirectSource = dsrc;
+                        if (hasDirectCache)
+                        {
+                            double dd = Math.Sqrt(Math.Pow(dx - directCx, 2) + Math.Pow(dy - directCy, 2));
+                            if (dd < 0.01) fallbackStaticReads++;
+                            else fallbackStaticReads = 0;
+                        }
+
+                        if (fallbackStaticReads >= 2 && TryAutoLockGlobalXY(dx, dy))
+                            lastDirectSource = $"{dsrc},glob=lock";
+                        else
+                            lastDirectSource = dsrc;
+
+                        if (fallbackStaticReads >= 2 && TryReadGlobalXYLocked(out float gx, out float gy))
+                        {
+                            directCx = gx; directCy = gy; directCz = dz; hasDirectCache = true;
+                            lastDirectSource = $"{lastDirectSource},glob=use";
+                            return (gx, gy, dz);
+                        }
+
+                        if (fallbackStaticReads >= 2 && TryReadGlobalXYModule(out float mx, out float my))
+                        {
+                            directCx = mx; directCy = my; directCz = dz; hasDirectCache = true;
+                            lastDirectSource = $"{lastDirectSource},glob=module";
+                            return (mx, my, dz);
+                        }
+
+                        return (dx, dy, dz);
                     }
-
-                    if (fallbackStaticReads >= 2 && TryReadGlobalXYLocked(out float gx, out float gy))
-                    {
-                        directCx = gx; directCy = gy; directCz = dz; hasDirectCache = true;
-                        lastDirectSource = $"{lastDirectSource},glob=use";
-                        return (gx, gy, dz);
-                    }
-
-                    if (fallbackStaticReads >= 2 && TryReadGlobalXYModule(out float mx, out float my))
-                    {
-                        directCx = mx; directCy = my; directCz = dz; hasDirectCache = true;
-                        lastDirectSource = $"{lastDirectSource},glob=module";
-                        return (mx, my, dz);
-                    }
-
-                    if (fallbackStaticReads >= 1 &&
-                        TryReadPlayerDirectAvoidStaticAnchor(out float adx, out float ady, out float adz, out string adsrc))
-                    {
-                        lastDirectSource = $"{lastDirectSource},skip-static-anchor->{adsrc}";
-                        return (adx, ady, adz);
-                    }
-
-                    return (dx, dy, dz);
-                }
-
-                if (simpleStatic &&
-                    TryReadPlayerDirectAvoidStaticAnchor(out float sax, out float say, out float saz, out string sasrc))
-                {
-                    lastDirectSource = $"simple-static,skip-static-anchor->{sasrc}";
-                    return (sax, say, saz);
-                }
-
-                if (simpleStatic &&
-                    TryReadPlayerDirect(out float sx, out float sy, out float sz, out string ssrc))
-                {
-                    lastDirectSource = $"simple-static,{ssrc}";
-                    return (sx, sy, sz);
                 }
                 lastDirectSource = "";
                 return p;
