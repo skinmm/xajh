@@ -42,10 +42,10 @@ namespace Xajh
             int[] directMgrOffsets = { 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4520, 0x9D4524, 0x9D450C };
             int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
             int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
-            int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0xA4, 0xB4, 0xD4, 0xE4, 0x104, 0x114 };
+            int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0xA4, 0xB4, 0xD4, 0xE4, 0x104, 0x114, 0x4C, 0x7C, 0x84, 0x8C };
             int[] directPtrOffsets = { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C };
             int[] directPtrOffsetsL2 = { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40 };
-            int[] directSubPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30 };
+            int[] directSubPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x4C, 0x7C, 0x84, 0x8C };
             int preferredDirectMgr = 0x9D4518;
             int preferredDirectList = 0x08;
             int preferredDirectObj = 0x4C;
@@ -1466,28 +1466,11 @@ namespace Xajh
             {
                 UpdateNpcCloudCenter();
 
-                // --- Phase 1: zxxy.dll direct float scan (authoritative, like xajhtoy.exe) ---
-                if (TryReadPlayerPosViaZxxyDirect(out float zdx, out float zdy, out float zdz, out string zdsrc) &&
-                    IsPlausibleWorldPos(zdx, zdy))
-                {
-                    lastDirectSource = zdsrc;
-                    return (zdx, zdy, zdz);
-                }
-
-                // --- Phase 2: zxxy.dll pointer chain scan (existing approach) ---
-                if (TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc) &&
-                    IsPlausibleWorldPos(zx, zy))
-                {
-                    lastDirectSource = zxsrc;
-                    return (zx, zy, zz);
-                }
-
-                // --- Phase 3: main module chain (PlayerReader) ---
+                // --- Pre-evaluate simple chain for reference position & static detection ---
+                // Knowing whether simple is static informs all subsequent phases.
                 var p = playerReader.Get();
                 var dbg = playerReader.GetDebugSnapshot();
 
-                // Detect frozen simple chain: same coords as last read.
-                // simpleStaticReads only resets when the simple chain values actually CHANGE.
                 bool simpleResolved = !IsUnresolvedSource(dbg.Source);
                 if (simpleResolved)
                 {
@@ -1509,8 +1492,7 @@ namespace Xajh
 
                 bool simpleStatic = simpleStaticReads >= 2;
 
-                // If simple chain is resolved, not static, and not implausibly far
-                // from NPC cloud, trust it.
+                // If simple chain is resolved, moving, and plausible, trust it immediately.
                 if (simpleResolved && !simpleStatic && !IsDirectFallbackLikelyWrong(p.x, p.y))
                 {
                     directCx = p.x;
@@ -1521,10 +1503,196 @@ namespace Xajh
                     return p;
                 }
 
-                // --- Phase 4: direct fallback with known-wrong coordinate rejection ---
-                // When simpleStatic, we know the exact wrong coordinates. Reject any
-                // candidate that matches them so we can find the REAL moving position.
-                // The result must have significant magnitude to avoid near-zero garbage.
+                // Seed directCache from simple chain if we have nothing better yet,
+                // even when simple is static — this gives zxxy phases a reference.
+                if (simpleResolved && !hasDirectCache && IsPlausibleWorldPos(p.x, p.y))
+                {
+                    directCx = p.x;
+                    directCy = p.y;
+                    directCz = p.z;
+                    hasDirectCache = true;
+                }
+
+                // --- Phase 1: zxxy.dll direct float scan (authoritative, like xajhtoy.exe) ---
+                if (TryReadPlayerPosViaZxxyDirect(out float zdx, out float zdy, out float zdz, out string zdsrc) &&
+                    IsPlausibleWorldPos(zdx, zdy))
+                {
+                    lastDirectSource = zdsrc;
+                    directCx = zdx; directCy = zdy; directCz = zdz; hasDirectCache = true;
+                    return (zdx, zdy, zdz);
+                }
+
+                // --- Phase 1b: zxxy-direct proximity fallback ---
+                // When motion detection fails (all candidates motion=0), pick the candidate
+                // closest to a known reference (simple chain or NPC cloud center).
+                if (zxxyDirectLockedAddr == 0 && zxxyDirectCandidates.Count > 0)
+                {
+                    float refX = float.NaN, refY = float.NaN;
+                    if (simpleResolved && IsPlausibleWorldPos(p.x, p.y))
+                    {
+                        refX = p.x; refY = p.y;
+                    }
+                    else if (hasLastNpcCloudCenter)
+                    {
+                        refX = (float)lastNpcCloudCenterX;
+                        refY = (float)lastNpcCloudCenterY;
+                    }
+                    else if (hasDirectCache)
+                    {
+                        refX = directCx; refY = directCy;
+                    }
+
+                    if (!float.IsNaN(refX))
+                    {
+                        float bestProxScore = float.MaxValue;
+                        long bestProxAddr = 0;
+                        float bestProxX = 0f, bestProxY = 0f, bestProxZ = 0f;
+                        foreach (var c in zxxyDirectCandidates)
+                        {
+                            double d = Math.Sqrt(Math.Pow(c.lastX - refX, 2) + Math.Pow(c.lastY - refY, 2));
+                            if (d > 500.0) continue;
+                            if (d < bestProxScore)
+                            {
+                                bestProxScore = (float)d;
+                                bestProxAddr = c.addr;
+                                bestProxX = c.lastX; bestProxY = c.lastY; bestProxZ = c.lastZ;
+                            }
+                        }
+
+                        if (bestProxAddr != 0 && IsPlausibleWorldPos(bestProxX, bestProxY))
+                        {
+                            zxxyDirectLockedAddr = bestProxAddr;
+                            zxxyDirectLockedLastX = bestProxX;
+                            zxxyDirectLockedLastY = bestProxY;
+                            zxxyDirectStaleReads = 0;
+                            lastDirectSource = $"zxxy-direct-prox(addr=0x{bestProxAddr:X8},dist={bestProxScore:F0},ref=simple)";
+                            directCx = bestProxX; directCy = bestProxY; directCz = bestProxZ; hasDirectCache = true;
+                            return (bestProxX, bestProxY, bestProxZ);
+                        }
+                    }
+                }
+
+                // --- Phase 2: zxxy.dll pointer chain scan (existing approach) ---
+                if (TryReadPlayerPosViaZxxy(out float zx, out float zy, out float zz, out string zxsrc) &&
+                    IsPlausibleWorldPos(zx, zy))
+                {
+                    lastDirectSource = zxsrc;
+                    return (zx, zy, zz);
+                }
+
+                // --- Phase 2b: probe zxxy chain entities at expanded offsets ---
+                // On some maps, zxxy chain entities store positions at offsets like
+                // +0x4C, +0x7C, +0x84, +0x8C, +0x94 that the chain scanner misses
+                // because the entity's standard chain resolution fails.
+                if (zxxyModuleBase != IntPtr.Zero && zxxyMgrCandidates.Count > 0 &&
+                    (simpleStatic || !simpleResolved))
+                {
+                    float bestZxxyEntityScore = float.MinValue;
+                    float bestZxxyEntityX = 0f, bestZxxyEntityY = 0f, bestZxxyEntityZ = 0f;
+                    string bestZxxyEntitySrc = "";
+                    int[] expandedPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0x4C, 0x7C, 0x84, 0x8C, 0x60, 0xA4 };
+
+                    foreach (var c in zxxyMgrCandidates)
+                    {
+                        int mgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(zxxyModuleBase, c.mgrOff));
+                        if (mgr < 0x00100000) continue;
+                        int list = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr, c.listOff));
+                        if (list < 0x00100000) continue;
+                        int raw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list, c.objOff));
+                        if (raw < 0x00100000) continue;
+                        var objPtr = Ptr32(raw);
+
+                        foreach (int po in expandedPosOffsets)
+                        {
+                            if (!TryReadStablePos(hProcess, objPtr, po, out float ex, out float ey, out float ez))
+                                continue;
+                            if (!IsPlausibleWorldPos(ex, ey)) continue;
+
+                            float score = 0f;
+                            if (simpleResolved && IsPlausibleWorldPos(p.x, p.y))
+                            {
+                                double d = Math.Sqrt(Math.Pow(ex - p.x, 2) + Math.Pow(ey - p.y, 2));
+                                if (d <= 50f) score += 6f;
+                                else if (d <= 300f) score += 3f;
+                                else if (d > 5000f) score -= 5f;
+                            }
+                            if (hasLastNpcCloudCenter)
+                            {
+                                double d = Math.Sqrt(Math.Pow(ex - lastNpcCloudCenterX, 2) + Math.Pow(ey - lastNpcCloudCenterY, 2));
+                                if (d <= 3000.0) score += 2f;
+                                else if (d > 15000.0) score -= 5f;
+                            }
+                            if (hasDirectCache)
+                            {
+                                double d = Math.Sqrt(Math.Pow(ex - directCx, 2) + Math.Pow(ey - directCy, 2));
+                                if (d <= 50f) score += 4f;
+                                else if (d <= 500f) score += 1f;
+                            }
+                            if (po == 0x94) score += 1f;
+
+                            if (score > bestZxxyEntityScore)
+                            {
+                                bestZxxyEntityScore = score;
+                                bestZxxyEntityX = ex; bestZxxyEntityY = ey; bestZxxyEntityZ = ez;
+                                bestZxxyEntitySrc = $"zxxy-entity(mgr=0x{c.mgrOff:X},obj=0x{raw:X8},pos=0x{po:X2},score={score:F1})";
+                            }
+                        }
+
+                        // Also follow pointer fields from the entity to sub-objects
+                        foreach (int ptrOff in directPtrOffsets)
+                        {
+                            int subRaw = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw, ptrOff));
+                            if (subRaw == 0 || subRaw == raw || subRaw < 0x00100000) continue;
+                            var subPtr = Ptr32(subRaw);
+
+                            foreach (int po in expandedPosOffsets)
+                            {
+                                if (!TryReadStablePos(hProcess, subPtr, po, out float ex, out float ey, out float ez))
+                                    continue;
+                                if (!IsPlausibleWorldPos(ex, ey)) continue;
+
+                                float score = 0f;
+                                if (simpleResolved && IsPlausibleWorldPos(p.x, p.y))
+                                {
+                                    double d = Math.Sqrt(Math.Pow(ex - p.x, 2) + Math.Pow(ey - p.y, 2));
+                                    if (d <= 50f) score += 6f;
+                                    else if (d <= 300f) score += 3f;
+                                    else if (d > 5000f) score -= 5f;
+                                }
+                                if (hasLastNpcCloudCenter)
+                                {
+                                    double d = Math.Sqrt(Math.Pow(ex - lastNpcCloudCenterX, 2) + Math.Pow(ey - lastNpcCloudCenterY, 2));
+                                    if (d <= 3000.0) score += 2f;
+                                    else if (d > 15000.0) score -= 5f;
+                                }
+                                if (hasDirectCache)
+                                {
+                                    double d = Math.Sqrt(Math.Pow(ex - directCx, 2) + Math.Pow(ey - directCy, 2));
+                                    if (d <= 50f) score += 4f;
+                                    else if (d <= 500f) score += 1f;
+                                }
+                                if (po == 0x94) score += 1f;
+                                score += 0.5f; // slight bonus for sub-objects (more likely to hold moving coords)
+
+                                if (score > bestZxxyEntityScore)
+                                {
+                                    bestZxxyEntityScore = score;
+                                    bestZxxyEntityX = ex; bestZxxyEntityY = ey; bestZxxyEntityZ = ez;
+                                    bestZxxyEntitySrc = $"zxxy-entity-sub(mgr=0x{c.mgrOff:X},obj=0x{raw:X8},ptr=0x{ptrOff:X2},sub=0x{subRaw:X8},pos=0x{po:X2},score={score:F1})";
+                                }
+                            }
+                        }
+                    }
+
+                    if (bestZxxyEntityScore > 2f && IsPlausibleWorldPos(bestZxxyEntityX, bestZxxyEntityY))
+                    {
+                        lastDirectSource = bestZxxyEntitySrc;
+                        directCx = bestZxxyEntityX; directCy = bestZxxyEntityY; directCz = bestZxxyEntityZ; hasDirectCache = true;
+                        return (bestZxxyEntityX, bestZxxyEntityY, bestZxxyEntityZ);
+                    }
+                }
+
+                // --- Phase 3: direct fallback with known-wrong coordinate rejection ---
                 if (simpleStatic &&
                     TryReadPlayerDirectRejectCoords(p.x, p.y, out float rdx, out float rdy, out float rdz, out string rdsrc) &&
                     IsPlausibleWorldPos(rdx, rdy))
@@ -1537,7 +1705,6 @@ namespace Xajh
                     TryReadPlayerDirect(out float dx, out float dy, out float dz, out string dsrc) &&
                     IsPlausibleWorldPos(dx, dy))
                 {
-                    // If the regular direct path returns the same static coords, skip it.
                     bool directAlsoStatic = simpleStatic &&
                         Math.Abs(dx - p.x) < 1f && Math.Abs(dy - p.y) < 1f;
                     if (directAlsoStatic)
@@ -1583,8 +1750,6 @@ namespace Xajh
                     }
                 }
 
-                // All fallbacks exhausted or returned static/garbage — return simple
-                // chain value. It's wrong but at least stable.
                 lastDirectSource = simpleStatic ? "simple-static(no-alt-found)" : "";
                 return p;
             }

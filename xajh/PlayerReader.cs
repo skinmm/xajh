@@ -67,8 +67,9 @@ namespace xajh
         };
         readonly int[] _candidatePosOffsets =
         {
-            // Translation triplets from four 3x3 matrix blocks inside player object.
-            0x94, 0x34, 0x64, 0xC4
+            // Translation triplets from four 3x3 matrix blocks inside player object,
+            // plus offsets observed in zxxy chain entity dumps on problematic maps.
+            0x94, 0x34, 0x64, 0xC4, 0x4C, 0x7C, 0x84, 0x8C
         };
 
         readonly IntPtr _h, _m;
