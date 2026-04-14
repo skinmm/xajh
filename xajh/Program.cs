@@ -1399,7 +1399,7 @@ namespace Xajh
             Console.WriteLine("=== XAJH Combat Overlay ===");
             Console.WriteLine("[A] Auto-turn+fight toggle    [C] Reset calibration");
             Console.WriteLine("[R] Set radius  [L] List nearby NPCs  [M] Calibrate fallback  [P] Dump player obj");
-            Console.WriteLine("[D] Deep scan (move char!)  [G] /loc command  [W] Refresh window  [End] Exit");
+            Console.WriteLine("[D] Deep scan  [F] Focused dump  [G] /loc  [W] Refresh window  [End] Exit");
             Console.WriteLine();
 
             bool autoFace = false;
@@ -2301,6 +2301,51 @@ namespace Xajh
                                 Console.WriteLine($"[G] /loc result: ({locCmd.LocX:F1}, {locCmd.LocY:F1}, {locCmd.LocZ:F1})");
                             else
                                 Console.WriteLine("[G] /loc: no valid position found in response");
+                        }
+                        else if (key == ConsoleKey.F)
+                        {
+                            // Focused dump: read the exact +0xBC sub-object from the
+                            // known chain and print ALL float triplets for offset comparison.
+                            Console.WriteLine("[F] Focused dump of targeted chain endpoint...");
+                            int fMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4520));
+                            int fList = fMgr != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(fMgr, 0x0C)) : 0;
+                            int fObj = fList != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(fList, 0x58)) : 0;
+                            if (fObj == 0 || fObj < 0x00100000)
+                            {
+                                // Try obj offset 0x4C as fallback
+                                fObj = fList != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(fList, 0x4C)) : 0;
+                            }
+                            if (fObj != 0 && fObj >= 0x00100000)
+                            {
+                                // Try multiple sub-offsets that lead to the position sub-object
+                                int[] subOffsets = { 0xBC, 0xB8, 0x04, 0x70, 0x0C };
+                                foreach (int sOff in subOffsets)
+                                {
+                                    int fSub = MemoryHelper.ReadInt32(hProcess, Ptr32Add(fObj, sOff));
+                                    if (fSub == 0 || fSub == fObj || fSub < 0x00100000) continue;
+                                    Console.WriteLine($"\n  obj=0x{fObj:X8}>+0x{sOff:X2} → sub=0x{fSub:X8}:");
+                                    var buf = new byte[0x400];
+                                    if (!MemoryHelper.ReadProcessMemory(hProcess, Ptr32(fSub), buf, 0x400, out int rd) || rd < 0x40)
+                                        continue;
+                                    for (int off = 0; off + 12 <= rd; off += 4)
+                                    {
+                                        float fx = BitConverter.ToSingle(buf, off);
+                                        float fy = BitConverter.ToSingle(buf, off + 4);
+                                        float fz = BitConverter.ToSingle(buf, off + 8);
+                                        if (float.IsNaN(fx) || float.IsNaN(fy) || float.IsNaN(fz)) continue;
+                                        if (float.IsInfinity(fx) || float.IsInfinity(fy) || float.IsInfinity(fz)) continue;
+                                        bool anyBig = Math.Abs(fx) > 10f || Math.Abs(fy) > 10f || Math.Abs(fz) > 10f;
+                                        if (!anyBig) continue;
+                                        if (Math.Abs(fx) > 1_000_000f || Math.Abs(fy) > 1_000_000f || Math.Abs(fz) > 1_000_000f) continue;
+                                        Console.WriteLine($"    +0x{off:X3}: ({fx,10:F1}, {fy,10:F1}, {fz,10:F1})");
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine("[F] Chain not resolvable");
+                            }
+                            Console.WriteLine();
                         }
                         else if (key == ConsoleKey.D)
                         {
