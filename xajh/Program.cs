@@ -1821,16 +1821,47 @@ namespace Xajh
                         // Pick the result with the most movement.
                         probeResults.Sort((a, b) => b.mv.CompareTo(a.mv));
 
-                        if (probeResults.Count > 0 && probeResults[0].mv > 0.05 &&
-                            IsStrictPlausiblePos(probeResults[0].x, probeResults[0].y))
+                        // Pick best: prefer movement, then magnitude.
+                        (float x, float y, float z, double mv, string src)? bestProbe = null;
+
+                        // First: any candidate with confirmed movement.
+                        foreach (var r in probeResults)
                         {
-                            var best = probeResults[0];
-                            directCx = best.x; directCy = best.y; directCz = best.z; hasDirectCache = true;
-                            lastDirectSource = best.src;
-                            return (best.x, best.y, best.z);
+                            if (r.mv > 0.05 && IsStrictPlausiblePos(r.x, r.y))
+                            {
+                                bestProbe = r;
+                                break;
+                            }
                         }
 
-                        // Log top candidates for debugging.
+                        // Fallback: when standing still (no movement detected),
+                        // pick the candidate with the largest coordinate magnitude.
+                        // Real world positions have |X| or |Z| in hundreds/thousands;
+                        // garbage like (20,20,0) has much smaller values.
+                        if (!bestProbe.HasValue)
+                        {
+                            float bestMag = 0f;
+                            foreach (var r in probeResults)
+                            {
+                                if (!IsStrictPlausiblePos(r.x, r.y)) continue;
+                                float mag = Math.Max(Math.Abs(r.x), Math.Max(Math.Abs(r.y), Math.Abs(r.z)));
+                                if (mag > 100f && mag > bestMag)
+                                {
+                                    bestMag = mag;
+                                    bestProbe = r;
+                                }
+                            }
+                        }
+
+                        if (bestProbe.HasValue)
+                        {
+                            var bp = bestProbe.Value;
+                            directCx = bp.x; directCy = bp.y; directCz = bp.z; hasDirectCache = true;
+                            lastDirectSource = bp.src;
+                            return (bp.x, bp.y, bp.z);
+                        }
+
+                        // Log top candidates for debugging when nothing matched.
                         if (probeResults.Count > 0)
                         {
                             int show = Math.Min(5, probeResults.Count);
