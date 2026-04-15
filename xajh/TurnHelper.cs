@@ -25,7 +25,11 @@ namespace xajh
         const uint WM_MOUSEMOVE = 0x0200;
         const uint WM_RBUTTONDOWN = 0x0204;
         const uint WM_RBUTTONUP = 0x0205;
+        const uint WM_KEYDOWN = 0x0100;
+        const uint WM_KEYUP = 0x0101;
         const int MK_RBUTTON = 0x0002;
+        const int VK_X = 0x58;
+        const int VK_F = 0x46;
 
         [DllImport("user32.dll", SetLastError = true)]
         static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
@@ -201,6 +205,26 @@ namespace xajh
         }
 
         public void ResetCalibration() => _pixelsPerRadian = 0f;
+
+        /// <summary>
+        /// Target nearest NPC then start fight by sending "X" then "F".
+        /// </summary>
+        public bool TriggerTargetAndFight()
+        {
+            if (_gameHwnd == IntPtr.Zero) return false;
+
+            // Keep behavior consistent with turn logic: ensure game is active.
+            SetForegroundWindow(_gameHwnd);
+            Thread.Sleep(30);
+            bool targetDown = PostMessage(_gameHwnd, WM_KEYDOWN, (IntPtr)VK_X, IntPtr.Zero);
+            Thread.Sleep(20);
+            bool targetUp = PostMessage(_gameHwnd, WM_KEYUP, (IntPtr)VK_X, IntPtr.Zero);
+            Thread.Sleep(40);
+            bool fightDown = PostMessage(_gameHwnd, WM_KEYDOWN, (IntPtr)VK_F, IntPtr.Zero);
+            Thread.Sleep(20);
+            bool fightUp = PostMessage(_gameHwnd, WM_KEYUP, (IntPtr)VK_F, IntPtr.Zero);
+            return targetDown && targetUp && fightDown && fightUp;
+        }
 
         private int GetPlayerObject()
         {
