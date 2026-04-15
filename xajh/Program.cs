@@ -54,6 +54,12 @@ namespace Xajh
             int preferredDirectPos = 0x94;
             bool hasDirectCache = false;
             float directCx = 0f, directCy = 0f, directCz = 0f;
+            // Chain D persistent cache — survives temporary null pointer
+            float chainDx = 0f, chainDy = 0f, chainDz = 0f;
+            bool hasChainD = false;
+            int chainDFrozenCount = 0;      // how many consecutive identical reads
+            const int ChainDFreezeLimit = 5; // invalidate after this many frozen reads
+            long lastReattachMs = 0;         // throttle auto-reattach to once per 5s
             int preferredDirectStaticReads = 0;
             var directLastByKey = new Dictionary<(int mgr, int list, int obj, int link, int pos), (float x, float y)>();
             bool directCalibrating = false;
@@ -1536,6 +1542,20 @@ namespace Xajh
             {
                 UpdateNpcCloudCenter();
 
+                // Auto-reattach if simple chain base (0x9D4518) is null — process handle stale
+                {
+                    int mgrCheck = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                    if (mgrCheck == 0)
+                    {
+                        long nowMs = Environment.TickCount64;
+                        if (nowMs - lastReattachMs > 5000)
+                        {
+                            lastReattachMs = nowMs;
+                            TryReattachGame("mgr=0x0", forceRefreshSameProcess: true);
+                        }
+                    }
+                }
+
                 // --- Phase 0: /loc command result (authoritative server-side position) ---
                 if (locCmd.HasLoc && locCmd.LocAge < 10000 &&
                     IsPlausibleWorldPos(locCmd.LocX, locCmd.LocY))
@@ -1546,6 +1566,54 @@ namespace Xajh
                     hasDirectCache = true;
                     lastDirectSource = $"loc(age={locCmd.LocAge}ms)";
                     return (locCmd.LocX, locCmd.LocY, locCmd.LocZ);
+                }
+
+                // --- Phase 0.1: Chain D (game+0x9CA8A0) — highest priority confirmed chain ---
+                // Runs every call regardless of simpleStatic. Direct pointer to player object.
+                // Confirmed by [F] dump: +0x034=X, +0x038=Y. No NPC cloud needed.
+                // Phase 0.1: Chain D (game+0x9CA8A0) — highest priority confirmed chain.
+                // Runs every call regardless of simpleStatic.
+                // If the value is moving → return immediately (best source).
+                // If frozen (player still or snapshot) → record but let later phases compete;
+                //   use as final fallback at end if everything else fails.
+                {
+                    bool chainDLive = false;
+                    int mD = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9CA8A0));
+                    if (mD != 0 && mD >= 0x00100000)
+                    {
+                        float d4x = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x034));
+                        float d4y = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x038));
+                        float d4z = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x03C));
+                        if (!IsStrictPlausiblePos(d4x, d4y))
+                        {
+                            d4x = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x094));
+                            d4y = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x098));
+                            d4z = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x09C));
+                        }
+                        if (IsStrictPlausiblePos(d4x, d4y))
+                        {
+                            bool moved = !hasChainD
+                                || Math.Abs(d4x - chainDx) >= 0.5f
+                                || Math.Abs(d4y - chainDy) >= 0.5f;
+                            chainDFrozenCount = moved ? 0 : chainDFrozenCount + 1;
+                            chainDx = d4x; chainDy = d4y; chainDz = d4z;
+                            hasChainD = true; chainDLive = true;
+                            turn.SetPlayerObjectHint(mD);
+
+                            if (moved || chainDFrozenCount <= 3)
+                            {
+                                directCx = d4x; directCy = d4y; directCz = d4z; hasDirectCache = true;
+                                lastDirectSource = $"xajh-D(obj=0x{mD:X8},f={chainDFrozenCount})";
+                                return (d4x, d4y, d4z);
+                            }
+                            // Frozen for >3 reads — fall through to other phases
+                        }
+                    }
+                    else if (hasChainD)
+                    {
+                        // Pointer temporarily null — keep hasChainD so last-resort can use it
+                        chainDFrozenCount++;
+                    }
                 }
 
                 // --- Phase 0.5: sub-object at playerObj+0xBC (confirmed by dump, ~10u accuracy) ---
@@ -1710,36 +1778,6 @@ namespace Xajh
                         }
                     }
 
-                    // Chain D: game+0x9CA8A0 → direct object → pos at +0x034/+0x038
-                    // CONFIRMED by [F] dump. This is a direct stable pointer — no NPC cloud
-                    // validation needed, trust it as long as coordinates are in world range.
-                    if (!p6ok)
-                    {
-                        int mD = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9CA8A0));
-                        if (mD != 0 && mD >= 0x00100000)
-                        {
-                            float d4x = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x034));
-                            float d4y = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x038));
-                            float d4z = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x03C));
-                            if (IsStrictPlausiblePos(d4x, d4y))
-                            {
-                                p6ok = true; p6x = d4x; p6y = d4y; p6z = d4z;
-                                p6src = $"xajh-D(obj=0x{mD:X8},+0x034)";
-                            }
-                            if (!p6ok)
-                            {
-                                d4x = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x094));
-                                d4y = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x098));
-                                d4z = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x09C));
-                                if (IsStrictPlausiblePos(d4x, d4y))
-                                {
-                                    p6ok = true; p6x = d4x; p6y = d4y; p6z = d4z;
-                                    p6src = $"xajh-D(obj=0x{mD:X8},+0x094)";
-                                }
-                            }
-                        }
-                    }
-
                     if (p6ok)
                     {
                         directCx = p6x; directCy = p6y; directCz = p6z; hasDirectCache = true;
@@ -1749,6 +1787,14 @@ namespace Xajh
                 }
 
                 // --- Phase 0.7: motion-detection + NPC-cloud brute-force object search ---
+                // Skip Phase 0.7 entirely if Chain D has a frozen-but-valid value.
+                // Phase 0.7's NPC anchor can pick wrong objects; frozen Chain D is safer.
+                if (hasChainD && chainDFrozenCount > 3 && IsStrictPlausiblePos(chainDx, chainDy))
+                {
+                    directCx = chainDx; directCy = chainDy; directCz = chainDz; hasDirectCache = true;
+                    lastDirectSource = $"xajh-D-frozen({chainDx:F0},{chainDy:F0},f={chainDFrozenCount})";
+                    return (chainDx, chainDy, chainDz);
+                }
                 // Two-stage: collect all plausible candidates (excluding the known-frozen simple
                 // chain output), wait 180ms, return whichever moved most.  If nothing moved
                 // (player standing still), fall back to NPC-cloud proximity — but only if the
@@ -2437,8 +2483,14 @@ namespace Xajh
                     Console.WriteLine($"  [DBG] phase4-rejected: ({dx:F1},{dy:F1},{dz:F1}) {dsrc}");
 
                 lastDirectSource = simpleStatic ? "simple-static(no-alt-found)" : "";
-                // If simple chain is frozen, returning p would give the wrong position.
-                // Prefer the last good direct cache over the frozen simple chain output.
+                // Chain D frozen value beats all stale caches — even if not moving,
+                // the last known position is more reliable than an arbitrary cache entry.
+                if (hasChainD && IsStrictPlausiblePos(chainDx, chainDy))
+                {
+                    lastDirectSource = $"xajh-D-frozen({chainDx:F0},{chainDy:F0},f={chainDFrozenCount})";
+                    return (chainDx, chainDy, chainDz);
+                }
+                // If simple chain is frozen, prefer last good direct cache over it.
                 if (simpleStatic && hasDirectCache && IsStrictPlausiblePos(directCx, directCy))
                 {
                     lastDirectSource = $"cache-last-resort({directCx:F0},{directCy:F0})";

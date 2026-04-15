@@ -49,10 +49,23 @@ namespace xajh
         private readonly IntPtr _moduleBase;
         private readonly IntPtr _gameHwnd;
         private float _pixelsPerRadian = 0f;     // 0 = uncalibrated
+        private int _validPlayerObj = 0;     // confirmed non-frozen player object
 
-        const int PlayerMgrOffset = 0x9D4518;
-        const int PlayerListOffset = 0x08;
-        const int PlayerObjOffset = 0x4C;
+        // All known chains that might yield a live (non-frozen) player object.
+        // Each entry: (mgrOffset, listOffset, objOffset).
+        // A list/obj offset of 0 means "direct" (no intermediate hop).
+        static readonly (int mgr, int list, int obj)[] _candidateChains =
+        {
+            (0x9D4518, 0x08, 0x4C),   // original simple chain
+            (0x9D4518, 0x08, 0x50),
+            (0x9D4518, 0x0C, 0x4C),
+            (0x9D4518, 0x0C, 0x50),
+            (0x9D4518, 0x08, 0x48),
+            (0x9D4514, 0,    0   ),   // direct ptr
+            (0x9CA8A0, 0,    0   ),   // confirmed Chain D object (position owner)
+            (0x978AE0, 0x58, 0x0C),
+            (0x9DD6C4, 0x0C, 0   ),
+        };
 
         public TurnHelper(IntPtr hProcess, IntPtr moduleBase, IntPtr gameHwnd)
         {
@@ -60,6 +73,11 @@ namespace xajh
             _moduleBase = moduleBase;
             _gameHwnd = gameHwnd;
         }
+
+        /// <summary>
+        /// Allow Program.cs to hint which object is the correct player object.
+        /// </summary>
+        public void SetPlayerObjectHint(int obj) { if (obj != 0) _validPlayerObj = obj; }
 
         /// <summary>
         /// Read current player yaw from the display matrix at playerObj+0x10/+0x1C.
@@ -70,6 +88,8 @@ namespace xajh
             var pObj = new IntPtr((uint)playerObj);
             float c = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(pObj, 0x10));
             float s = MemoryHelper.ReadFloat(_hProcess, IntPtr.Add(pObj, 0x1C));
+            if (float.IsNaN(c) || float.IsNaN(s)) return float.NaN;
+            if (Math.Abs(c) > 1.1f || Math.Abs(s) > 1.1f) return float.NaN; // not a rotation matrix
             return (float)Math.Atan2(s, c);
         }
 
@@ -80,59 +100,35 @@ namespace xajh
         public string FaceTarget(Func<(float x, float y, float z)> readPos,
                                  float tx, float ty)
         {
-            // Auto-aim runs on a timer while the console often has focus; many clients
-            // only apply keyboard/mouse look when the game window is active.
             if (_gameHwnd != IntPtr.Zero)
                 SetForegroundWindow(_gameHwnd);
             Thread.Sleep(80);
 
-            int playerObj = GetPlayerObject();
-            if (playerObj == 0)
-                return "[!] Player object not found";
+            // Calibration: if uncalibrated or previous player object gone, find the
+            // object whose yaw actually changes after a test drag.
+            if (_pixelsPerRadian == 0f || _validPlayerObj == 0)
+            {
+                string calResult = Recalibrate();
+                if (calResult != null) return calResult;  // calibration failed
+            }
 
-            float curYaw = ReadPlayerYaw(playerObj);
+            float curYaw = ReadPlayerYaw(_validPlayerObj);
             if (float.IsNaN(curYaw))
-                return "[!] Failed to read current yaw";
+            {
+                // Cached object stale — force recal next call
+                _pixelsPerRadian = 0f; _validPlayerObj = 0;
+                return "[!] Yaw read failed — will recalibrate";
+            }
 
             var (px, py, _) = readPos();
             float dx = tx - px;
             float dy = ty - py;
-            // Matrix yaw is opposite of world-vector yaw in this client, so
-            // add PI to align "face target" with actual model orientation.
             float targetYaw = (float)Math.Atan2(dx, dy) + (float)Math.PI;
-
-            float delta = targetYaw - curYaw;
-            while (delta > Math.PI) delta -= 2f * (float)Math.PI;
-            while (delta < -Math.PI) delta += 2f * (float)Math.PI;
-
-            if (_pixelsPerRadian == 0f)
-            {
-                const int TestPx = 200;
-                DragTurn(TestPx);
-                Thread.Sleep(120);
-
-                int playerObjAfterDrag = GetPlayerObject();
-                if (playerObjAfterDrag == 0)
-                    return "[!] Cal failed: player object not found after drag";
-
-                float newYaw = ReadPlayerYaw(playerObjAfterDrag);
-                if (float.IsNaN(newYaw))
-                    return "[!] Cal failed: second yaw read failed";
-
-                float yawChange = newYaw - curYaw;
-                while (yawChange > Math.PI) yawChange -= 2f * (float)Math.PI;
-                while (yawChange < -Math.PI) yawChange += 2f * (float)Math.PI;
-                if (Math.Abs(yawChange) < 0.01f)
-                    return $"[!] Cal failed: drag={TestPx}px gave yawΔ={yawChange:F2}";
-
-                _pixelsPerRadian = TestPx / yawChange;
-                curYaw = newYaw;
-            }
 
             int pixels = 0;
             for (int i = 0; i < 2; i++)
             {
-                delta = targetYaw - curYaw;
+                float delta = targetYaw - curYaw;
                 while (delta > Math.PI) delta -= 2f * (float)Math.PI;
                 while (delta < -Math.PI) delta += 2f * (float)Math.PI;
 
@@ -143,14 +139,73 @@ namespace xajh
                 DragTurn(pixels);
                 Thread.Sleep(80);
 
-                int pObj = GetPlayerObject();
-                if (pObj == 0) break;
-                float newYaw = ReadPlayerYaw(pObj);
+                float newYaw = ReadPlayerYaw(_validPlayerObj);
                 if (float.IsNaN(newYaw)) break;
                 curYaw = newYaw;
             }
 
-            return $"cur={curYaw:F2} tgt={targetYaw:F2} Δ={delta:F2} ({pixels}px) cal={_pixelsPerRadian:F0}";
+            float finalDelta = targetYaw - curYaw;
+            while (finalDelta > Math.PI) finalDelta -= 2f * (float)Math.PI;
+            while (finalDelta < -Math.PI) finalDelta += 2f * (float)Math.PI;
+            return $"cur={curYaw:F2} tgt={targetYaw:F2} Δ={finalDelta:F2} ({pixels}px) cal={_pixelsPerRadian:F0}";
+        }
+
+        /// <summary>
+        /// Find the player object whose yaw changes after a test drag.
+        /// Returns null on success (calibrated), error string on failure.
+        /// </summary>
+        private string Recalibrate()
+        {
+            const int TestPx = 200;
+
+            // Collect all candidate objects
+            var candidates = new System.Collections.Generic.List<int>();
+            foreach (var (mgr, list, obj) in _candidateChains)
+            {
+                int pObj = ResolveChain(mgr, list, obj);
+                if (pObj != 0 && !candidates.Contains(pObj))
+                    candidates.Add(pObj);
+            }
+            // Also try _validPlayerObj if set from outside
+            if (_validPlayerObj != 0 && !candidates.Contains(_validPlayerObj))
+                candidates.Insert(0, _validPlayerObj);
+
+            if (candidates.Count == 0)
+                return "[!] Cal failed: no candidate player objects found";
+
+            // Read yaw before drag for each candidate
+            var yawsBefore = new float[candidates.Count];
+            for (int i = 0; i < candidates.Count; i++)
+                yawsBefore[i] = ReadPlayerYaw(candidates[i]);
+
+            // Test drag
+            DragTurn(TestPx);
+            Thread.Sleep(150);
+
+            // Find the candidate that changed yaw the most
+            int bestIdx = -1;
+            float bestChange = 0.01f;  // minimum threshold
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                if (float.IsNaN(yawsBefore[i])) continue;
+                float newYaw = ReadPlayerYaw(candidates[i]);
+                if (float.IsNaN(newYaw)) continue;
+                float change = newYaw - yawsBefore[i];
+                while (change > Math.PI) change -= 2f * (float)Math.PI;
+                while (change < -Math.PI) change += 2f * (float)Math.PI;
+                if (Math.Abs(change) > Math.Abs(bestChange))
+                {
+                    bestChange = change;
+                    bestIdx = i;
+                }
+            }
+
+            if (bestIdx < 0)
+                return $"[!] Cal failed: no object yaw changed after {TestPx}px drag";
+
+            _validPlayerObj = candidates[bestIdx];
+            _pixelsPerRadian = TestPx / bestChange;
+            return null;  // success
         }
 
 
@@ -226,13 +281,16 @@ namespace xajh
             return targetDown && targetUp && fightDown && fightUp;
         }
 
-        private int GetPlayerObject()
+        private int ResolveChain(int mgrOffset, int listOffset, int objOffset)
         {
-            int mgr = MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(_moduleBase, PlayerMgrOffset));
-            if (mgr == 0) return 0;
-            int list = MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(new IntPtr((uint)mgr), PlayerListOffset));
-            if (list == 0) return 0;
-            return MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(new IntPtr((uint)list), PlayerObjOffset));
+            int mgr = MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(_moduleBase, mgrOffset));
+            if (mgr == 0 || mgr < 0x00100000) return 0;
+            if (listOffset == 0) return mgr;  // direct pointer
+            int list = MemoryHelper.ReadInt32(_hProcess, new IntPtr((uint)mgr + (uint)listOffset));
+            if (list == 0 || list < 0x00100000) return 0;
+            if (objOffset == 0) return list;
+            int obj = MemoryHelper.ReadInt32(_hProcess, new IntPtr((uint)list + (uint)objOffset));
+            return (obj < 0x00100000) ? 0 : obj;
         }
     }
 }
