@@ -55,6 +55,16 @@ namespace xajh
         public long LocAge => _hasLoc ? Environment.TickCount64 - _locTimestamp : long.MaxValue;
 
         /// <summary>
+        /// Force-send /loc immediately, bypassing the cooldown.
+        /// Use only when all other position sources have failed.
+        /// </summary>
+        public bool ForceRead()
+        {
+            _nextLocAllowedTicks = 0;
+            return SendAndRead();
+        }
+
+        /// <summary>
         /// Send /loc to the game and try to read the response.
         /// Returns true if a valid position was parsed.
         /// </summary>

@@ -39,13 +39,14 @@ namespace Xajh
                 int l2 = linkCode & 0xFF;
                 return $"sub+0x{l1:X2}>+0x{l2:X2}";
             }
-            int[] directMgrOffsets = { 0x9D4520, 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4524, 0x9D450C };
-            int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14 };
+            int[] directMgrOffsets = { 0x9D4520, 0x9D4518, 0x9D4514, 0x9D4510, 0x9D4524, 0x9D450C,
+                                        0x978AE0, 0x9DD6C4, 0x9CA8A0 };  // added from XajhSmileDll
+            int[] directListOffsets = { 0x08, 0x0C, 0x04, 0x10, 0x14, 0x58 };  // 0x58 added from XajhSmileDll
             int[] directObjOffsets = { 0x4C, 0x48, 0x50, 0x44, 0x54, 0x40, 0x58, 0x3C };
             int[] directPosOffsets = { 0x94, 0x34, 0x64, 0xC4, 0xA4, 0xB4, 0xD4, 0xE4, 0x104, 0x114, 0x4C, 0x7C, 0x84, 0x8C };
             int[] directPtrOffsets = { 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C, 0x80, 0x84, 0x88, 0x8C, 0x90, 0x94, 0x98, 0x9C, 0xA0 };
             int[] directPtrOffsetsL2 = { 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C };
-            int[] directSubPosOffsets = { 0x230, 0x190, 0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x4C, 0x7C, 0x84, 0x8C };
+            int[] directSubPosOffsets = { 0x384, 0x230, 0x190, 0x160, 0x94, 0x34, 0x64, 0xC4, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x4C, 0x7C, 0x84, 0x8C };
             int preferredDirectMgr = 0x9D4518;
             int preferredDirectList = 0x08;
             int preferredDirectObj = 0x4C;
@@ -586,7 +587,8 @@ namespace Xajh
             ///   sub + 0x024       →  float Z (height)
             ///   sub + 0x028       →  float Y
             ///
-            /// Memory layout is (X, Z, Y); we return (X, Y, Z) for caller consistency.
+            /// Memory layout is (game_X, game_Z_ground, game_Y_height).
+            /// Returned as C# (x=X_ground, y=Z_ground, z=Y_height) matching all other position code.
             /// Accuracy: ~10 units vs /loc (visual interpolation lag); far better than
             /// the ~30-unit error from a wrong direct-offset read.
             /// </summary>
@@ -1444,6 +1446,7 @@ namespace Xajh
 
             bool autoFace = false;
             float aimRadius = 300f;
+            bool lastPosReliable = false;  // updated by ReadPlayerPos; accessible by AimNearest/GetNearbyNpcs
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
             string lastDirectSource = "";
 
@@ -1491,10 +1494,19 @@ namespace Xajh
             // near zero — real world positions have significant coordinate values
             // (|X| > 10 AND |Y| > 10), while garbage like (1,1,255) or (2,2,0)
             // from 255-filled entities has near-zero world coords.
+            // Coordinate convention used throughout: ReadPlayerPos returns (x, y, z) where
+            //   x = game X  (ground plane, typically 200–30000)
+            //   y = game Z  (ground plane, typically 200–30000)  ← the tuple's "y" IS game Z
+            //   z = game Y  (height, typically -100–+200)        ← the tuple's "z" IS game Y
+            // Memory at confirmed position offsets stores (X, Z_ground, Y_height) consecutively.
+            // TryReadStablePos reads them raw; TryReadSubPtrPos explicitly remaps the sub+0x020 layout.
             bool IsStrictPlausiblePos(float x, float y)
             {
                 if (!IsPlausibleWorldPos(x, y)) return false;
-                if (Math.Abs(x) < 10f || Math.Abs(y) < 10f) return false;
+                // Real positions on this server are in the 1000–20000 range.
+                // Raise the floor well above the garbage values seen in phase3/4
+                // (e.g. 43.5, 0.0, 2832) that previously slipped through.
+                if (Math.Abs(x) < 200f || Math.Abs(y) < 200f) return false;
                 return true;
             }
 
@@ -1510,6 +1522,17 @@ namespace Xajh
             }
 
             (float x, float y, float z) ReadPlayerPos()
+            {
+                var result = ReadPlayerPosInner();
+                lastPosReliable = IsStrictPlausiblePos(result.x, result.y)
+                    && !IsDirectFallbackLikelyWrong(result.x, result.y)
+                    && !string.IsNullOrEmpty(lastDirectSource)
+                    && !lastDirectSource.StartsWith("cache-last")
+                    && !lastDirectSource.StartsWith("simple-static");
+                return result;
+            }
+
+            (float x, float y, float z) ReadPlayerPosInner()
             {
                 UpdateNpcCloudCenter();
 
@@ -1602,6 +1625,344 @@ namespace Xajh
 
                 // Note: do NOT seed directCache from frozen simple chain — the spawn
                 // position can be thousands of units from the real position.
+
+                // --- Phase 0.6: XajhSmileDll.dll confirmed chains (reverse-engineered) ---
+                // These three chains were extracted from XajhSmileDll.dll (Cloud_xajhfuzhu's
+                // injected DLL). It reads player position via direct pointer access inside the
+                // game process with no VMProtect.
+                //
+                // Chain A: game+0x9D4514 is a DIRECT pointer to playerObj  → pos at +0x94/+0x98/+0x9C
+                // Chain B: game+0x978AE0 → [+0x58] → [+0x0C] → pos at +0x94
+                // Chain C: game+0x9DD6C4 → [+0x0C] → pos at +0x94
+                //
+                // Memory layout at pos offsets: +0x94 = X_ground, +0x98 = Z_height, +0x9C = Y_ground
+                {
+                    bool p6ok = false;
+                    float p6x = 0, p6y = 0, p6z = 0;
+                    string p6src = "";
+
+                    // Chain A: direct playerObj pointer at game+0x9D4514
+                    // Scan all known position offsets — game version may have shifted from +0x94
+                    {
+                        int pObjA = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4514));
+                        if (pObjA != 0 && pObjA >= 0x00100000)
+                        {
+                            foreach (int pOff in directPosOffsets)
+                            {
+                                float ax = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjA, pOff));
+                                float ay = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjA, pOff + 8));  // +8 = Y in x,z,y layout
+                                if (!IsStrictPlausiblePos(ax, ay) || IsDirectFallbackLikelyWrong(ax, ay)) continue;
+                                float az = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjA, pOff + 4));
+                                p6ok = true; p6x = ax; p6y = ay; p6z = az;
+                                p6src = $"xajh-A(obj=0x{pObjA:X8},po=0x{pOff:X2})";
+                                break;
+                            }
+                        }
+                    }
+
+                    // Chain B: game+0x978AE0 → [+0x58] → [+0x0C] → pos
+                    if (!p6ok)
+                    {
+                        int mB = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x978AE0));
+                        if (mB != 0 && mB >= 0x00100000)
+                        {
+                            int lB = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mB, 0x58));
+                            if (lB != 0 && lB != mB && lB >= 0x00100000)
+                            {
+                                int pObjB = MemoryHelper.ReadInt32(hProcess, Ptr32Add(lB, 0x0C));
+                                if (pObjB != 0 && pObjB != lB && pObjB >= 0x00100000)
+                                {
+                                    foreach (int pOff in directPosOffsets)
+                                    {
+                                        float bx = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjB, pOff));
+                                        float by = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjB, pOff + 8));
+                                        if (!IsStrictPlausiblePos(bx, by) || IsDirectFallbackLikelyWrong(bx, by)) continue;
+                                        float bz = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjB, pOff + 4));
+                                        p6ok = true; p6x = bx; p6y = by; p6z = bz;
+                                        p6src = $"xajh-B(obj=0x{pObjB:X8},po=0x{pOff:X2})";
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Chain C: game+0x9DD6C4 → [+0x0C] → pos
+                    if (!p6ok)
+                    {
+                        int mC = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9DD6C4));
+                        if (mC != 0 && mC >= 0x00100000)
+                        {
+                            int pObjC = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mC, 0x0C));
+                            if (pObjC != 0 && pObjC != mC && pObjC >= 0x00100000)
+                            {
+                                foreach (int pOff in directPosOffsets)
+                                {
+                                    float cx = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjC, pOff));
+                                    float cy = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjC, pOff + 8));
+                                    if (!IsStrictPlausiblePos(cx, cy) || IsDirectFallbackLikelyWrong(cx, cy)) continue;
+                                    float cz = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjC, pOff + 4));
+                                    p6ok = true; p6x = cx; p6y = cy; p6z = cz;
+                                    p6src = $"xajh-C(obj=0x{pObjC:X8},po=0x{pOff:X2})";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Chain D: game+0x9CA8A0 → direct object → pos at +0x034/+0x038
+                    // CONFIRMED by [F] dump. This is a direct stable pointer — no NPC cloud
+                    // validation needed, trust it as long as coordinates are in world range.
+                    if (!p6ok)
+                    {
+                        int mD = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9CA8A0));
+                        if (mD != 0 && mD >= 0x00100000)
+                        {
+                            float d4x = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x034));
+                            float d4y = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x038));
+                            float d4z = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x03C));
+                            if (IsStrictPlausiblePos(d4x, d4y))
+                            {
+                                p6ok = true; p6x = d4x; p6y = d4y; p6z = d4z;
+                                p6src = $"xajh-D(obj=0x{mD:X8},+0x034)";
+                            }
+                            if (!p6ok)
+                            {
+                                d4x = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x094));
+                                d4y = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x098));
+                                d4z = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mD, 0x09C));
+                                if (IsStrictPlausiblePos(d4x, d4y))
+                                {
+                                    p6ok = true; p6x = d4x; p6y = d4y; p6z = d4z;
+                                    p6src = $"xajh-D(obj=0x{mD:X8},+0x094)";
+                                }
+                            }
+                        }
+                    }
+
+                    if (p6ok)
+                    {
+                        directCx = p6x; directCy = p6y; directCz = p6z; hasDirectCache = true;
+                        lastDirectSource = p6src;
+                        return (p6x, p6y, p6z);
+                    }
+                }
+
+                // --- Phase 0.7: motion-detection + NPC-cloud brute-force object search ---
+                // Two-stage: collect all plausible candidates (excluding the known-frozen simple
+                // chain output), wait 180ms, return whichever moved most.  If nothing moved
+                // (player standing still), fall back to NPC-cloud proximity — but only if the
+                // NPC cloud itself is far from the frozen position (otherwise it is also stale).
+                if (simpleStatic)
+                {
+                    var snap07 = new List<(IntPtr obj07, int po, bool isSub, float x, float y, float z, string tag)>();
+                    int[] ptrHops07 = { 0x04, 0x08, 0x0C, 0x10, 0x40, 0x44, 0x48, 0x50, 0x58, 0x70, 0x90, 0xA0, 0xB8, 0xBC };
+
+                    foreach (int mo in directMgrOffsets)
+                    {
+                        int mgr07 = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, mo));
+                        if (mgr07 == 0) continue;
+                        foreach (int lo in directListOffsets)
+                        {
+                            int list07 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(mgr07, lo));
+                            if (list07 == 0 || list07 < 0x00100000) continue;
+                            foreach (int oo in directObjOffsets)
+                            {
+                                int raw07 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(list07, oo));
+                                if (raw07 == 0 || raw07 < 0x00100000) continue;
+                                var obj07 = Ptr32(raw07);
+
+                                // Direct pos offsets
+                                foreach (int po in directPosOffsets)
+                                {
+                                    if (!TryReadStablePos(hProcess, obj07, po, out float ex, out float ey, out float ez)) continue;
+                                    if (!IsStrictPlausiblePos(ex, ey)) continue;
+                                    // Exclude the known-frozen simple chain output
+                                    if (simpleResolved && Math.Abs(ex - p.x) < 50f && Math.Abs(ey - p.y) < 50f) continue;
+                                    snap07.Add((obj07, po, false, ex, ey, ez, $"mo=0x{mo:X},lo=0x{lo:X2},oo=0x{oo:X2},po=0x{po:X2}"));
+                                }
+
+                                // Sub-0xBC
+                                if (TryReadSubPtrPos(obj07, out float spx, out float spy, out float spz) &&
+                                    IsStrictPlausiblePos(spx, spy) &&
+                                    !(simpleResolved && Math.Abs(spx - p.x) < 50f && Math.Abs(spy - p.y) < 50f))
+                                {
+                                    snap07.Add((obj07, -1, true, spx, spy, spz, $"mo=0x{mo:X},lo=0x{lo:X2},oo=0x{oo:X2},sub0xBC"));
+                                }
+
+                                // One-hop sub-objects
+                                foreach (int ptrOff in ptrHops07)
+                                {
+                                    int subRaw07 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(raw07, ptrOff));
+                                    if (subRaw07 == 0 || subRaw07 == raw07 || subRaw07 < 0x00100000) continue;
+                                    var sub07 = Ptr32(subRaw07);
+                                    foreach (int po in directSubPosOffsets)
+                                    {
+                                        if (!TryReadStablePos(hProcess, sub07, po, out float ex, out float ey, out float ez)) continue;
+                                        if (!IsStrictPlausiblePos(ex, ey)) continue;
+                                        if (simpleResolved && Math.Abs(ex - p.x) < 50f && Math.Abs(ey - p.y) < 50f) continue;
+                                        snap07.Add((sub07, po, false, ex, ey, ez, $"mo=0x{mo:X},lo=0x{lo:X2},oo=0x{oo:X2},ptr=0x{ptrOff:X2},po=0x{po:X2}"));
+                                    }
+
+                                    // Two-hop: follow a second pointer from the sub-object.
+                                    // Required to reach deep chains like +0x24>+0x70>+0x28 at +0x384.
+                                    foreach (int ptrOff2 in new[] { 0x04, 0x08, 0x0C, 0x10, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60, 0x68, 0x70, 0x80, 0x90, 0xA0, 0xB4, 0xB8, 0xBC, 0xC0 })
+                                    {
+                                        int subRaw072 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(subRaw07, ptrOff2));
+                                        if (subRaw072 == 0 || subRaw072 == subRaw07 || subRaw072 == raw07 || subRaw072 < 0x00100000) continue;
+                                        var sub072 = Ptr32(subRaw072);
+                                        foreach (int po in directSubPosOffsets)
+                                        {
+                                            if (!TryReadStablePos(hProcess, sub072, po, out float ex, out float ey, out float ez)) continue;
+                                            if (!IsStrictPlausiblePos(ex, ey)) continue;
+                                            if (simpleResolved && Math.Abs(ex - p.x) < 50f && Math.Abs(ey - p.y) < 50f) continue;
+                                            snap07.Add((sub072, po, false, ex, ey, ez, $"mo=0x{mo:X},lo=0x{lo:X2},oo=0x{oo:X2},ptr=0x{ptrOff:X2}>0x{ptrOff2:X2},po=0x{po:X2}"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (snap07.Count > 0)
+                    {
+                        // Stage 1: motion detection — wait for player movement
+                        Thread.Sleep(180);
+
+                        float bestMotion = 0.4f;  // min threshold: must move > 0.4 units
+                        float motX = 0, motY = 0, motZ = 0;
+                        string motSrc = "";
+
+                        bool hasLocRef = locCmd.HasLoc && locCmd.LocAge < 15000 &&
+                            IsPlausibleWorldPos(locCmd.LocX, locCmd.LocY);
+                        // /loc is stale if it matches the frozen simple-chain position —
+                        // ForceRead fired but the game returned old-zone data.
+                        bool locMatchesFrozen = hasLocRef && simpleResolved &&
+                            Math.Abs(locCmd.LocX - p.x) < 100f &&
+                            Math.Abs(locCmd.LocY - p.y) < 100f;
+                        bool locUsable = hasLocRef && !locMatchesFrozen;
+
+                        foreach (var s in snap07)
+                        {
+                            float nx, ny, nz;
+                            if (s.isSub)
+                            {
+                                if (!TryReadSubPtrPos(s.obj07, out nx, out ny, out nz)) continue;
+                            }
+                            else
+                            {
+                                if (!TryReadStablePos(hProcess, s.obj07, s.po, out nx, out ny, out nz)) continue;
+                            }
+                            if (!IsStrictPlausiblePos(nx, ny)) continue;
+                            float mv = (float)Math.Sqrt(Math.Pow(nx - s.x, 2) + Math.Pow(ny - s.y, 2));
+                            if (mv > bestMotion)
+                            {
+                                // Cross-validate against /loc only when it is NOT stale zone data.
+                                if (locUsable)
+                                {
+                                    double dLoc = Math.Sqrt(Math.Pow(nx - locCmd.LocX, 2) + Math.Pow(ny - locCmd.LocY, 2));
+                                    if (dLoc > 2000.0) continue;
+                                }
+                                bestMotion = mv;
+                                motX = nx; motY = ny; motZ = nz;
+                                motSrc = $"motion({s.tag},mv={mv:F1})";
+                            }
+                        }
+
+                        if (!string.IsNullOrEmpty(motSrc))
+                        {
+                            directCx = motX; directCy = motY; directCz = motZ; hasDirectCache = true;
+                            lastDirectSource = motSrc;
+                            return (motX, motY, motZ);
+                        }
+
+                        // Stage 2: player standing still.
+                        // Reference priority:
+                        //   1. /loc — only if NOT matching the frozen zone (stale /loc is worse than nothing)
+                        //   2. directCache — if it's far from the frozen position (previous correct read)
+                        //   3. NPC cloud — if far from frozen
+                        //   4. No reference: pick snap07 candidate farthest from frozen (best-effort)
+                        float refX07 = float.NaN, refY07 = float.NaN;
+                        string refSrc07 = "";
+
+                        if (locUsable)
+                        {
+                            refX07 = locCmd.LocX; refY07 = locCmd.LocY;
+                            refSrc07 = $"loc(age={locCmd.LocAge}ms)";
+                        }
+                        else if (hasDirectCache && IsStrictPlausiblePos(directCx, directCy))
+                        {
+                            double cacheDistFromFrozen = Math.Sqrt(Math.Pow(directCx - p.x, 2) + Math.Pow(directCy - p.y, 2));
+                            if (cacheDistFromFrozen > 500.0)
+                            {
+                                refX07 = directCx; refY07 = directCy;
+                                refSrc07 = $"cache({directCx:F0},{directCy:F0})";
+                            }
+                        }
+
+                        if (float.IsNaN(refX07) && hasLastNpcCloudCenter)
+                        {
+                            float ncx = (float)lastNpcCloudCenterX;
+                            float ncy = (float)lastNpcCloudCenterY;
+                            float frozenDistToCloud = (float)Math.Sqrt(Math.Pow(p.x - ncx, 2) + Math.Pow(p.y - ncy, 2));
+                            if (frozenDistToCloud > 500f)
+                            {
+                                refX07 = ncx; refY07 = ncy;
+                                refSrc07 = "npc-cloud";
+                            }
+                        }
+
+                        if (!float.IsNaN(refX07))
+                        {
+                            float bestRefDist = 300f;  // tight: real player is within 300u of NPC cloud
+                            float bestRefX = 0, bestRefY = 0, bestRefZ = 0;
+                            string bestRefSrc = "";
+                            foreach (var s in snap07)
+                            {
+                                float d = (float)Math.Sqrt(Math.Pow(s.x - refX07, 2) + Math.Pow(s.y - refY07, 2));
+                                if (d < bestRefDist)
+                                {
+                                    bestRefDist = d;
+                                    bestRefX = s.x; bestRefY = s.y; bestRefZ = s.z;
+                                    bestRefSrc = $"anchor({refSrc07},{s.tag},d={d:F0})";
+                                }
+                            }
+                            if (!string.IsNullOrEmpty(bestRefSrc))
+                            {
+                                directCx = bestRefX; directCy = bestRefY; directCz = bestRefZ; hasDirectCache = true;
+                                lastDirectSource = bestRefSrc;
+                                return (bestRefX, bestRefY, bestRefZ);
+                            }
+                        }
+
+                        // No reference available at all — pick the snap07 candidate farthest from
+                        // the frozen position.  All candidates in snap07 already passed
+                        // IsStrictPlausiblePos and the frozen-exclusion filter, so the farthest one
+                        // is the least likely to be a stale anchor object.
+                        if (snap07.Count > 0)
+                        {
+                            float bestFrozenDist = 500f;  // must be at least 500u from frozen
+                            float bfX = 0, bfY = 0, bfZ = 0;
+                            string bfSrc = "";
+                            foreach (var s in snap07)
+                            {
+                                float d = (float)Math.Sqrt(Math.Pow(s.x - p.x, 2) + Math.Pow(s.y - p.y, 2));
+                                if (d > bestFrozenDist)
+                                {
+                                    bestFrozenDist = d;
+                                    bfX = s.x; bfY = s.y; bfZ = s.z;
+                                    bfSrc = $"farthest-from-frozen({s.tag},d={d:F0})";
+                                }
+                            }
+                            if (!string.IsNullOrEmpty(bfSrc))
+                            {
+                                directCx = bfX; directCy = bfY; directCz = bfZ; hasDirectCache = true;
+                                lastDirectSource = bfSrc;
+                                return (bfX, bfY, bfZ);
+                            }
+                        }
+                    }
+                }
 
                 // --- Phase 1: zxxy.dll direct float scan (authoritative, like xajhtoy.exe) ---
                 if (TryReadPlayerPosViaZxxyDirect(out float zdx, out float zdy, out float zdz, out string zdsrc) &&
@@ -1816,7 +2177,7 @@ namespace Xajh
                         new[] { 0x9D4520, 0x0C, 0x40, 0xB8, 0x24 },
                     };
                     // 0x230/0x190 confirmed by deep scan; 0x020 confirmed by focused dump
-                    int[] probePosOffsets = { 0x230, 0x190, 0x020, 0x94, 0x64, 0x34, 0xC4, 0x24, 0x28, 0x4C, 0x68 };
+                    int[] probePosOffsets = { 0x384, 0x230, 0x190, 0x160, 0x020, 0x94, 0x64, 0x34, 0xC4, 0x24, 0x28, 0x4C, 0x68 };
 
                     var endpoints = new List<(IntPtr ptr, string tag, bool is2link)>();
 
@@ -1844,6 +2205,17 @@ namespace Xajh
                         if (sub1 == 0 || sub1 == obj || sub1 < 0x00100000) continue;
                         int sub2 = MemoryHelper.ReadInt32(hProcess, Ptr32Add(sub1, c[4]));
                         if (sub2 == 0 || sub2 == sub1 || sub2 == obj || sub2 < 0x00100000) continue;
+
+                        // For the confirmed +0x04>+0x90 chain, also probe the intermediate
+                        // objects (obj and sub1) before the predictive sub2 endpoint.
+                        // The sub2 endpoint stores the render-interpolated position (+19u X error
+                        // when moving); earlier chain objects may hold the server position.
+                        if (c[0] == 0x9D4518 && c[3] == 0x04 && c[4] == 0x90)
+                        {
+                            endpoints.Add((Ptr32(obj), $"mgr+0x{c[0]:X}[+0x{c[1]:X2}]+0x{c[2]:X2}(obj)", true));
+                            endpoints.Add((Ptr32(sub1), $"mgr+0x{c[0]:X}[+0x{c[1]:X2}]+0x{c[2]:X2}>+0x{c[3]:X2}(sub1)", true));
+                        }
+
                         endpoints.Add((Ptr32(sub2), $"mgr+0x{c[0]:X}[+0x{c[1]:X2}]+0x{c[2]:X2}>+0x{c[3]:X2}>+0x{c[4]:X2}", false));
                     }
 
@@ -1912,6 +2284,16 @@ namespace Xajh
                             var bp = bestProbe.Value;
                             directCx = bp.x; directCy = bp.y; directCz = bp.z; hasDirectCache = true;
                             lastDirectSource = bp.src;
+
+                            // If /loc already has a fresh result (from manual [G] press), prefer it.
+                            if (locCmd.HasLoc && locCmd.LocAge < 4000 &&
+                                IsPlausibleWorldPos(locCmd.LocX, locCmd.LocY))
+                            {
+                                directCx = locCmd.LocX; directCy = locCmd.LocY; directCz = locCmd.LocZ;
+                                lastDirectSource = $"loc-manual(age={locCmd.LocAge}ms,chain={bp.src})";
+                                return (locCmd.LocX, locCmd.LocY, locCmd.LocZ);
+                            }
+
                             return (bp.x, bp.y, bp.z);
                         }
 
@@ -1926,16 +2308,16 @@ namespace Xajh
                     }
                 }
 
-                // --- Phase 2d: 4-hop backup chain confirmed by deep scan ---
-                // mgr+0x9D4524 → [+0x0C] → [+0x50] → [+0x70] → [+0xA0] → [+0x0C] → +0x190 = (X,Y,Z)
-                // Also probes the companion chain via 0x9D4518[+0x0C]+0x50 at pos +0x230.
+                // --- Phase 2d: 4-hop chains confirmed by deep scan ---
                 if (simpleStatic || !simplePlausible)
                 {
-                    // 4-hop chain: { mgrOff, listOff, objOff, sub1Off, sub2Off, sub3Off }
+                    // { mgrOff, listOff, objOff, sub1Off, sub2Off, sub3Off }
                     int[][] chains4 = {
-                        new[] { 0x9D4524, 0x0C, 0x50, 0x70, 0xA0, 0x0C },  // CONFIRMED: pos at +0x190
+                        new[] { 0x9D4524, 0x0C, 0x54, 0x24, 0x70, 0x28 },  // CONFIRMED: pos at +0x384 (deep scan Δ=161/208)
+                        new[] { 0x9D4524, 0x0C, 0x50, 0x70, 0xA0, 0x0C },  // previous confirmed: pos at +0x190
                     };
-                    int[] p4PosOffs = { 0x190, 0x230, 0x94, 0x64, 0x34 };
+                    // 0x384/0x388 = confirmed XY pair; others kept as fallback
+                    int[] p4PosOffs = { 0x384, 0x190, 0x230, 0x94, 0x64, 0x34 };
 
                     foreach (var c4 in chains4)
                     {
@@ -1956,8 +2338,27 @@ namespace Xajh
                         {
                             if (!TryReadStablePos(hProcess, ep4, p4po, out float e4x, out float e4y, out float e4z)) continue;
                             if (!IsStrictPlausiblePos(e4x, e4y)) continue;
+                            // Validate: prefer /loc only when it is NOT stale zone data.
+                            bool c4LocStale = simpleResolved && locCmd.HasLoc &&
+                                Math.Abs(locCmd.LocX - p.x) < 100f && Math.Abs(locCmd.LocY - p.y) < 100f;
+                            bool passesRef = false;
+                            if (locCmd.HasLoc && locCmd.LocAge < 15000 && IsPlausibleWorldPos(locCmd.LocX, locCmd.LocY) && !c4LocStale)
+                            {
+                                double d = Math.Sqrt(Math.Pow(e4x - locCmd.LocX, 2) + Math.Pow(e4y - locCmd.LocY, 2));
+                                passesRef = d < 2000.0;
+                            }
+                            else if (hasLastNpcCloudCenter)
+                            {
+                                double d = Math.Sqrt(Math.Pow(e4x - lastNpcCloudCenterX, 2) + Math.Pow(e4y - lastNpcCloudCenterY, 2));
+                                passesRef = d < 8000.0;
+                            }
+                            else
+                            {
+                                passesRef = true;  // no reference available, accept any strictly plausible result
+                            }
+                            if (!passesRef) continue;
                             directCx = e4x; directCy = e4y; directCz = e4z; hasDirectCache = true;
-                            lastDirectSource = $"chain4(mgr=0x{c4[0]:X},pos=0x{p4po:X2},ep=0x{s3:X8})";
+                            lastDirectSource = $"chain4(mgr=0x{c4[0]:X},ptr=0x{c4[3]:X2}>0x{c4[4]:X2}>0x{c4[5]:X2},pos=0x{p4po:X2},ep=0x{s3:X8})";
                             return (e4x, e4y, e4z);
                         }
                     }
@@ -2035,23 +2436,14 @@ namespace Xajh
                 if (phase4ok && !IsStrictPlausiblePos(dx, dy))
                     Console.WriteLine($"  [DBG] phase4-rejected: ({dx:F1},{dy:F1},{dz:F1}) {dsrc}");
 
-                // All fallbacks exhausted. If simple is static, try /loc as last resort.
-                if (simpleStatic && simplePlausible)
-                {
-                    locCmd.SendAndRead();
-                    if (locCmd.HasLoc && locCmd.LocAge < 10000 &&
-                        IsPlausibleWorldPos(locCmd.LocX, locCmd.LocY))
-                    {
-                        directCx = locCmd.LocX;
-                        directCy = locCmd.LocY;
-                        directCz = locCmd.LocZ;
-                        hasDirectCache = true;
-                        lastDirectSource = $"loc-auto(age={locCmd.LocAge}ms)";
-                        return (locCmd.LocX, locCmd.LocY, locCmd.LocZ);
-                    }
-                }
-
                 lastDirectSource = simpleStatic ? "simple-static(no-alt-found)" : "";
+                // If simple chain is frozen, returning p would give the wrong position.
+                // Prefer the last good direct cache over the frozen simple chain output.
+                if (simpleStatic && hasDirectCache && IsStrictPlausiblePos(directCx, directCy))
+                {
+                    lastDirectSource = $"cache-last-resort({directCx:F0},{directCy:F0})";
+                    return (directCx, directCy, directCz);
+                }
                 return p;
             }
 
@@ -2199,6 +2591,7 @@ namespace Xajh
                 var (px, py, pz) = ReadPlayerPos();
                 var npcs = GetTrackedNpcs();
                 var nearby = new List<(Npc, double, double)>();
+
                 foreach (var n in npcs)
                 {
                     double dxy = Math.Sqrt(
@@ -2208,7 +2601,8 @@ namespace Xajh
                         Math.Pow(n.X - px, 2) +
                         Math.Pow(n.Y - py, 2) +
                         Math.Pow(n.Z - pz, 2));
-                    if (dxy <= aimRadius)
+                    // When position is unreliable, include all NPCs (ignore radius filter)
+                    if (!lastPosReliable || dxy <= aimRadius)
                         nearby.Add((n, dxy, d3d));
                 }
                 nearby.Sort((a, b) => a.Item2.CompareTo(b.Item2));
@@ -2222,27 +2616,37 @@ namespace Xajh
 
                 if (verbose)
                 {
-                    // Full list for debugging when auto routine runs
-                    Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
-                    Console.WriteLine($"  {"#",2}  {"Name",-20} {"xy",7} {"3d",7}  {"NpcX",9} {"NpcY",9} {"NpcZ",9}   {"dX",8} {"dY",8} {"dZ",8}");
+                    Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  (x, z, y)  radius={aimRadius:F0}  pos={(lastPosReliable ? "OK" : "UNRELIABLE")}");
+                    Console.WriteLine($"  {"#",2}  {"Name",-20} {"xz",7} {"3d",7}  {"NpcX",9} {"NpcZ",9} {"NpcY",9}   {"dX",8} {"dZ",8} {"dY",8}");
                     for (int i = 0; i < nearby.Count; i++)
                     {
                         var (n, dxy, d3d) = nearby[i];
                         Console.WriteLine($"  {i + 1,2}. {n.Name,-20} {dxy,7:F0} {d3d,7:F0}  {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}   {n.X - px,8:F1} {n.Y - py,8:F1} {n.Z - pz,8:F1}");
                     }
-                    if (nearby.Count == 0) { return $"[!] No NPC within {aimRadius:F0}"; }
+                    if (nearby.Count == 0) { return "[!] No NPCs found"; }
                     Console.WriteLine();
                 }
                 else if (nearby.Count == 0)
-                    return $"[!] No NPC within {aimRadius:F0}";
+                    return "[!] No NPCs found";
 
                 var (target, distXY, _) = nearby[0];
-                string r = turn.FaceTarget(() => ReadPlayerPos(), target.X, target.Y);
-                bool fightTriggered = false;
-                if (!r.StartsWith("[!]"))
-                    fightTriggered = turn.TriggerTargetAndFight();
-                string fightStatus = fightTriggered ? "target=X fight=F" : "target/fight=!";
-                return $"→ {target.Name} d={distXY:F0}  {r}  {fightStatus}  ({nearby.Count} in range)";
+
+                if (lastPosReliable)
+                {
+                    // Full turn + fight when we have a reliable position
+                    string r = turn.FaceTarget(() => ReadPlayerPos(), target.X, target.Y);
+                    bool fightTriggered = false;
+                    if (!r.StartsWith("[!]"))
+                        fightTriggered = turn.TriggerTargetAndFight();
+                    string fightStatus = fightTriggered ? "target=X fight=F" : "target/fight=!";
+                    return $"→ {target.Name} d={distXY:F0}  {r}  {fightStatus}  ({nearby.Count} npcs)";
+                }
+                else
+                {
+                    // Position unreliable — skip turn, just send X (game auto-selects nearest) + F
+                    bool ok = turn.TriggerTargetAndFight();
+                    return $"→ {target.Name} [no-pos: X+F only]  {(ok ? "sent" : "!")}  ({nearby.Count} npcs)";
+                }
             }
 
             try
@@ -2256,12 +2660,16 @@ namespace Xajh
 
                         if (key == ConsoleKey.L)
                         {
+                            // First call seeds caches (NPC cloud, directCache, Phase 0.6 chains).
+                            // Second call gets the correct result using those caches.
+                            ReadPlayerPos();
                             var (px, py, pz) = ReadPlayerPos();
                             var dbg = playerReader.GetDebugSnapshot();
                             bool unresolved = IsUnresolvedSource(dbg.Source) && string.IsNullOrEmpty(lastDirectSource);
                             if (unresolved && TryReattachGame($"player-source={dbg.Source}", forceRefreshSameProcess: true))
                             {
                                 Thread.Sleep(150);
+                                ReadPlayerPos();
                                 (px, py, pz) = ReadPlayerPos();
                                 dbg = playerReader.GetDebugSnapshot();
                             }
@@ -2270,7 +2678,7 @@ namespace Xajh
                                 Console.WriteLine($"[REATTACH] failed (source={dbg.Source})");
                             }
 
-                            Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  radius={aimRadius:F0}");
+                            Console.WriteLine($"\n  Player: ({px:F1}, {py:F1}, {pz:F1})  (x, z, y)  radius={aimRadius:F0}");
                             Console.WriteLine(
                                 $"  [DBG] src={dbg.Source} mgr=0x{dbg.MgrOffset:X} off=0x{dbg.ObjOffset:X2} pos=0x{dbg.PosOffset:X2} obj=0x{dbg.PlayerObj.ToInt64():X8} " +
                                 $"raw=({dbg.RawX:F1},{dbg.RawY:F1},{dbg.RawZ:F1}) simpleStatic={simpleStaticReads} chainStatic={dbg.SimpleChainStaticReads}");
@@ -2447,6 +2855,93 @@ namespace Xajh
                                     else
                                     {
                                         Console.WriteLine($"\n[F] Standard chain sub-0xBC: playerObj=0x{sObj:X8} → sub ptr null/invalid");
+                                    }
+                                }
+                            }
+
+                            // XajhSmileDll chain diagnostics
+                            Console.WriteLine("\n[F] XajhSmileDll chain diagnostics:");
+                            {
+                                // Chain A: direct playerObj at game+0x9D4514
+                                int pObjA = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4514));
+                                if (pObjA != 0 && pObjA >= 0x00100000)
+                                {
+                                    float ax = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjA, 0x94));
+                                    float az = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjA, 0x98));
+                                    float ay = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjA, 0x9C));
+                                    Console.WriteLine($"  Chain A (game+0x9D4514): ptr=0x{pObjA:X8}  pos=({ax:F1},{ay:F1},{az:F1})  valid={IsStrictPlausiblePos(ax, ay)}");
+                                }
+                                else Console.WriteLine($"  Chain A (game+0x9D4514): ptr=0x{pObjA:X8}  NULL/invalid");
+
+                                // Chain B: game+0x978AE0 → [+0x58] → [+0x0C]
+                                int mB = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x978AE0));
+                                int lB = mB != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(mB, 0x58)) : 0;
+                                int pObjB = lB != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(lB, 0x0C)) : 0;
+                                if (pObjB != 0 && pObjB >= 0x00100000)
+                                {
+                                    float bx = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjB, 0x94));
+                                    float bz = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjB, 0x98));
+                                    float by = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjB, 0x9C));
+                                    Console.WriteLine($"  Chain B (0x978AE0→+0x58→+0x0C): mgr=0x{mB:X8} obj=0x{pObjB:X8}  pos=({bx:F1},{by:F1},{bz:F1})  valid={IsStrictPlausiblePos(bx, by)}");
+                                }
+                                else Console.WriteLine($"  Chain B (0x978AE0→+0x58→+0x0C): mgr=0x{mB:X8} list=0x{lB:X8} obj=0x{pObjB:X8}  NULL");
+
+                                // Chain C: game+0x9DD6C4 → [+0x0C]
+                                int mC = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9DD6C4));
+                                int pObjC = mC != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(mC, 0x0C)) : 0;
+                                if (pObjC != 0 && pObjC >= 0x00100000)
+                                {
+                                    float cx = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjC, 0x94));
+                                    float cz = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjC, 0x98));
+                                    float cy = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjC, 0x9C));
+                                    Console.WriteLine($"  Chain C (0x9DD6C4→+0x0C): mgr=0x{mC:X8} obj=0x{pObjC:X8}  pos=({cx:F1},{cy:F1},{cz:F1})  valid={IsStrictPlausiblePos(cx, cy)}");
+                                }
+                                else Console.WriteLine($"  Chain C (0x9DD6C4→+0x0C): mgr=0x{mC:X8} obj=0x{pObjC:X8}  NULL");
+
+                                // Also show game+0x9CA8A0 content — confirmed position object
+                                int mX = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9CA8A0));
+                                if (mX != 0 && mX >= 0x00100000)
+                                {
+                                    float dx = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mX, 0x034));
+                                    float dy = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mX, 0x038));
+                                    float dz = MemoryHelper.ReadFloat(hProcess, Ptr32Add(mX, 0x03C));
+                                    Console.WriteLine($"  Chain D (game+0x9CA8A0): obj=0x{mX:X8}  +0x034=({dx:F1},{dy:F1},{dz:F1})  valid={IsStrictPlausiblePos(dx, dy)}");
+                                }
+                                else Console.WriteLine($"  Chain D (game+0x9CA8A0): = 0x{mX:X8}  NULL");
+
+                                // Dump the shared target object (0x0BBE08D8 style) to find where
+                                // position is actually stored in this game version.
+                                int dumpTarget = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4514));
+                                if (dumpTarget != 0 && dumpTarget >= 0x00100000)
+                                {
+                                    Console.WriteLine($"\n  Dumping object 0x{dumpTarget:X8} (0x200 bytes) — looking for world coordinates:");
+                                    var dBuf = new byte[0x200];
+                                    MemoryHelper.ReadProcessMemory(hProcess, Ptr32(dumpTarget), dBuf, 0x200, out int dRead);
+                                    Console.WriteLine($"  {"Off",-6} {"float":>12}  note");
+                                    for (int di = 0; di + 4 <= dRead; di += 4)
+                                    {
+                                        float fv = BitConverter.ToSingle(dBuf, di);
+                                        if (float.IsNaN(fv) || float.IsInfinity(fv)) continue;
+                                        float af = Math.Abs(fv);
+                                        // World coordinates: 200–30000 (our observed range)
+                                        if (af >= 200f && af <= 30000f)
+                                            Console.WriteLine($"  +0x{di:X3}  {fv,12:F1}  ← COORD?");
+                                    }
+
+                                    // Also dump 9CA8A0 target
+                                    if (mX != 0 && mX >= 0x00100000)
+                                    {
+                                        Console.WriteLine($"\n  Dumping game+0x9CA8A0 target 0x{mX:X8}:");
+                                        var xBuf = new byte[0x100];
+                                        MemoryHelper.ReadProcessMemory(hProcess, Ptr32(mX), xBuf, 0x100, out int xRead);
+                                        for (int di = 0; di + 4 <= xRead; di += 4)
+                                        {
+                                            float fv = BitConverter.ToSingle(xBuf, di);
+                                            if (float.IsNaN(fv) || float.IsInfinity(fv)) continue;
+                                            float af = Math.Abs(fv);
+                                            if (af >= 200f && af <= 30000f)
+                                                Console.WriteLine($"  +0x{di:X3}  {fv,12:F1}  ← COORD?");
+                                        }
                                     }
                                 }
                             }
