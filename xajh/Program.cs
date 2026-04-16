@@ -1706,6 +1706,7 @@ namespace Xajh
                 // Memory layout at pos offsets: +0x94 = X_ground, +0x98 = Z_height, +0x9C = Y_ground
                 {
                     bool p6ok = false;
+                    int p6Obj = 0;
                     float p6x = 0, p6y = 0, p6z = 0;
                     string p6src = "";
 
@@ -1721,7 +1722,7 @@ namespace Xajh
                                 float ay = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjA, pOff + 8));  // +8 = Y in x,z,y layout
                                 if (!IsStrictPlausiblePos(ax, ay) || IsDirectFallbackLikelyWrong(ax, ay)) continue;
                                 float az = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjA, pOff + 4));
-                                p6ok = true; p6x = ax; p6y = ay; p6z = az;
+                                p6ok = true; p6Obj = pObjA; p6x = ax; p6y = ay; p6z = az;
                                 p6src = $"xajh-A(obj=0x{pObjA:X8},po=0x{pOff:X2})";
                                 break;
                             }
@@ -1746,7 +1747,7 @@ namespace Xajh
                                         float by = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjB, pOff + 8));
                                         if (!IsStrictPlausiblePos(bx, by) || IsDirectFallbackLikelyWrong(bx, by)) continue;
                                         float bz = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjB, pOff + 4));
-                                        p6ok = true; p6x = bx; p6y = by; p6z = bz;
+                                        p6ok = true; p6Obj = pObjB; p6x = bx; p6y = by; p6z = bz;
                                         p6src = $"xajh-B(obj=0x{pObjB:X8},po=0x{pOff:X2})";
                                         break;
                                     }
@@ -1770,7 +1771,7 @@ namespace Xajh
                                     float cy = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjC, pOff + 8));
                                     if (!IsStrictPlausiblePos(cx, cy) || IsDirectFallbackLikelyWrong(cx, cy)) continue;
                                     float cz = MemoryHelper.ReadFloat(hProcess, Ptr32Add(pObjC, pOff + 4));
-                                    p6ok = true; p6x = cx; p6y = cy; p6z = cz;
+                                    p6ok = true; p6Obj = pObjC; p6x = cx; p6y = cy; p6z = cz;
                                     p6src = $"xajh-C(obj=0x{pObjC:X8},po=0x{pOff:X2})";
                                     break;
                                 }
@@ -1780,6 +1781,7 @@ namespace Xajh
 
                     if (p6ok)
                     {
+                        turn.SetPlayerObjectHint(p6Obj);
                         directCx = p6x; directCy = p6y; directCz = p6z; hasDirectCache = true;
                         lastDirectSource = p6src;
                         return (p6x, p6y, p6z);
