@@ -2772,11 +2772,15 @@ namespace Xajh
                 var curNpc = nearby.First(e => e.npc.Oid == autoLastTargetOid);
                 autoKillTimeMs = 0;
 
-                // Continuously write target NPC coords to Cloud's face globals [9D5594/9D569C].
-                // Cloud's timer reads these every ~500ms and turns + fights toward that position.
-                // Continuously write ALL rotation matrix copies to maintain facing toward NPC
-                // Don't call SetFacingDirect during combat — only on initial engage
-                return $"→ {curNpc.npc.Name} d={curNpc.distXY:F0}  oid={autoLastTargetOid}  fighting({(Environment.TickCount64 - autoLastFightMs) / 1000}s)  ({nearby.Count} npcs)";
+                long secsFighting = (Environment.TickCount64 - autoLastFightMs) / 1000;
+                // If we've been "fighting" 8+ seconds without kill on same target,
+                // auto-fight probably turned off. Press F once to toggle back ON.
+                if (secsFighting >= 8 && Environment.TickCount64 - autoLastFMs > 8000)
+                {
+                    autoLastFMs = Environment.TickCount64;
+                    turn.TriggerFight();  // flip F state
+                }
+                return $"→ {curNpc.npc.Name} d={curNpc.distXY:F0}  oid={autoLastTargetOid}  fighting({secsFighting}s)  ({nearby.Count} npcs)";
             }
 
             try
@@ -3633,9 +3637,9 @@ namespace Xajh
                             var nearby4 = GetNearbyNpcs();
                             if (nearby4.Count == 0) { Console.WriteLine("[Z] No NPCs"); break; }
                             var n = nearby4.OrderBy(e => e.distXY).First();
-                            Console.WriteLine($"[Z] TurnByKeys (A/D loop) → ({n.npc.X:F0}, {n.npc.Y:F0}) {n.npc.Name}");
-                            turn.TurnByKeys(n.npc.X, n.npc.Y);
-                            Console.WriteLine("[Z] done");
+                            Console.WriteLine($"[Z] AttackTarget(0x6871AF) → ({n.npc.X:F0}, {n.npc.Y:F0}) {n.npc.Name}");
+                            turn.AttackTarget(n.npc.X, n.npc.Y);
+                            Console.WriteLine("[Z] done — watch if player attacks that NPC");
                         }
                         else if (key == ConsoleKey.V)
                         {

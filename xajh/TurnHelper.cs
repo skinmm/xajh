@@ -48,6 +48,7 @@ namespace xajh
             AttachThreadInput(curTid, fgTid, false);
         }
         [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] static extern uint SendInput(uint nInputs, SINPUT[] pInputs, int cbSize);
         [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extraInfo);
         [DllImport("user32.dll")] static extern uint MapVirtualKey(uint uCode, uint uMapType);
@@ -353,7 +354,55 @@ namespace xajh
             return true;
         }
 
-        /// <summary>Call game function 0x6871AF — uses item from inventory (e.g. 全抗散).</summary>
+        /// <summary>Call game function 0x6871AF — attack toward (face_X, face_Y).
+        /// Matches DLL wrapper at 0x100022A0. Writes coords to face globals, then calls with
+        /// push face_Y, push face_X, push state, ECX=playerObj, call 0x6871AF, [0xDD55A4]=1.</summary>
+        public bool AttackTarget(float tx, float ty)
+        {
+            // Write target coords to face globals (where the game func reads them)
+            MemoryHelper.WriteFloat(_hProcess, new IntPtr(0xDD5594), tx);
+            MemoryHelper.WriteFloat(_hProcess, new IntPtr(0xDD569C), ty);
+
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0xA1, 0xA0, 0xA8, 0xDC, 0x00,                // mov eax, [0xDCA8A0] (chainD)
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x3A,                                   // jz popad (+58)
+                0x8B, 0x80, 0x48, 0x06, 0x00, 0x00,          // mov eax, [eax+0x648] (combat_obj)
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x30,                                   // jz popad (+48)
+                0xFF, 0x70, 0x14,                             // push [eax+0x14] (state)
+                0xFF, 0x35, 0x94, 0x55, 0xDD, 0x00,          // push [0xDD5594] (face_X)
+                0xFF, 0x35, 0x9C, 0x56, 0xDD, 0x00,          // push [0xDD569C] (face_Y)
+                0xA1, 0x14, 0x45, 0xDD, 0x00,                // mov eax, [0xDD4514] (playerObj)
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x15,                                   // jz cleanup (+21)
+                0x8B, 0xC8,                                   // mov ecx, eax (ECX=playerObj)
+                0xB8, 0xAF, 0x71, 0x68, 0x00,                // mov eax, 0x006871AF
+                0xFF, 0xD0,                                   // call eax
+                0xC7, 0x05, 0xA4, 0x55, 0xDD, 0x00, 0x01, 0x00, 0x00, 0x00,  // [0xDD55A4]=1
+                0xEB, 0x03,                                   // jmp +3 → popad
+                // cleanup: add esp, 0x0C
+                0x83, 0xC4, 0x0C,                             // add esp, 0xC (remove 3 pushed args)
+                // end (popad here):
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out _);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 1000);
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>Legacy shellcode - was triggering "use item" because of wrong arg order.</summary>
         public bool UseItem()
         {
 
@@ -417,9 +466,6 @@ namespace xajh
 
             ForceForeground(_gameHwnd);
             Thread.Sleep(20);
-            IntPtr fg = GetForegroundWindow();
-            bool inForeground = (fg == _gameHwnd);
-            Console.WriteLine($"  [TurnByKeys] fg match={inForeground} want=({wantX:F2},{wantY:F2})");
 
             for (int iter = 0; iter < 30; iter++)
             {
@@ -429,14 +475,13 @@ namespace xajh
                 float curDxn = f014;
                 float curDyn = -f010;
                 float dot = curDxn * wantX + curDyn * wantY;
-                if (dot > 0.995f) return; // within ~6°
+                if (dot > 0.998f) return; // within ~3.5°
 
                 float cross = curDxn * wantY - curDyn * wantX;
                 byte vk = (byte)(cross > 0 ? 0x41 : 0x44); // A=left, D=right
                 byte sc = (byte)MapVirtualKey(vk, 0);
 
                 float angleDeg = (float)(Math.Acos(Math.Max(-1f, Math.Min(1f, dot))) * 180.0 / Math.PI);
-                Console.WriteLine($"    iter{iter}: cur=({curDxn:F2},{curDyn:F2}) dot={dot:F2} angle={angleDeg:F0}° press={(char)vk}");
                 int holdMs;
                 if (angleDeg > 90) holdMs = 150;
                 else if (angleDeg > 30) holdMs = 80;
@@ -450,16 +495,109 @@ namespace xajh
             }
         }
 
+        /// <summary>Check auto-fight state via combat_obj+0x14.</summary>
+        public bool IsFightOn()
+        {
+            int chainD = MemoryHelper.ReadInt32(_hProcess, new IntPtr(ADDR_CHAIN_D));
+            if (chainD == 0) return false;
+            int combatObj = MemoryHelper.ReadInt32(_hProcess, new IntPtr((uint)chainD + 0x648));
+            if (combatObj < 0x1000000) return false;
+            int state = MemoryHelper.ReadInt32(_hProcess, new IntPtr((uint)combatObj + 0x14));
+            return state == 0x7A77;
+        }
+
+        /// <summary>Call game function 0x6859AE(4, 2, 8) — from DLL call #3/#4.
+        /// ECX chain: [0xD78AE0]+0x58+0x0C+0x94. Post-flag: [0xDD557C]=1.</summary>
+        public bool GameAttack()
+        {
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x6A, 0x04,                                   // push 4
+                0x6A, 0x02,                                   // push 2
+                0x6A, 0x08,                                   // push 8
+                0xA1, 0xE0, 0x8A, 0xD7, 0x00,                // mov eax, [0xD78AE0]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x2B,                                   // jz cleanup (+43)
+                0x8B, 0x40, 0x58,                             // mov eax, [eax+0x58]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x24,                                   // jz (+36)
+                0x8B, 0x40, 0x0C,                             // mov eax, [eax+0x0C]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x1D,                                   // jz (+29)
+                0x8B, 0x88, 0x94, 0x00, 0x00, 0x00,           // mov ecx, [eax+0x94]
+                0x85, 0xC9,                                   // test ecx, ecx
+                0x74, 0x13,                                   // jz (+19)
+                0xB8, 0xAE, 0x59, 0x68, 0x00,                 // mov eax, 0x6859AE
+                0xFF, 0xD0,                                   // call eax
+                // set trigger flag:
+                0xC7, 0x05, 0x7C, 0x55, 0xDD, 0x00, 0x01, 0x00, 0x00, 0x00,  // mov [0xDD557C], 1
+                0xEB, 0x03,                                   // jmp +3 (skip cleanup)
+                // cleanup if any jz taken: add esp, 0x0C (3 args pushed)
+                0x83, 0xC4, 0x0C,                             // add esp, 0x0C
+                // common end:
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out _);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 1000);
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>OLD unused placeholder</summary>
+        public bool _OldGameAttack()
+        {
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x6A, 0x01,                                   // push 1
+                0x6A, 0x01,                                   // push 1
+                0xA1, 0x14, 0x45, 0xDD, 0x00,                // mov eax, [0xDD4514] (playerObj)
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x13,                                   // jz end (+19)
+                0x8B, 0x88, 0x94, 0x00, 0x00, 0x00,          // mov ecx, [eax+0x94]
+                0x85, 0xC9,                                   // test ecx, ecx
+                0x74, 0x09,                                   // jz end (+9)
+                0xB8, 0x3F, 0x41, 0x68, 0x00,                // mov eax, 0x68413F
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x04,                                   // jmp skip cleanup pops
+                // end — clean up stack if we jumped
+                0x83, 0xC4, 0x08,                            // add esp, 8 (clean pushed args)
+                0x90,                                         // nop
+                // common end:
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out _);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 1000);
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
         public bool AttackNpc(uint npcObjAddr, float tx = 0f, float ty = 0f)
         {
-            // Only skip turn if both coords are exactly 0 (unset defaults)
             if (!(tx == 0f && ty == 0f))
             {
                 TurnByKeys(tx, ty);
             }
-            TriggerTarget();   // X
-            Thread.Sleep(80);
-            TriggerFight();    // F
+            TriggerTarget();   // X — select target
+            Thread.Sleep(100);
+            TriggerFight();    // F — one press
             return true;
         }
 
@@ -542,15 +680,16 @@ namespace xajh
             return true;
         }
 
-        public bool TriggerFight(int holdMs = 10)
+        public bool TriggerFight(int holdMs = 50)
         {
             if (_gameHwnd == IntPtr.Zero) return false;
             ForceForeground(_gameHwnd);
-            Thread.Sleep(15);
+            Thread.Sleep(30);
             byte sc = (byte)MapVirtualKey((uint)VK_F, 0);
             keybd_event((byte)VK_F, sc, 0, UIntPtr.Zero);
             Thread.Sleep(holdMs);
             keybd_event((byte)VK_F, sc, 2, UIntPtr.Zero);
+            Thread.Sleep(20);
             return true;
         }
 
