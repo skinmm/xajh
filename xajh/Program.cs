@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using xajh;
@@ -23,6 +24,26 @@ namespace Xajh
         static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr dwExtraInfo; }
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit)]
+        struct INPUTUNION { [System.Runtime.InteropServices.FieldOffset(0)] public MOUSEINPUT mi; [System.Runtime.InteropServices.FieldOffset(0)] public KEYBDINPUT ki; }
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct INPUT { public uint type; public INPUTUNION u; }
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint dwFreeType);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpAttr, uint stackSize, IntPtr lpStart, IntPtr lpParam, uint flags, out uint lpThreadId);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        static extern uint WaitForSingleObject(IntPtr hObject, uint dwMs);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        static extern bool CloseHandle(IntPtr hObject);
         [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
         struct RECT { public int Left, Top, Right, Bottom; }
 
@@ -1343,6 +1364,14 @@ namespace Xajh
             }
 
             var turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+            // Set game's main thread ID for in-thread shellcode injection
+            var gameHwnd = GetGameHwnd();
+            if (gameHwnd != IntPtr.Zero)
+            {
+                uint gameThreadId = GetWindowThreadProcessId(gameHwnd, out uint _);
+                turn.SetMainThreadId(gameThreadId);
+                Console.WriteLine($"[init] Game main thread ID: {gameThreadId}");
+            }
             var locCmd = new LocCommand(hProcess, moduleBase, GetGameHwnd);
             var npcSnapshotLock = new object();
             var npcSnapshot = new List<Npc>();
@@ -1451,6 +1480,17 @@ namespace Xajh
             Console.WriteLine();
 
             bool autoFace = false;
+            uint autoLastTargetOid = 0;  // OID from npc_obj+0x644
+            float autoLastFacedX = float.NaN, autoLastFacedY = float.NaN;
+            long autoKillTimeMs = 0;
+            long autoLastFightMs = 0;
+            long autoLastFMs = 0;
+            long autoLastFaceMs = 0;  // for DLL@16A0 face re-calls at 500ms
+            uint autoLastTargetObjAddr = 0;  // NpcObjAddr of current target for death check
+            float autoLastTargetPosX = float.NaN, autoLastTargetPosY = float.NaN;
+            long autoTargetFrozenMs = 0;    // when target position first froze
+            int autoLastNpcCount = 0;      // detect kill when count drops
+            const long MaxFightMs = 0;   // unused — no timeout reset
             float aimRadius = 300f;
             bool lastPosReliable = false;  // updated by ReadPlayerPos; accessible by AimNearest/GetNearbyNpcs
             Console.WriteLine($"[*] Aim radius: {aimRadius:F0}");
@@ -2675,30 +2715,68 @@ namespace Xajh
                         var (n, dxy, d3d) = nearby[i];
                         Console.WriteLine($"  {i + 1,2}. {n.Name,-20} {dxy,7:F0} {d3d,7:F0}  {n.X,9:F1} {n.Y,9:F1} {n.Z,9:F1}   {n.X - px,8:F1} {n.Y - py,8:F1} {n.Z - pz,8:F1}");
                     }
-                    if (nearby.Count == 0) { return "[!] No NPCs found"; }
+                    if (nearby.Count == 0)
+                    {
+                        autoLastTargetOid = 0;
+                        autoKillTimeMs = 0;
+                        return "[!] No NPCs found";
+                    }
                     Console.WriteLine();
                 }
                 else if (nearby.Count == 0)
+                {
+                    autoLastTargetOid = 0;
+                    autoKillTimeMs = 0;
                     return "[!] No NPCs found";
-
-                var (target, distXY, _) = nearby[0];
-
-                if (lastPosReliable)
-                {
-                    // Full turn + fight when we have a reliable position
-                    string r = turn.FaceTarget(() => ReadPlayerPos(), target.X, target.Y);
-                    bool fightTriggered = false;
-                    if (!r.StartsWith("[!]"))
-                        fightTriggered = turn.TriggerTargetAndFight();
-                    string fightStatus = fightTriggered ? "target=X fight=F" : "target/fight=!";
-                    return $"→ {target.Name} d={distXY:F0}  {r}  {fightStatus}  ({nearby.Count} npcs)";
                 }
-                else
+
+                // Only check if current target still in nearby list; don't read obj+0x644
+                // (obj addr gets reused, leading to false death signals)
+
+                // Count-drop kill signal
+                bool countDropped = false;
+                if (autoLastNpcCount > 0 && nearby.Count < autoLastNpcCount
+                    && nearby.Count <= autoLastNpcCount + 2)
+                    countDropped = true;
+                if (nearby.Count <= autoLastNpcCount + 10)
+                    autoLastNpcCount = nearby.Count;
+                if (countDropped && autoLastTargetOid != 0)
                 {
-                    // Position unreliable — skip turn, just send X (game auto-selects nearest) + F
-                    bool ok = turn.TriggerTargetAndFight();
-                    return $"→ {target.Name} [no-pos: X+F only]  {(ok ? "sent" : "!")}  ({nearby.Count} npcs)";
+                    autoLastTargetOid = 0;
+                    autoLastTargetObjAddr = 0;
+                    autoKillTimeMs = 0;
+                    autoLastFightMs = 0;
                 }
+
+                bool currentTargetAlive = autoLastTargetOid != 0 &&
+                    nearby.Any(e => e.npc.Oid == autoLastTargetOid);
+
+                if (autoLastTargetOid == 0 || !currentTargetAlive)
+                {
+                    if (autoKillTimeMs == 0 && autoLastTargetOid != 0)
+                        autoKillTimeMs = Environment.TickCount64;
+                    long waitedMs = autoKillTimeMs > 0 ? Environment.TickCount64 - autoKillTimeMs : 500;
+                    if (waitedMs < 100)
+                        return $"kill-pause({100 - waitedMs}ms)...";
+                    autoKillTimeMs = 0;
+                    var next = nearby.OrderBy(e => e.distXY).First();
+                    autoLastFightMs = Environment.TickCount64;
+                    autoLastFMs = Environment.TickCount64;
+                    autoLastTargetOid = next.npc.Oid;
+                    autoLastTargetObjAddr = next.npc.NpcObjAddr;
+                    turn.ResetFightState(); // game exits F-mode after kill, need to re-press F
+                    turn.AttackNpc(next.npc.NpcObjAddr, next.npc.X, next.npc.Y);
+                    return $"→ {next.npc.Name} d={next.distXY:F0}  oid={next.npc.Oid}  turned+attack  ({nearby.Count} npcs)";
+                }
+
+                var curNpc = nearby.First(e => e.npc.Oid == autoLastTargetOid);
+                autoKillTimeMs = 0;
+
+                // Continuously write target NPC coords to Cloud's face globals [9D5594/9D569C].
+                // Cloud's timer reads these every ~500ms and turns + fights toward that position.
+                // Continuously write ALL rotation matrix copies to maintain facing toward NPC
+                // Don't call SetFacingDirect during combat — only on initial engage
+                return $"→ {curNpc.npc.Name} d={curNpc.distXY:F0}  oid={autoLastTargetOid}  fighting({(Environment.TickCount64 - autoLastFightMs) / 1000}s)  ({nearby.Count} npcs)";
             }
 
             try
@@ -2823,6 +2901,33 @@ namespace Xajh
                         {
                             turn.ResetCalibration();
                             Console.WriteLine("[C] Calibration reset");
+
+                            // Verify: write a 90° turn and read back to confirm the write sticks
+                            Console.WriteLine("[C] Testing rotation write on all chain objects...");
+                            int cMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                            foreach (int lo in new[] { 0x08, 0x0C })
+                                foreach (int oo in new[] { 0x48, 0x4C, 0x50, 0x54 })
+                                {
+                                    int cList = cMgr != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(cMgr, lo)) : 0;
+                                    int cObj = cList != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(cList, oo)) : 0;
+                                    if (cObj == 0 || cObj < 0x00100000) continue;
+                                    // Read before
+                                    float cosBefore = MemoryHelper.ReadFloat(hProcess, Ptr32Add(cObj, 0x10));
+                                    float sinBefore = MemoryHelper.ReadFloat(hProcess, Ptr32Add(cObj, 0x14));
+                                    // Write 90°
+                                    float testCos = 0f; float testSin = 1f;
+                                    MemoryHelper.WriteFloat(hProcess, Ptr32Add(cObj, 0x10), testCos);
+                                    MemoryHelper.WriteFloat(hProcess, Ptr32Add(cObj, 0x14), testSin);
+                                    Thread.Sleep(50);
+                                    // Read after
+                                    float cosAfter = MemoryHelper.ReadFloat(hProcess, Ptr32Add(cObj, 0x10));
+                                    float sinAfter = MemoryHelper.ReadFloat(hProcess, Ptr32Add(cObj, 0x14));
+                                    bool stuck = Math.Abs(cosAfter - testCos) < 0.05f;
+                                    // Restore
+                                    MemoryHelper.WriteFloat(hProcess, Ptr32Add(cObj, 0x10), cosBefore);
+                                    MemoryHelper.WriteFloat(hProcess, Ptr32Add(cObj, 0x14), sinBefore);
+                                    Console.WriteLine($"  +0x{lo:X2}+0x{oo:X2} obj=0x{cObj:X8}  before=({cosBefore:F3},{sinBefore:F3})  after=({cosAfter:F3},{sinAfter:F3})  STICKS={stuck}");
+                                }
                         }
                         else if (key == ConsoleKey.W)
                         {
@@ -2865,6 +2970,391 @@ namespace Xajh
                         else if (key == ConsoleKey.P)
                         {
                             combat.DumpPlayerObject();
+                        }
+                        else if (key == ConsoleKey.O)
+                        {
+                            // Orientation scan: find ALL memory locations containing the current
+                            // player rotation matrix. One of them is the renderer's model matrix.
+                            // Steps:
+                            //   1. Read current yaw from known logic object
+                            //   2. Scan all committed memory for (cos, sin) float pair
+                            //   3. Write a 90° test to each candidate, wait 80ms, see if player turned
+                            //   4. Report which address caused a visible change (yaw read confirms)
+
+                            int oMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                            int oList = oMgr != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(oMgr, 0x08)) : 0;
+                            int oObjA = oList != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(oList, 0x4C)) : 0;
+                            if (oObjA == 0) { Console.WriteLine("[O] Could not resolve player object"); goto skipO; }
+
+                            float oCos = MemoryHelper.ReadFloat(hProcess, Ptr32Add(oObjA, 0x10));
+                            float oSin = MemoryHelper.ReadFloat(hProcess, Ptr32Add(oObjA, 0x14));
+                            Console.WriteLine($"[O] Current rotation: cos={oCos:F4} sin={oSin:F4}");
+                            Console.WriteLine($"[O] Scanning all memory for matching float pairs (tolerance 0.002)...");
+
+                            var oHits = new System.Collections.Generic.List<IntPtr>();
+                            {
+                                IntPtr addr = IntPtr.Zero;
+                                int scanned = 0;
+                                while (true)
+                                {
+                                    if (!MemoryHelper.VirtualQueryEx(hProcess, addr, out var mbi, (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryHelper.MEMORY_BASIC_INFORMATION>()))
+                                        break;
+                                    bool readable = mbi.State == MemoryHelper.MEM_COMMIT &&
+                                        (mbi.Protect == MemoryHelper.PAGE_READWRITE ||
+                                         mbi.Protect == MemoryHelper.PAGE_EXECUTE_READWRITE);
+                                    if (readable)
+                                    {
+                                        int rsz = (int)Math.Min(mbi.RegionSize.ToInt64(), 0x800000);
+                                        var rbuf = new byte[rsz];
+                                        MemoryHelper.ReadProcessMemory(hProcess, mbi.BaseAddress, rbuf, rsz, out int nRead);
+                                        for (int ri = 0; ri + 8 <= nRead; ri += 4)
+                                        {
+                                            float fc = BitConverter.ToSingle(rbuf, ri);
+                                            float fs = BitConverter.ToSingle(rbuf, ri + 4);
+                                            if (Math.Abs(fc - oCos) < 0.002f && Math.Abs(fs - oSin) < 0.002f &&
+                                                !float.IsNaN(fc) && !float.IsNaN(fs))
+                                            {
+                                                oHits.Add(IntPtr.Add(mbi.BaseAddress, ri));
+                                            }
+                                        }
+                                        scanned++;
+                                    }
+                                    long next = addr.ToInt64() + mbi.RegionSize.ToInt64();
+                                    if (next <= 0 || next >= 0x7FFFFFFF) break;
+                                    addr = new IntPtr(next);
+                                }
+                            }
+                            Console.WriteLine($"[O] Found {oHits.Count} candidate addresses");
+
+                            // Test each: write 90° (cos=0, sin=1), wait 80ms, read back current yaw
+                            // If yaw changed externally (not just our write), it's the renderer matrix
+                            float testCos = 0f, testSin = 1f;
+                            int tested = 0;
+                            foreach (var hit in oHits)
+                            {
+                                if (tested >= 200) { Console.WriteLine("[O] Tested 200, stopping"); break; }
+                                // Skip the known logic object
+                                long diff = Math.Abs(hit.ToInt64() - (long)(uint)oObjA - 0x10);
+                                if (diff < 0x200) { tested++; continue; }
+
+                                // Read before
+                                float cbefore = MemoryHelper.ReadFloat(hProcess, hit);
+                                // Write test value
+                                MemoryHelper.WriteFloat(hProcess, hit, testCos);
+                                MemoryHelper.WriteFloat(hProcess, IntPtr.Add(hit, 4), testSin);
+                                Thread.Sleep(80);
+                                // Read current yaw from known logic obj
+                                float newYaw = MemoryHelper.ReadFloat(hProcess, Ptr32Add(oObjA, 0x10));
+                                float stuckVal = MemoryHelper.ReadFloat(hProcess, hit);
+                                bool sticks = Math.Abs(stuckVal - testCos) < 0.01f;
+                                // Restore
+                                MemoryHelper.WriteFloat(hProcess, hit, cbefore);
+                                MemoryHelper.WriteFloat(hProcess, IntPtr.Add(hit, 4), oSin);
+
+                                if (sticks)
+                                    Console.WriteLine($"  0x{hit.ToInt64():X8}  STICKS  (logic_yaw_after={newYaw:F3})");
+                                tested++;
+                            }
+                            Console.WriteLine("[O] Scan complete");
+
+                            // Phase 2: write 90° to ALL non-DLL candidates simultaneously and hold 2s.
+                            // If the player visually turns, the renderer matrix is in this group.
+                            var heapCandidates = new System.Collections.Generic.List<IntPtr>();
+                            foreach (var hit in oHits)
+                            {
+                                long a = hit.ToInt64();
+                                long diff = Math.Abs(a - (long)(uint)oObjA - 0x10);
+                                if (diff < 0x200) continue;          // skip known logic obj
+                                if (a >= 0x10000000 && a < 0x20000000) continue; // skip DLL range
+                                heapCandidates.Add(hit);
+                            }
+                            Console.WriteLine($"[O] Phase 2: writing 90° to {heapCandidates.Count} heap candidates for 2s — watch screen!");
+                            long restoreAt = Environment.TickCount64 + 2000;
+                            var savedVals = new float[heapCandidates.Count * 2];
+                            for (int hi = 0; hi < heapCandidates.Count; hi++)
+                            {
+                                savedVals[hi * 2] = MemoryHelper.ReadFloat(hProcess, heapCandidates[hi]);
+                                savedVals[hi * 2 + 1] = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(heapCandidates[hi], 4));
+                                MemoryHelper.WriteFloat(hProcess, heapCandidates[hi], 0f);  // cos(90°)=0
+                                MemoryHelper.WriteFloat(hProcess, IntPtr.Add(heapCandidates[hi], 4), 1f); // sin(90°)=1
+                            }
+                            Thread.Sleep(2000);
+                            // Restore all
+                            for (int hi = 0; hi < heapCandidates.Count; hi++)
+                            {
+                                MemoryHelper.WriteFloat(hProcess, heapCandidates[hi], savedVals[hi * 2]);
+                                MemoryHelper.WriteFloat(hProcess, IntPtr.Add(heapCandidates[hi], 4), savedVals[hi * 2 + 1]);
+                            }
+                            Console.WriteLine("[O] Phase 2 restored. Did player turn?");
+                            Console.WriteLine("[O] Heap candidates were: " + string.Join(", ", heapCandidates.ConvertAll(h => $"0x{h.ToInt64():X8}")));
+
+                            // Phase 3: find the WORLD transform matrix — must contain BOTH
+                            // rotation (cos/sin) AND player position (X,Y from Chain D).
+                            // View matrices rotate the camera but have no position component.
+                            // World matrices have translation row/column with player coords.
+                            var (wpx, wpy, _) = ReadPlayerPos();
+                            Console.WriteLine($"[O] Phase 3: searching for world matrix with pos≈({wpx:F0},{wpy:F0}) near rotation...");
+                            var worldHits = new System.Collections.Generic.List<(IntPtr addr, float px, float py, int posOff)>();
+                            foreach (var hit in oHits)
+                            {
+                                long a = hit.ToInt64();
+                                if (a >= 0x10000000) continue; // skip DLL range
+                                // Check offsets +0x08 to +0x50 for player position floats
+                                for (int posOff = 0x08; posOff <= 0x50; posOff += 4)
+                                {
+                                    float fx = MemoryHelper.ReadFloat(hProcess, new IntPtr(a + posOff));
+                                    float fy = MemoryHelper.ReadFloat(hProcess, new IntPtr(a + posOff + 4));
+                                    if (float.IsNaN(fx) || float.IsNaN(fy)) continue;
+                                    if (Math.Abs(fx - wpx) < 5f && Math.Abs(fy - wpy) < 5f)
+                                    {
+                                        worldHits.Add((hit, fx, fy, posOff));
+                                        Console.WriteLine($"  ★ WORLD MATRIX: 0x{a:X8}  rot=(cos,sin)+pos@+0x{posOff:X2}=({fx:F1},{fy:F1})");
+                                    }
+                                }
+                            }
+                            if (worldHits.Count == 0)
+                                Console.WriteLine("[O] No world matrix found — position not adjacent to rotation in these objects");
+                            else
+                            {
+                                Console.WriteLine($"[O] Found {worldHits.Count} world matrix candidate(s) — testing turn...");
+                                foreach (var (waddr, _, _, _) in worldHits)
+                                {
+                                    long wa = waddr.ToInt64();
+                                    float wsave0 = MemoryHelper.ReadFloat(hProcess, waddr);
+                                    float wsave4 = MemoryHelper.ReadFloat(hProcess, new IntPtr(wa + 4));
+                                    MemoryHelper.WriteFloat(hProcess, waddr, 0f);
+                                    MemoryHelper.WriteFloat(hProcess, new IntPtr(wa + 4), 1f);
+                                    Thread.Sleep(1500);
+                                    MemoryHelper.WriteFloat(hProcess, waddr, wsave0);
+                                    MemoryHelper.WriteFloat(hProcess, new IntPtr(wa + 4), wsave4);
+                                    Console.WriteLine($"  Tested 0x{wa:X8} for 1.5s — did that one turn?");
+                                }
+                            }
+                            // Phase 3: scan ALL memory for player position (X,Y), then check
+                            // if rotation data (cos,sin) is within ±0x80 bytes.
+                            // A world transform has BOTH position and rotation in the same matrix.
+                            var (wpx3, wpy3, _) = ReadPlayerPos();
+                            Console.WriteLine($"\n[O] Phase 3: scanning for world matrix — pos=({wpx3:F1},{wpy3:F1}) + rotation nearby...");
+                            var worldCandidates = new System.Collections.Generic.List<(long posAddr, int rotOff)>();
+                            {
+                                IntPtr addr3 = IntPtr.Zero;
+                                while (true)
+                                {
+                                    if (!MemoryHelper.VirtualQueryEx(hProcess, addr3, out var mbi3,
+                                        (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryHelper.MEMORY_BASIC_INFORMATION>())) break;
+                                    bool rd3 = mbi3.State == MemoryHelper.MEM_COMMIT &&
+                                        (mbi3.Protect == MemoryHelper.PAGE_READWRITE ||
+                                         mbi3.Protect == MemoryHelper.PAGE_EXECUTE_READWRITE);
+                                    if (rd3)
+                                    {
+                                        int rsz3 = (int)Math.Min(mbi3.RegionSize.ToInt64(), 0x800000);
+                                        var rbuf3 = new byte[rsz3];
+                                        MemoryHelper.ReadProcessMemory(hProcess, mbi3.BaseAddress, rbuf3, rsz3, out int nr3);
+                                        for (int ri3 = 0; ri3 + 8 <= nr3; ri3 += 4)
+                                        {
+                                            float fx3 = BitConverter.ToSingle(rbuf3, ri3);
+                                            float fy3 = BitConverter.ToSingle(rbuf3, ri3 + 4);
+                                            if (Math.Abs(fx3 - wpx3) < 2f && Math.Abs(fy3 - wpy3) < 2f)
+                                            {
+                                                long posA = mbi3.BaseAddress.ToInt64() + ri3;
+                                                // Check ±0x80 for rotation (cos,sin) pair
+                                                for (int rOff = -0x80; rOff <= 0x80; rOff += 4)
+                                                {
+                                                    int bi = ri3 + rOff;
+                                                    if (bi < 0 || bi + 8 > nr3) continue;
+                                                    float rc = BitConverter.ToSingle(rbuf3, bi);
+                                                    float rs = BitConverter.ToSingle(rbuf3, bi + 4);
+                                                    if (Math.Abs(rc - oCos) < 0.003f && Math.Abs(rs - oSin) < 0.003f)
+                                                    {
+                                                        worldCandidates.Add((posA, rOff));
+                                                        Console.WriteLine($"  ★ 0x{posA:X8}  pos=({fx3:F1},{fy3:F1})  rot@+0x{rOff:X2}=(cos,sin)");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    long next3 = addr3.ToInt64() + mbi3.RegionSize.ToInt64();
+                                    if (next3 <= 0 || next3 >= 0x7FFFFFFF) break;
+                                    addr3 = new IntPtr(next3);
+                                }
+                            }
+                            Console.WriteLine($"[O] Phase 3 found {worldCandidates.Count} world matrix candidate(s)");
+
+                            // Test each world matrix candidate individually: write 90° to its rotation part
+                            foreach (var (posA3, rOff3) in worldCandidates)
+                            {
+                                long rotA = posA3 + rOff3;
+                                float save0 = MemoryHelper.ReadFloat(hProcess, new IntPtr(rotA));
+                                float save4 = MemoryHelper.ReadFloat(hProcess, new IntPtr(rotA + 4));
+                                float save1C = MemoryHelper.ReadFloat(hProcess, new IntPtr(rotA + 0x0C));
+                                float save20 = MemoryHelper.ReadFloat(hProcess, new IntPtr(rotA + 0x10));
+                                // Write full 2×2 rotation for 90°: cos=0, sin=1, -sin=-1, cos=0
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(rotA), 0f);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(rotA + 4), 1f);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(rotA + 0x0C), -1f);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(rotA + 0x10), 0f);
+                                Thread.Sleep(1500);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(rotA), save0);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(rotA + 4), save4);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(rotA + 0x0C), save1C);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(rotA + 0x10), save20);
+                                Console.WriteLine($"  Tested rot@0x{rotA:X8} (pos@0x{posA3:X8}) for 1.5s");
+                            }
+                            // Phase 4: test DLL-range (0x10xxxxxx) rotation copies individually.
+                            // These are XajhSmileDll's cached matrices — may feed directly into D3D renderer.
+                            // Previous phases only tested heap (0x0xxxxxxx); DLL copies were skipped.
+                            var dllCandidates = new System.Collections.Generic.List<IntPtr>();
+                            foreach (var hit in oHits)
+                            {
+                                long a4 = hit.ToInt64();
+                                if (a4 >= 0x10000000 && a4 < 0x20000000)
+                                    dllCandidates.Add(hit);
+                            }
+                            Console.WriteLine($"\n[O] Phase 4: testing {dllCandidates.Count} DLL-range copies individually (model mesh check)...");
+                            Console.WriteLine("[O] Watch the player MODEL in 3rd-person — does mesh visually rotate?");
+                            foreach (var hit4 in dllCandidates)
+                            {
+                                long a4 = hit4.ToInt64();
+                                float s0 = MemoryHelper.ReadFloat(hProcess, hit4);
+                                float s4 = MemoryHelper.ReadFloat(hProcess, new IntPtr(a4 + 4));
+                                float s8 = MemoryHelper.ReadFloat(hProcess, new IntPtr(a4 + 0x0C));
+                                float sC = MemoryHelper.ReadFloat(hProcess, new IntPtr(a4 + 0x10));
+                                // Write full 90° rotation
+                                MemoryHelper.WriteFloat(hProcess, hit4, 0f);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(a4 + 4), 1f);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(a4 + 0x0C), -1f);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(a4 + 0x10), 0f);
+                                Thread.Sleep(1000);
+                                // Restore
+                                MemoryHelper.WriteFloat(hProcess, hit4, s0);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(a4 + 4), s4);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(a4 + 0x0C), s8);
+                                MemoryHelper.WriteFloat(hProcess, new IntPtr(a4 + 0x10), sC);
+                                Console.WriteLine($"  Tested 0x{a4:X8} — model turn?");
+                                Thread.Sleep(200);
+                            }
+                            Console.WriteLine("[O] Phase 4 done.");
+
+                            // Phase 5: scan for single heading float.
+                            // The model bone system uses ONE float angle, not a matrix.
+                            // Matrix is computed FROM this angle each frame — writing matrix does nothing.
+                            // Current yaw in multiple representations:
+                            float curYaw5 = (float)Math.Atan2(oSin, oCos);           // radians: -PI..PI
+                            float curYaw5P = curYaw5 < 0 ? curYaw5 + 2f * (float)Math.PI : curYaw5; // 0..2PI
+                            float curDeg5 = curYaw5 * 180f / (float)Math.PI;          // degrees: -180..180
+                            float curDeg5P = curDeg5 < 0 ? curDeg5 + 360f : curDeg5;  // 0..360
+                            Console.WriteLine($"\n[O] Phase 5: scanning for single heading float...");
+                            Console.WriteLine($"  yaw={curYaw5:F4}rad  yaw+={curYaw5P:F4}rad  deg={curDeg5:F2}°  deg+={curDeg5P:F2}°");
+
+                            var angleCandidates = new System.Collections.Generic.List<(IntPtr addr, string repr)>();
+                            {
+                                IntPtr addr5 = IntPtr.Zero;
+                                while (true)
+                                {
+                                    if (!MemoryHelper.VirtualQueryEx(hProcess, addr5, out var mbi5,
+                                        (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryHelper.MEMORY_BASIC_INFORMATION>())) break;
+                                    bool rd5 = mbi5.State == MemoryHelper.MEM_COMMIT &&
+                                        mbi5.Protect == MemoryHelper.PAGE_READWRITE;
+                                    if (rd5)
+                                    {
+                                        int rsz5 = (int)Math.Min(mbi5.RegionSize.ToInt64(), 0x800000);
+                                        var rbuf5 = new byte[rsz5];
+                                        MemoryHelper.ReadProcessMemory(hProcess, mbi5.BaseAddress, rbuf5, rsz5, out int nr5);
+                                        for (int ri5 = 0; ri5 + 4 <= nr5; ri5 += 4)
+                                        {
+                                            float fv = BitConverter.ToSingle(rbuf5, ri5);
+                                            if (float.IsNaN(fv) || float.IsInfinity(fv)) continue;
+                                            var a5 = IntPtr.Add(mbi5.BaseAddress, ri5);
+                                            if (Math.Abs(fv - curYaw5) < 0.0005f) angleCandidates.Add((a5, $"rad={fv:F4}"));
+                                            else if (Math.Abs(fv - curYaw5P) < 0.0005f) angleCandidates.Add((a5, $"rad+={fv:F4}"));
+                                            else if (Math.Abs(fv - curDeg5) < 0.05f) angleCandidates.Add((a5, $"deg={fv:F2}"));
+                                            else if (Math.Abs(fv - curDeg5P) < 0.05f) angleCandidates.Add((a5, $"deg+={fv:F2}"));
+                                        }
+                                    }
+                                    long next5 = addr5.ToInt64() + mbi5.RegionSize.ToInt64();
+                                    if (next5 <= 0 || next5 >= 0x7FFFFFFF) break;
+                                    addr5 = new IntPtr(next5);
+                                }
+                            }
+                            Console.WriteLine($"[O] Phase 5 found {angleCandidates.Count} single-angle candidates");
+                            // Sort: deg= first (most likely for Korean MMO engines), then by address
+                            angleCandidates.Sort((x, y) => {
+                                bool xd = x.repr.StartsWith("deg");
+                                bool yd = y.repr.StartsWith("deg");
+                                if (xd != yd) return xd ? -1 : 1;
+                                return x.addr.ToInt64().CompareTo(y.addr.ToInt64());
+                            });
+                            foreach (var (a5, repr5) in angleCandidates)
+                            {
+                                long av = a5.ToInt64();
+                                if (Math.Abs(av - (long)(uint)oObjA) < 0x400) continue;
+                                if (av >= 0x10000000 && av < 0x20000000) continue;
+                                float save5 = MemoryHelper.ReadFloat(hProcess, a5);
+                                float write5 = repr5.StartsWith("deg") ? 90f : (float)(Math.PI / 2);
+                                MemoryHelper.WriteFloat(hProcess, a5, write5);
+                                Thread.Sleep(1200);
+                                MemoryHelper.WriteFloat(hProcess, a5, save5);
+                                Console.WriteLine($"  0x{av:X8}  {repr5}  → wrote {write5:F3}, restored. Turn?");
+                                Thread.Sleep(150);
+                            }
+                        skipO:;
+                        }
+                        else if (key == ConsoleKey.Y)
+                        {
+                            Console.WriteLine("[Y] Scanning for heading source float (0x400 bytes)...");
+                            Console.WriteLine("    Press [Y] before and after turning to find changed offset.\n");
+
+                            var yObjects = new System.Collections.Generic.List<(string tag, int addr)>();
+                            int yMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
+                            foreach (int lo in new[] { 0x08, 0x0C })
+                                foreach (int oo in new[] { 0x48, 0x4C, 0x50, 0x54 })
+                                {
+                                    int yList = yMgr != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(yMgr, lo)) : 0;
+                                    int yObj = yList != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(yList, oo)) : 0;
+                                    if (yObj != 0 && yObj >= 0x00100000)
+                                        yObjects.Add(($"0x9D4518+0x{lo:X2}+0x{oo:X2}", yObj));
+                                }
+                            int chainDObj = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9CA8A0));
+                            if (chainDObj != 0 && chainDObj >= 0x00100000)
+                                yObjects.Add(("ChainD(0x9CA8A0)", chainDObj));
+
+                            foreach (var (tag, yObj) in yObjects)
+                            {
+                                // Read rotation matrix to compute current yaw
+                                float matCos = MemoryHelper.ReadFloat(hProcess, Ptr32Add(yObj, 0x10));
+                                float matSin = MemoryHelper.ReadFloat(hProcess, Ptr32Add(yObj, 0x14));
+                                float computedYaw = (float)Math.Atan2(matSin, matCos);
+                                float computedDeg = computedYaw * 180f / (float)Math.PI;
+
+                                Console.WriteLine($"  === {tag} = 0x{yObj:X8}  matrix_yaw={computedYaw:F4}rad ({computedDeg:F1}°) ===");
+
+                                var ybuf = new byte[0x400];
+                                MemoryHelper.ReadProcessMemory(hProcess, Ptr32(yObj), ybuf, 0x400, out _);
+                                for (int di = 0; di + 4 <= 0x400; di += 4)
+                                {
+                                    float fv = BitConverter.ToSingle(ybuf, di);
+                                    if (float.IsNaN(fv) || float.IsInfinity(fv)) continue;
+                                    float af = Math.Abs(fv);
+
+                                    // Skip matrix values we already know
+                                    if (di >= 0x010 && di <= 0x020) continue;
+                                    if (di >= 0x040 && di <= 0x060) continue;
+
+                                    // Look for: value close to computed yaw (the source heading)
+                                    bool isYawMatch = Math.Abs(fv - computedYaw) < 0.05f;
+                                    // Radians range
+                                    bool isRad = af > 0.01f && af <= (float)(Math.PI * 2);
+                                    // Degrees (non-matrix) range
+                                    bool isDeg = fv >= -360f && fv <= 360f && af > 0.1f && af < 360f;
+
+                                    if (isYawMatch)
+                                        Console.WriteLine($"    +0x{di:X3}  {fv,9:F4}  ★ MATCHES YAW! ({fv * 180 / (float)Math.PI:F1}°)");
+                                    else if (isRad && af > 0.05f && Math.Abs(Math.Abs(fv) - 1f) > 0.01f)
+                                        Console.WriteLine($"    +0x{di:X3}  {fv,9:F4} rad  ({fv * 180 / (float)Math.PI:F1}°)");
+                                    else if (isDeg && !isRad)
+                                        Console.WriteLine($"    +0x{di:X3}  {fv,9:F2} deg");
+                                }
+                            }
                         }
                         else if (key == ConsoleKey.G)
                         {
@@ -3027,7 +3517,159 @@ namespace Xajh
                             {
                                 Console.WriteLine("[F] Chain not resolvable");
                             }
+
+                            // DLL face-function globals diagnostic
+                            Console.WriteLine("\n[F] DLL face-function globals (for game+0x27E62C→27F644):");
+                            int[] faceGlobals = {
+                                0x9D55C4, // arg to 27E62C (face target value)
+                                0x9D55E4, // flag set after face call
+                                0x9D5594, // arg2 for 2871AF calls
+                                0x9D569C, // arg1 for 2871AF calls
+                                0x9D5574, // used in battle call
+                                0x9D5654, // used in 279B5E call
+                                0x9D5664, // used in 279B5E call
+                            };
+                            foreach (int fg in faceGlobals)
+                            {
+                                int iv = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, fg));
+                                float fv = MemoryHelper.ReadFloat(hProcess, IntPtr.Add(moduleBase, fg));
+                                string floatNote = (!float.IsNaN(fv) && Math.Abs(fv) > 0.01f && Math.Abs(fv) < 100000f) ? $"  float={fv:F2}" : "";
+                                Console.WriteLine($"  game+0x{fg:X}  int=0x{iv:X8} ({iv}){floatNote}");
+                                // If it looks like a pointer, follow it
+                                if (iv >= 0x00100000 && iv < 0x20000000)
+                                {
+                                    float f0 = MemoryHelper.ReadFloat(hProcess, new IntPtr((uint)iv));
+                                    float f4 = MemoryHelper.ReadFloat(hProcess, new IntPtr((uint)iv + 4));
+                                    float f8 = MemoryHelper.ReadFloat(hProcess, new IntPtr((uint)iv + 8));
+                                    Console.WriteLine($"    → [0x{iv:X8}] = ({f0:F2}, {f4:F2}, {f8:F2})");
+                                }
+                            }
                             Console.WriteLine();
+                        }
+                        else if (key == ConsoleKey.N)
+                        {
+                            Console.WriteLine("[N] NPC OID scan:");
+                            var noids = GetNearbyNpcs();
+                            int cnt = Math.Min(noids.Count, 6);
+                            if (cnt == 0) { Console.WriteLine("  No NPCs"); break; }
+
+                            // Show NPC list with addresses
+                            for (int ni = 0; ni < cnt; ni++)
+                                Console.WriteLine($"  NPC{ni + 1}: {noids[ni].npc.Name,-20} obj=0x{noids[ni].npc.NpcObjAddr:X8} node=0x{noids[ni].npc.NodeAddr:X8} oid={noids[ni].npc.Oid}");
+
+                            // Scan npc_obj from 0x00 to 0x300 for int-like unique values
+                            Console.WriteLine("\n  === Scanning npc_obj 0x00-0x300 for int-like unique values ===");
+                            for (uint off = 0x00; off <= 0x300; off += 4)
+                            {
+                                var vals = new int[cnt];
+                                for (int ni = 0; ni < cnt; ni++)
+                                    vals[ni] = MemoryHelper.ReadInt32(hProcess, new IntPtr(noids[ni].npc.NpcObjAddr + off));
+                                if (vals.Distinct().Count() < cnt) continue; // not all unique
+                                if (vals.All(v => v > 0 && v < 0x10000000))
+                                {
+                                    bool hit = vals.Any(v => v == 699163);
+                                    Console.WriteLine($"  obj+{off:X3}: " + string.Join("  ", vals.Select(v => $"{v,9}")) + (hit ? "  ← OID HERE" : ""));
+                                }
+                            }
+
+                            // Scan NodeAddr from 0x00 to 0x80
+                            Console.WriteLine("\n  === Scanning NodeAddr 0x00-0x80 for int-like unique values ===");
+                            for (uint off = 0x00; off <= 0x80; off += 4)
+                            {
+                                var vals = new int[cnt];
+                                for (int ni = 0; ni < cnt; ni++)
+                                    vals[ni] = MemoryHelper.ReadInt32(hProcess, new IntPtr(noids[ni].npc.NodeAddr + off));
+                                if (vals.Distinct().Count() < cnt) continue;
+                                if (vals.All(v => v > 0 && v < 0x10000000))
+                                {
+                                    bool hit = vals.Any(v => v == 699163);
+                                    Console.WriteLine($"  node+{off:X3}: " + string.Join("  ", vals.Select(v => $"{v,9}")) + (hit ? "  ← OID HERE" : ""));
+                                }
+                            }
+
+                            // Byte-level search: scan ALL NPC objects for exact value 699163
+                            Console.WriteLine($"\n  === Byte-level search for OID=699163 (0x{699163:X}) in ALL NPCs ===");
+                            uint searchVal = 699163;
+                            for (int ni = 0; ni < cnt; ni++)
+                            {
+                                var npc = noids[ni].npc;
+                                // Scan npc_obj up to 0x800
+                                byte[] sb = new byte[0x800];
+                                MemoryHelper.ReadProcessMemory(hProcess, new IntPtr(npc.NpcObjAddr), sb, 0x800, out int sbr);
+                                bool found = false;
+                                for (int si = 0; si <= sbr - 4; si++)
+                                {
+                                    uint v32 = BitConverter.ToUInt32(sb, si);
+                                    if (v32 == searchVal)
+                                    { Console.WriteLine($"  NPC{ni + 1} obj+0x{si:X3} = {searchVal} ← OID FOUND"); found = true; }
+                                }
+                                // Also scan node
+                                byte[] nb2 = new byte[0x100];
+                                MemoryHelper.ReadProcessMemory(hProcess, new IntPtr(npc.NodeAddr), nb2, 0x100, out int nbr2);
+                                for (int si = 0; si <= nbr2 - 4; si++)
+                                {
+                                    uint v32 = BitConverter.ToUInt32(nb2, si);
+                                    if (v32 == searchVal)
+                                    { Console.WriteLine($"  NPC{ni + 1} node+0x{si:X3} = {searchVal} ← OID FOUND (node)"); found = true; }
+                                }
+                                // Follow pointer at obj+0x114 (sub-object seen in earlier scans)
+                                int subPtr = MemoryHelper.ReadInt32(hProcess, new IntPtr(npc.NpcObjAddr + 0x114));
+                                if (subPtr > 0x1000000 && subPtr < 0x20000000)
+                                {
+                                    byte[] ssb = new byte[0x40];
+                                    MemoryHelper.ReadProcessMemory(hProcess, new IntPtr((uint)subPtr), ssb, 0x40, out int ssr);
+                                    for (int si = 0; si <= ssr - 4; si++)
+                                    {
+                                        uint v32 = BitConverter.ToUInt32(ssb, si);
+                                        if (v32 == searchVal)
+                                        { Console.WriteLine($"  NPC{ni + 1} [obj+114]+0x{si:X3} = {searchVal} ← OID FOUND (sub)"); found = true; }
+                                    }
+                                }
+                                if (!found) Console.WriteLine($"  NPC{ni + 1} ({npc.Name}): not found in 0x{sbr:X} bytes");
+                            }
+                        }
+                        else if (key == ConsoleKey.Z)
+                        {
+                            var nearby4 = GetNearbyNpcs();
+                            if (nearby4.Count == 0) { Console.WriteLine("[Z] No NPCs"); break; }
+                            var n = nearby4.OrderBy(e => e.distXY).First();
+                            Console.WriteLine($"[Z] TurnByKeys (A/D loop) → ({n.npc.X:F0}, {n.npc.Y:F0}) {n.npc.Name}");
+                            turn.TurnByKeys(n.npc.X, n.npc.Y);
+                            Console.WriteLine("[Z] done");
+                        }
+                        else if (key == ConsoleKey.V)
+                        {
+                            // Check state chain [9CA8A0→+648→+14] and try DLL@1700 if valid
+                            Console.WriteLine("[V] State chain check + DLL@1700 attempt:");
+                            uint c1 = (uint)MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9CA8A0));
+                            uint c2 = c1 != 0 ? (uint)MemoryHelper.ReadInt32(hProcess, new IntPtr(c1 + 0x648)) : 0;
+                            uint statePtr = c2 != 0 ? (uint)MemoryHelper.ReadInt32(hProcess, new IntPtr(c2 + 0x14)) : 0;
+                            Console.WriteLine($"  [9CA8A0] = 0x{c1:X}");
+                            Console.WriteLine($"  [+0x648] = 0x{c2:X}");
+                            Console.WriteLine($"  [+0x14]  = 0x{statePtr:X}  ← state_ptr");
+
+                            // Also show face coord globals
+                            uint faceX = (uint)MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D5594));
+                            uint faceY = (uint)MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D569C));
+                            float faceXf = BitConverter.ToSingle(BitConverter.GetBytes(faceX), 0);
+                            float faceYf = BitConverter.ToSingle(BitConverter.GetBytes(faceY), 0);
+                            Console.WriteLine($"  [9D5594] = 0x{faceX:X} = {faceXf:F1}  (face_X)");
+                            Console.WriteLine($"  [9D569C] = 0x{faceY:X} = {faceYf:F1}  (face_Y)");
+
+                            if (statePtr != 0)
+                            {
+                                Console.WriteLine($"  State valid! Calling DLL@0x1700...");
+                                uint dllBase = turn.FindDllBasePublic();
+                                if (dllBase != 0)
+                                {
+                                    turn.CallDll1700Direct();
+                                    Console.WriteLine($"  Called DLL@0x1700 (定点打怪)");
+                                }
+                            }
+                            else
+                            {
+                                Console.WriteLine($"  State null — press X first then [V] again");
+                            }
                         }
                         else if (key == ConsoleKey.D)
                         {
@@ -3231,14 +3873,29 @@ namespace Xajh
                         else if (key == ConsoleKey.A)
                         {
                             autoFace = !autoFace;
+                            turn.ResetFToggle(); // allow F to be pressed on next activation
+                            if (!autoFace) turn.ResetFightState();
+                            autoLastTargetOid = 0;
+                            autoLastTargetObjAddr = 0;
+                            autoKillTimeMs = 0;
+                            autoLastFightMs = 0;
+                            autoLastFMs = 0;
+                            autoLastNpcCount = 0;
+                            autoTargetFrozenMs = 0;
+                            autoLastTargetPosX = float.NaN; autoLastTargetPosY = float.NaN;
+                            autoLastFacedX = float.NaN; autoLastFacedY = float.NaN;
                             Console.WriteLine(autoFace ? $"[+] Auto-turn+fight ON (radius={aimRadius:F0})" : "[-] Auto-turn+fight OFF");
                         }
                     }
 
                     if (autoFace)
                     {
-                        Console.WriteLine($"[AUTO] {AimNearest(verbose: false)}");
-                        Thread.Sleep(800);   // throttle auto-aim
+                        string aimResult = AimNearest(verbose: false);
+                        Console.WriteLine($"[AUTO] {aimResult}");
+
+
+
+                        Thread.Sleep(300);
                     }
                     else
                     {

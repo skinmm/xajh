@@ -13,6 +13,7 @@ namespace xajh
         public float Z { get; set; }
         public uint NodeAddr { get; set; }    // list node pointer (node+0x4C -> npc_obj)
         public uint NpcObjAddr { get; set; }  // raw npc_obj pointer, for direct call injection
+        public uint Oid { get; set; }         // unique server OID at npc_obj+0x644
 
         public override string ToString() =>
             $"{Name,-16}  ({X,9:F2},{Y,9:F2},{Z,7:F2})";
@@ -133,7 +134,8 @@ namespace xajh
                     Y = y,
                     Z = z,
                     NodeAddr = nodeAddr,
-                    NpcObjAddr = (uint)npcObj.ToInt64()
+                    NpcObjAddr = (uint)npcObj.ToInt64(),
+                    Oid = (uint)MemoryHelper.ReadInt32(_hProcess, IntPtr.Add(npcObj, 0x644))
                 };
 
             }
