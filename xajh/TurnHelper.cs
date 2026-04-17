@@ -417,8 +417,10 @@ namespace xajh
 
             ForceForeground(_gameHwnd);
             Thread.Sleep(20);
+            IntPtr fg = GetForegroundWindow();
+            bool inForeground = (fg == _gameHwnd);
+            Console.WriteLine($"  [TurnByKeys] fg match={inForeground} want=({wantX:F2},{wantY:F2})");
 
-            // Loop: read current facing, press A or D in short bursts, check again
             for (int iter = 0; iter < 30; iter++)
             {
                 // Rotation matrix: f010 = -dyn, f014 = dxn  →  curDxn = f014, curDyn = -f010
@@ -434,6 +436,7 @@ namespace xajh
                 byte sc = (byte)MapVirtualKey(vk, 0);
 
                 float angleDeg = (float)(Math.Acos(Math.Max(-1f, Math.Min(1f, dot))) * 180.0 / Math.PI);
+                Console.WriteLine($"    iter{iter}: cur=({curDxn:F2},{curDyn:F2}) dot={dot:F2} angle={angleDeg:F0}° press={(char)vk}");
                 int holdMs;
                 if (angleDeg > 90) holdMs = 150;
                 else if (angleDeg > 30) holdMs = 80;
@@ -449,7 +452,8 @@ namespace xajh
 
         public bool AttackNpc(uint npcObjAddr, float tx = 0f, float ty = 0f)
         {
-            if (tx > 100f && ty > 100f)
+            // Only skip turn if both coords are exactly 0 (unset defaults)
+            if (!(tx == 0f && ty == 0f))
             {
                 TurnByKeys(tx, ty);
             }
