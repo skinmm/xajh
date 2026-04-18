@@ -24,6 +24,8 @@ namespace Xajh
         static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
         [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
         static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
         [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
@@ -1480,6 +1482,7 @@ namespace Xajh
             Console.WriteLine();
 
             bool autoFace = false;
+            System.Collections.Generic.Dictionary<uint, int> prevJSnapshot = null;
             uint autoLastTargetOid = 0;  // OID from npc_obj+0x644
             float autoLastFacedX = float.NaN, autoLastFacedY = float.NaN;
             long autoKillTimeMs = 0;
@@ -2773,12 +2776,11 @@ namespace Xajh
                 autoKillTimeMs = 0;
 
                 long secsFighting = (Environment.TickCount64 - autoLastFightMs) / 1000;
-                // If we've been "fighting" 8+ seconds without kill on same target,
-                // auto-fight probably turned off. Press F once to toggle back ON.
-                if (secsFighting >= 8 && Environment.TickCount64 - autoLastFMs > 8000)
+                // If auto-fight turned off (playerObj+0xC == 0) while we still have a target, re-press F
+                if (!turn.IsFightOn() && Environment.TickCount64 - autoLastFMs > 500)
                 {
                     autoLastFMs = Environment.TickCount64;
-                    turn.TriggerFight();  // flip F state
+                    turn.TriggerFight();
                 }
                 return $"→ {curNpc.npc.Name} d={curNpc.distXY:F0}  oid={autoLastTargetOid}  fighting({secsFighting}s)  ({nearby.Count} npcs)";
             }
@@ -3637,9 +3639,85 @@ namespace Xajh
                             var nearby4 = GetNearbyNpcs();
                             if (nearby4.Count == 0) { Console.WriteLine("[Z] No NPCs"); break; }
                             var n = nearby4.OrderBy(e => e.distXY).First();
-                            Console.WriteLine($"[Z] AttackTarget(0x6871AF) → ({n.npc.X:F0}, {n.npc.Y:F0}) {n.npc.Name}");
+                            Console.WriteLine($"[Z] AttackTarget only (no keys) → {n.npc.Name} ({n.npc.X:F0}, {n.npc.Y:F0})");
+                            Console.WriteLine("    Watch: does player turn to face NPC instantly?");
                             turn.AttackTarget(n.npc.X, n.npc.Y);
-                            Console.WriteLine("[Z] done — watch if player attacks that NPC");
+                        }
+                        else if (key == ConsoleKey.K)
+                        {
+                            int po = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4514));
+                            int chainD_k = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9CA8A0));
+                            int flagBefore = chainD_k != 0 ? MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)chainD_k + 0x508)) : -1;
+                            IntPtr kHwnd = GetGameHwnd();
+                            SetForegroundWindow(kHwnd);
+                            Thread.Sleep(300);
+                            Console.WriteLine($"[K] BEFORE F: chainD+0x508 = {flagBefore}  IsFightOn={turn.IsFightOn()}");
+                            Thread.Sleep(100);
+                            turn.TriggerFight();
+                            Thread.Sleep(400);
+                            int flagAfter = chainD_k != 0 ? MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)chainD_k + 0x508)) : -1;
+                            Console.WriteLine($"[K] AFTER F:  chainD+0x508 = {flagAfter}  IsFightOn={turn.IsFightOn()}");
+                        }
+                        else if (key == ConsoleKey.J)
+                        {
+                            // Snapshot & diff: press J when IDLE, press J when ATTACKING — shows which memory changed
+                            var nowSnap = new System.Collections.Generic.Dictionary<uint, int>();
+
+                            int chainD = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9CA8A0));
+                            int cobj = chainD != 0 ? MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)chainD + 0x648)) : 0;
+                            int playerObj = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4514));
+
+                            // Scan chainD 0..0x800
+                            if (chainD != 0)
+                            {
+                                for (uint off = 0; off <= 0x800; off += 4)
+                                {
+                                    try { nowSnap[0x10000000 + off] = MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)chainD + off)); } catch { }
+                                }
+                            }
+                            // Scan combat_obj 0..0x200
+                            if (cobj > 0x1000000)
+                            {
+                                for (uint off = 0; off <= 0x200; off += 4)
+                                {
+                                    try { nowSnap[0x20000000 + off] = MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)cobj + off)); } catch { }
+                                }
+                            }
+                            // Scan playerObj 0..0x800
+                            if (playerObj > 0x1000000)
+                            {
+                                for (uint off = 0; off <= 0x800; off += 4)
+                                {
+                                    try { nowSnap[0x30000000 + off] = MemoryHelper.ReadInt32(hProcess, new IntPtr((uint)playerObj + off)); } catch { }
+                                }
+                            }
+
+                            if (prevJSnapshot == null)
+                            {
+                                prevJSnapshot = nowSnap;
+                                Console.WriteLine($"[J] Baseline saved ({nowSnap.Count} locs). Toggle state then press J again for diff.");
+                            }
+                            else
+                            {
+                                int diffCount = 0;
+                                foreach (var kv in nowSnap)
+                                {
+                                    int prev;
+                                    if (!prevJSnapshot.TryGetValue(kv.Key, out prev)) continue;
+                                    if (prev != kv.Value)
+                                    {
+                                        string src = (kv.Key >> 28) == 1 ? "chainD" : (kv.Key >> 28) == 2 ? "combat" : "player";
+                                        uint offV = kv.Key & 0xFFFFFFF;
+                                        // Skip float-looking large values (coords etc)
+                                        long vAbs = Math.Abs((long)kv.Value);
+                                        if (vAbs > 0x1000 && vAbs < 0x70000000) continue;  // skip coords/pointers
+                                        Console.WriteLine($"  {src}+0x{offV:X}: {prev} -> {kv.Value}");
+                                        diffCount++;
+                                    }
+                                }
+                                Console.WriteLine($"[J] Found {diffCount} small-value changes (filtered). Saving new baseline.");
+                                prevJSnapshot = nowSnap;
+                            }
                         }
                         else if (key == ConsoleKey.V)
                         {
@@ -3896,10 +3974,7 @@ namespace Xajh
                     {
                         string aimResult = AimNearest(verbose: false);
                         Console.WriteLine($"[AUTO] {aimResult}");
-
-
-
-                        Thread.Sleep(300);
+                        Thread.Sleep(150);
                     }
                     else
                     {

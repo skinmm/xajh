@@ -20,6 +20,7 @@ namespace xajh
         [DllImport("kernel32.dll")] static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint dwFreeType);
         [DllImport("kernel32.dll")] static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttr, uint stackSize, IntPtr lpStartAddr, IntPtr lpParam, uint flags, out uint lpThreadId);
         [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr hObject, uint dwMilliseconds);
+        [DllImport("kernel32.dll")] static extern bool GetExitCodeThread(IntPtr hThread, out uint lpExitCode);
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr hObject);
         [DllImport("kernel32.dll")] static extern uint SuspendThread(IntPtr hThread);
         [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr hThread);
@@ -357,6 +358,56 @@ namespace xajh
         /// <summary>Call game function 0x6871AF — attack toward (face_X, face_Y).
         /// Matches DLL wrapper at 0x100022A0. Writes coords to face globals, then calls with
         /// push face_Y, push face_X, push state, ECX=playerObj, call 0x6871AF, [0xDD55A4]=1.</summary>
+        /// <summary>Attack NPC by calling game function 0x6842CA directly with NPC pointer.</summary>
+        public bool AttackNpcDirect(uint npcPtr)
+        {
+            if (npcPtr < 0x1000000) return false;
+            uint npcOid = (uint)MemoryHelper.ReadInt32(_hProcess, new IntPtr(npcPtr + 0x644));
+
+            byte[] oidBytes = BitConverter.GetBytes(npcOid);
+            byte[] ptrBytes = BitConverter.GetBytes(npcPtr);
+
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x6A, 0x01,                                   // push 1
+                0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push NPC_OID
+                0x68, ptrBytes[0], ptrBytes[1], ptrBytes[2], ptrBytes[3],  // push NPC_ptr
+                0xA1, 0xC4, 0xD6, 0xDD, 0x00,                // mov eax, [0xDDD6C4]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x10,                                   // jz cleanup (+16)
+                0x8B, 0x48, 0x0C,                             // mov ecx, [eax+0x0C]
+                0x85, 0xC9,                                   // test ecx, ecx
+                0x74, 0x09,                                   // jz cleanup (+9)
+                0xB8, 0xCA, 0x42, 0x68, 0x00,                // mov eax, 0x6842CA
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x03,                                   // jmp end (+3)
+                0x83, 0xC4, 0x0C,                             // add esp, 0xC
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out _);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 1000);
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>Attack by just writing face globals + trigger flag. No function call.</summary>
+        public bool SimpleAttack(float tx, float ty)
+        {
+            MemoryHelper.WriteFloat(_hProcess, new IntPtr(0xDD5594), tx);
+            MemoryHelper.WriteFloat(_hProcess, new IntPtr(0xDD569C), ty);
+            MemoryHelper.WriteInt32(_hProcess, new IntPtr(0xDD55A4), 1);
+            return true;
+        }
+
         public bool AttackTarget(float tx, float ty)
         {
             // Write target coords to face globals (where the game func reads them)
@@ -390,22 +441,29 @@ namespace xajh
             };
 
             IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
-            if (alloc == IntPtr.Zero) return false;
+            if (alloc == IntPtr.Zero) { Console.WriteLine("  [AttackTarget] VirtualAllocEx failed"); return false; }
             MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
-            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
             if (thread != IntPtr.Zero)
             {
-                WaitForSingleObject(thread, 1000);
+                uint waitResult = WaitForSingleObject(thread, 2000);
+                uint exitCode = 0;
+                GetExitCodeThread(thread, out exitCode);
+                Console.WriteLine($"  [AttackTarget] tx={tx:F0} ty={ty:F0} thread=0x{thread.ToInt64():X} tid={tid} wait=0x{waitResult:X} exitCode=0x{exitCode:X}");
                 CloseHandle(thread);
+            }
+            else
+            {
+                Console.WriteLine("  [AttackTarget] CreateRemoteThread failed!");
             }
             VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
             return true;
         }
 
-        /// <summary>Legacy shellcode - was triggering "use item" because of wrong arg order.</summary>
+        /// <summary>Use inventory item (全抗散) — this was the function that was mistakenly called before.</summary>
         public bool UseItem()
         {
-
             // push/pop around call; check null pointers
             byte[] sc = {
                 0x60,                                             // pushad
@@ -424,8 +482,8 @@ namespace xajh
                 0x74, 0x11,                                       // jz end (+17)
                 0xB8, 0xAF, 0x71, 0x68, 0x00,                    // mov eax, 0x006871AF
                 0xFF, 0xD0,                                       // call eax
-                0xC7, 0x05, 0xA4, 0x55, 0xDD, 0x00, 0x01, 0x00, 0x00, 0x00,  // mov [0xDD55A4], 1
-                // end (offset 63):
+                0xC7, 0x05, 0xA4, 0x55, 0xDD, 0x00, 0x01, 0x00, 0x00, 0x00,
+                // end:
                 0x61,                                             // popad
                 0xC3                                              // ret
             };
@@ -495,15 +553,24 @@ namespace xajh
             }
         }
 
-        /// <summary>Check auto-fight state via combat_obj+0x14.</summary>
+        /// <summary>Check auto-fight state via chainD+0x508 (0=idle, 1=fighting).</summary>
         public bool IsFightOn()
         {
             int chainD = MemoryHelper.ReadInt32(_hProcess, new IntPtr(ADDR_CHAIN_D));
             if (chainD == 0) return false;
+            int flag = MemoryHelper.ReadInt32(_hProcess, new IntPtr((uint)chainD + 0x508));
+            return flag == 1;
+        }
+
+        /// <summary>Check if player is currently attacking a target (combat_obj+0 = NPC pointer).</summary>
+        public uint GetAttackTarget()
+        {
+            int chainD = MemoryHelper.ReadInt32(_hProcess, new IntPtr(ADDR_CHAIN_D));
+            if (chainD == 0) return 0;
             int combatObj = MemoryHelper.ReadInt32(_hProcess, new IntPtr((uint)chainD + 0x648));
-            if (combatObj < 0x1000000) return false;
-            int state = MemoryHelper.ReadInt32(_hProcess, new IntPtr((uint)combatObj + 0x14));
-            return state == 0x7A77;
+            if (combatObj < 0x1000000) return 0;
+            int tgt = MemoryHelper.ReadInt32(_hProcess, new IntPtr((uint)combatObj + 0x00));
+            return tgt > 0x1000000 ? (uint)tgt : 0u;
         }
 
         /// <summary>Call game function 0x6859AE(4, 2, 8) — from DLL call #3/#4.
@@ -597,7 +664,14 @@ namespace xajh
             }
             TriggerTarget();   // X — select target
             Thread.Sleep(100);
-            TriggerFight();    // F — one press
+            // Only press F if auto-fight is OFF (avoid toggling it off when already attacking)
+            if (!IsFightOn())
+            {
+                TriggerFight();
+                Thread.Sleep(100);
+                // Verify it turned ON; if not, press again
+                if (!IsFightOn()) TriggerFight();
+            }
             return true;
         }
 
