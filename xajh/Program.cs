@@ -1366,6 +1366,7 @@ namespace Xajh
             }
 
             var turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+            var bag = new BagHelper(hProcess, moduleBase);
             // Set game's main thread ID for in-thread shellcode injection
             var gameHwnd = GetGameHwnd();
             if (gameHwnd != IntPtr.Zero)
@@ -1419,6 +1420,7 @@ namespace Xajh
                         playerReader = new PlayerReader(hProcess, moduleBase);
                         combat = new CombatOverlay(hProcess, moduleBase);
                         turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+                        bag = new BagHelper(hProcess, moduleBase);
                         locCmd = new LocCommand(hProcess, moduleBase, GetGameHwnd);
                         TryRefreshZxxyModule(force: true);
                         zxxyDirectCandidates.Clear();
@@ -1440,6 +1442,7 @@ namespace Xajh
                     playerReader = new PlayerReader(hProcess, moduleBase);
                     combat = new CombatOverlay(hProcess, moduleBase);
                     turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+                    bag = new BagHelper(hProcess, moduleBase);
                     locCmd = new LocCommand(hProcess, moduleBase, GetGameHwnd);
                     TryRefreshZxxyModule(force: true);
                     zxxyDirectCandidates.Clear();
@@ -3288,15 +3291,6 @@ namespace Xajh
                                 }
                             }
                         }
-                        else if (key == ConsoleKey.G)
-                        {
-                            Console.WriteLine("[G] Sending /loc command to game...");
-                            bool ok = locCmd.SendAndRead();
-                            if (ok)
-                                Console.WriteLine($"[G] /loc result: ({locCmd.LocX:F1}, {locCmd.LocY:F1}, {locCmd.LocZ:F1})");
-                            else
-                                Console.WriteLine("[G] /loc: no valid position found in response");
-                        }
                         else if (key == ConsoleKey.F)
                         {
                             // Focused dump: read the exact +0xBC sub-object from the
@@ -3633,6 +3627,123 @@ namespace Xajh
                                 }
                             }
                             Console.WriteLine("[N] done.");
+                        }
+                        else if (key == ConsoleKey.I)
+                        {
+                            Console.WriteLine("[I] Scanning inventory...");
+                            bag.ScanInventory();
+                        }
+                        else if (key == ConsoleKey.U)
+                        {
+                            // Deep inspect a candidate. Prompt for address.
+                            Console.Write("[U] Enter inventory ptr to deep-inspect (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint ptr))
+                            {
+                                bag.InspectCandidate(ptr, 16);
+                            }
+                        }
+                        else if (key == ConsoleKey.M)
+                        {
+                            // Follow a pointer and dump it (memory inspector)
+                            Console.Write("[M] Enter pointer (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            Console.Write("[M] Size (hex, default 100): ");
+                            string sz = Console.ReadLine()?.Trim() ?? "";
+                            int size = 0x100;
+                            if (!string.IsNullOrEmpty(sz)) int.TryParse(sz, System.Globalization.NumberStyles.HexNumber, null, out size);
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint ptr))
+                            {
+                                bag.FollowPointer(ptr, size);
+                            }
+                        }
+                        else if (key == ConsoleKey.H)
+                        {
+                            // Search (hunt) all game memory for a specific item template ID
+                            Console.Write("[H] Enter item ID (decimal by default, or 0x-prefix for hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            uint itemId = 0;
+                            bool ok;
+                            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                                ok = uint.TryParse(s.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out itemId);
+                            else
+                                ok = uint.TryParse(s, out itemId);
+                            if (ok)
+                            {
+                                bag.SearchByItemId(itemId);
+                            }
+                            else
+                            {
+                                Console.WriteLine("[H] invalid number");
+                            }
+                        }
+                        else if (key == ConsoleKey.B)
+                        {
+                            // BUFF: auto-find CSvClient, then call SendUseItem(bagSlot, itemSlot, self).
+                            // Example: 真36天剑 at bag 0 slot 7 → [B] 0 7
+                            Console.Write("[B] Enter bag slot in pouch (0-7, hex): ");
+                            string s1 = Console.ReadLine()?.Trim() ?? "";
+                            Console.Write("[B] Enter item slot in bag (0-7, hex): ");
+                            string s2 = Console.ReadLine()?.Trim() ?? "";
+                            uint bagSlot = 0, itemSlot = 0;
+                            if (!string.IsNullOrEmpty(s1)) uint.TryParse(s1, System.Globalization.NumberStyles.HexNumber, null, out bagSlot);
+                            if (!string.IsNullOrEmpty(s2)) uint.TryParse(s2, System.Globalization.NumberStyles.HexNumber, null, out itemSlot);
+                            Console.WriteLine($"[B] AutoBuff(bag={bagSlot}, slot={itemSlot}, target=31351)");
+                            bag.AutoBuff(bagSlot, itemSlot, 31351);
+                        }
+                        else if (key == ConsoleKey.C)
+                        {
+                            // Capture: hook SendUseItem to log its args.
+                            // First press: install hook.
+                            // Subsequent presses: read captured args.
+                            Console.WriteLine("[C] Hook/capture SendUseItem args:");
+                            Console.WriteLine("    1) install hook 2) read captured");
+                            Console.Write("Choose (1/2): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            if (s == "1")
+                            {
+                                bag.InstallUseItemHook();
+                            }
+                            else
+                            {
+                                bag.ReadCapturedArgs();
+                            }
+                        }
+                        else if (key == ConsoleKey.X)
+                        {
+                            // Find places in memory that contain pointers to a given address.
+                            // Useful for discovering stable chains to a captured runtime pointer.
+                            Console.Write("[X] Enter target address (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint tgt))
+                            {
+                                bag.FindPointersTo(tgt);
+                            }
+                        }
+                        else if (key == ConsoleKey.E)
+                        {
+                            // Recursive pointer chain discovery.
+                            // Finds chain from stable module memory → heap → ... → target.
+                            Console.Write("[E] Enter target address (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            Console.Write("[E] Max depth (default 3): ");
+                            string sd = Console.ReadLine()?.Trim() ?? "";
+                            int depth = 3;
+                            if (!string.IsNullOrEmpty(sd)) int.TryParse(sd, out depth);
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint tgt))
+                            {
+                                bag.FindChainsTo(tgt, depth);
+                            }
+                        }
+                        else if (key == ConsoleKey.T)
+                        {
+                            // Find all heap objects matching a vtable (class instances).
+                            Console.Write("[T] Enter vtable address (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint vt))
+                            {
+                                bag.FindInstancesByVtable(vt);
+                            }
                         }
                         else if (key == ConsoleKey.K)
                         {
