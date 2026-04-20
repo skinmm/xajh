@@ -1366,6 +1366,7 @@ namespace Xajh
             }
 
             var turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+            var bag = new BagHelper(hProcess, moduleBase);
             // Set game's main thread ID for in-thread shellcode injection
             var gameHwnd = GetGameHwnd();
             if (gameHwnd != IntPtr.Zero)
@@ -1419,6 +1420,7 @@ namespace Xajh
                         playerReader = new PlayerReader(hProcess, moduleBase);
                         combat = new CombatOverlay(hProcess, moduleBase);
                         turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+                        bag = new BagHelper(hProcess, moduleBase);
                         locCmd = new LocCommand(hProcess, moduleBase, GetGameHwnd);
                         TryRefreshZxxyModule(force: true);
                         zxxyDirectCandidates.Clear();
@@ -1440,6 +1442,7 @@ namespace Xajh
                     playerReader = new PlayerReader(hProcess, moduleBase);
                     combat = new CombatOverlay(hProcess, moduleBase);
                     turn = new TurnHelper(hProcess, moduleBase, GetGameHwnd());
+                    bag = new BagHelper(hProcess, moduleBase);
                     locCmd = new LocCommand(hProcess, moduleBase, GetGameHwnd);
                     TryRefreshZxxyModule(force: true);
                     zxxyDirectCandidates.Clear();
@@ -2899,80 +2902,6 @@ namespace Xajh
                                 Console.WriteLine($"[R] Invalid — keeping {aimRadius:F0}");
                             }
                         }
-                        else if (key == ConsoleKey.M)
-                        {
-                            RunDirectMovementCalibration();
-                        }
-                        else if (key == ConsoleKey.C)
-                        {
-                            turn.ResetCalibration();
-                            Console.WriteLine("[C] Calibration reset");
-
-                            // Verify: write a 90° turn and read back to confirm the write sticks
-                            Console.WriteLine("[C] Testing rotation write on all chain objects...");
-                            int cMgr = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4518));
-                            foreach (int lo in new[] { 0x08, 0x0C })
-                                foreach (int oo in new[] { 0x48, 0x4C, 0x50, 0x54 })
-                                {
-                                    int cList = cMgr != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(cMgr, lo)) : 0;
-                                    int cObj = cList != 0 ? MemoryHelper.ReadInt32(hProcess, Ptr32Add(cList, oo)) : 0;
-                                    if (cObj == 0 || cObj < 0x00100000) continue;
-                                    // Read before
-                                    float cosBefore = MemoryHelper.ReadFloat(hProcess, Ptr32Add(cObj, 0x10));
-                                    float sinBefore = MemoryHelper.ReadFloat(hProcess, Ptr32Add(cObj, 0x14));
-                                    // Write 90°
-                                    float testCos = 0f; float testSin = 1f;
-                                    MemoryHelper.WriteFloat(hProcess, Ptr32Add(cObj, 0x10), testCos);
-                                    MemoryHelper.WriteFloat(hProcess, Ptr32Add(cObj, 0x14), testSin);
-                                    Thread.Sleep(50);
-                                    // Read after
-                                    float cosAfter = MemoryHelper.ReadFloat(hProcess, Ptr32Add(cObj, 0x10));
-                                    float sinAfter = MemoryHelper.ReadFloat(hProcess, Ptr32Add(cObj, 0x14));
-                                    bool stuck = Math.Abs(cosAfter - testCos) < 0.05f;
-                                    // Restore
-                                    MemoryHelper.WriteFloat(hProcess, Ptr32Add(cObj, 0x10), cosBefore);
-                                    MemoryHelper.WriteFloat(hProcess, Ptr32Add(cObj, 0x14), sinBefore);
-                                    Console.WriteLine($"  +0x{lo:X2}+0x{oo:X2} obj=0x{cObj:X8}  before=({cosBefore:F3},{sinBefore:F3})  after=({cosAfter:F3},{sinAfter:F3})  STICKS={stuck}");
-                                }
-                        }
-                        else if (key == ConsoleKey.W)
-                        {
-                            // Enumerate all top-level windows owned by the game process,
-                            // pick the largest visible one (the main viewport).
-                            IntPtr best = IntPtr.Zero;
-                            int bestArea = 0;
-                            foreach (ProcessThread t in game.Threads)
-                            {
-                                // no per-thread enum without P/Invoke; fall back below
-                            }
-                            // Use EnumWindows via Process.MainWindowHandle refresh +
-                            // walk all process windows
-                            game.Refresh();
-                            var handles = new List<IntPtr>();
-                            EnumWindows((h, l) =>
-                            {
-                                GetWindowThreadProcessId(h, out uint pid);
-                                if (pid == (uint)game.Id && IsWindowVisible(h))
-                                {
-                                    GetClientRect(h, out RECT rc);
-                                    int area = (rc.Right - rc.Left) * (rc.Bottom - rc.Top);
-                                    if (area > bestArea) { bestArea = area; best = h; }
-                                    handles.Add(h);
-                                }
-                                return true;
-                            }, IntPtr.Zero);
-
-                            Console.WriteLine($"[W] Found {handles.Count} visible windows in process:");
-                            foreach (var h in handles)
-                            {
-                                GetClientRect(h, out RECT rc);
-                                var sb = new System.Text.StringBuilder(256);
-                                GetClassName(h, sb, 256);
-                                Console.WriteLine($"    0x{h.ToInt64():X}  {rc.Right - rc.Left}x{rc.Bottom - rc.Top}  class={sb}");
-                            }
-                            Console.WriteLine($"[W] Picked largest: 0x{best.ToInt64():X} ({bestArea}px²)");
-                            turn = new TurnHelper(hProcess, moduleBase, best);
-                        }
                         else if (key == ConsoleKey.P)
                         {
                             combat.DumpPlayerObject();
@@ -3362,15 +3291,6 @@ namespace Xajh
                                 }
                             }
                         }
-                        else if (key == ConsoleKey.G)
-                        {
-                            Console.WriteLine("[G] Sending /loc command to game...");
-                            bool ok = locCmd.SendAndRead();
-                            if (ok)
-                                Console.WriteLine($"[G] /loc result: ({locCmd.LocX:F1}, {locCmd.LocY:F1}, {locCmd.LocZ:F1})");
-                            else
-                                Console.WriteLine("[G] /loc: no valid position found in response");
-                        }
                         else if (key == ConsoleKey.F)
                         {
                             // Focused dump: read the exact +0xBC sub-object from the
@@ -3552,88 +3472,6 @@ namespace Xajh
                             }
                             Console.WriteLine();
                         }
-                        else if (key == ConsoleKey.N)
-                        {
-                            Console.WriteLine("[N] NPC OID scan:");
-                            var noids = GetNearbyNpcs();
-                            int cnt = Math.Min(noids.Count, 6);
-                            if (cnt == 0) { Console.WriteLine("  No NPCs"); break; }
-
-                            // Show NPC list with addresses
-                            for (int ni = 0; ni < cnt; ni++)
-                                Console.WriteLine($"  NPC{ni + 1}: {noids[ni].npc.Name,-20} obj=0x{noids[ni].npc.NpcObjAddr:X8} node=0x{noids[ni].npc.NodeAddr:X8} oid={noids[ni].npc.Oid}");
-
-                            // Scan npc_obj from 0x00 to 0x300 for int-like unique values
-                            Console.WriteLine("\n  === Scanning npc_obj 0x00-0x300 for int-like unique values ===");
-                            for (uint off = 0x00; off <= 0x300; off += 4)
-                            {
-                                var vals = new int[cnt];
-                                for (int ni = 0; ni < cnt; ni++)
-                                    vals[ni] = MemoryHelper.ReadInt32(hProcess, new IntPtr(noids[ni].npc.NpcObjAddr + off));
-                                if (vals.Distinct().Count() < cnt) continue; // not all unique
-                                if (vals.All(v => v > 0 && v < 0x10000000))
-                                {
-                                    bool hit = vals.Any(v => v == 699163);
-                                    Console.WriteLine($"  obj+{off:X3}: " + string.Join("  ", vals.Select(v => $"{v,9}")) + (hit ? "  ← OID HERE" : ""));
-                                }
-                            }
-
-                            // Scan NodeAddr from 0x00 to 0x80
-                            Console.WriteLine("\n  === Scanning NodeAddr 0x00-0x80 for int-like unique values ===");
-                            for (uint off = 0x00; off <= 0x80; off += 4)
-                            {
-                                var vals = new int[cnt];
-                                for (int ni = 0; ni < cnt; ni++)
-                                    vals[ni] = MemoryHelper.ReadInt32(hProcess, new IntPtr(noids[ni].npc.NodeAddr + off));
-                                if (vals.Distinct().Count() < cnt) continue;
-                                if (vals.All(v => v > 0 && v < 0x10000000))
-                                {
-                                    bool hit = vals.Any(v => v == 699163);
-                                    Console.WriteLine($"  node+{off:X3}: " + string.Join("  ", vals.Select(v => $"{v,9}")) + (hit ? "  ← OID HERE" : ""));
-                                }
-                            }
-
-                            // Byte-level search: scan ALL NPC objects for exact value 699163
-                            Console.WriteLine($"\n  === Byte-level search for OID=699163 (0x{699163:X}) in ALL NPCs ===");
-                            uint searchVal = 699163;
-                            for (int ni = 0; ni < cnt; ni++)
-                            {
-                                var npc = noids[ni].npc;
-                                // Scan npc_obj up to 0x800
-                                byte[] sb = new byte[0x800];
-                                MemoryHelper.ReadProcessMemory(hProcess, new IntPtr(npc.NpcObjAddr), sb, 0x800, out int sbr);
-                                bool found = false;
-                                for (int si = 0; si <= sbr - 4; si++)
-                                {
-                                    uint v32 = BitConverter.ToUInt32(sb, si);
-                                    if (v32 == searchVal)
-                                    { Console.WriteLine($"  NPC{ni + 1} obj+0x{si:X3} = {searchVal} ← OID FOUND"); found = true; }
-                                }
-                                // Also scan node
-                                byte[] nb2 = new byte[0x100];
-                                MemoryHelper.ReadProcessMemory(hProcess, new IntPtr(npc.NodeAddr), nb2, 0x100, out int nbr2);
-                                for (int si = 0; si <= nbr2 - 4; si++)
-                                {
-                                    uint v32 = BitConverter.ToUInt32(nb2, si);
-                                    if (v32 == searchVal)
-                                    { Console.WriteLine($"  NPC{ni + 1} node+0x{si:X3} = {searchVal} ← OID FOUND (node)"); found = true; }
-                                }
-                                // Follow pointer at obj+0x114 (sub-object seen in earlier scans)
-                                int subPtr = MemoryHelper.ReadInt32(hProcess, new IntPtr(npc.NpcObjAddr + 0x114));
-                                if (subPtr > 0x1000000 && subPtr < 0x20000000)
-                                {
-                                    byte[] ssb = new byte[0x40];
-                                    MemoryHelper.ReadProcessMemory(hProcess, new IntPtr((uint)subPtr), ssb, 0x40, out int ssr);
-                                    for (int si = 0; si <= ssr - 4; si++)
-                                    {
-                                        uint v32 = BitConverter.ToUInt32(ssb, si);
-                                        if (v32 == searchVal)
-                                        { Console.WriteLine($"  NPC{ni + 1} [obj+114]+0x{si:X3} = {searchVal} ← OID FOUND (sub)"); found = true; }
-                                    }
-                                }
-                                if (!found) Console.WriteLine($"  NPC{ni + 1} ({npc.Name}): not found in 0x{sbr:X} bytes");
-                            }
-                        }
                         else if (key == ConsoleKey.Z)
                         {
                             var nearby4 = GetNearbyNpcs();
@@ -3642,6 +3480,270 @@ namespace Xajh
                             Console.WriteLine($"[Z] AttackTarget only (no keys) → {n.npc.Name} ({n.npc.X:F0}, {n.npc.Y:F0})");
                             Console.WriteLine("    Watch: does player turn to face NPC instantly?");
                             turn.AttackTarget(n.npc.X, n.npc.Y);
+                        }
+                        else if (key == ConsoleKey.N)
+                        {
+                            // Find all corpses (no distance filter - let game decide what's reachable)
+                            var liveNpcs = GetTrackedNpcs();
+                            if (liveNpcs.Count == 0) { Console.WriteLine("[N] no live NPC"); break; }
+                            int npcVtable = MemoryHelper.ReadInt32(hProcess, new IntPtr(liveNpcs.First().NpcObjAddr));
+                            int chainDn = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9CA8A0));
+                            float px = chainDn != 0 ? MemoryHelper.ReadFloat(hProcess, new IntPtr((uint)chainDn + 0x34)) : 0f;
+                            float py = chainDn != 0 ? MemoryHelper.ReadFloat(hProcess, new IntPtr((uint)chainDn + 0x38)) : 0f;
+
+                            byte[] target = BitConverter.GetBytes(npcVtable);
+                            var hits = new List<uint>();
+                            IntPtr addr = IntPtr.Zero;
+                            while (addr.ToInt64() < 0x80000000L && hits.Count < 3000)
+                            {
+                                if (!MemoryHelper.VirtualQueryEx(hProcess, addr, out var mbi, (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryHelper.MEMORY_BASIC_INFORMATION>())) break;
+                                long regSize = (long)mbi.RegionSize.ToInt64();
+                                if (regSize <= 0) break;
+                                if (mbi.State == 0x1000 && (mbi.Protect & 0xEE) != 0 && (mbi.Type & 0x1000000) == 0 && mbi.BaseAddress.ToInt64() < 0x40000000L)
+                                {
+                                    int size = (int)Math.Min(regSize, 0x400000);
+                                    byte[] buf = new byte[size];
+                                    if (MemoryHelper.ReadProcessMemory(hProcess, mbi.BaseAddress, buf, size, out int br))
+                                    {
+                                        for (int i = 0; i <= br - 4; i += 4)
+                                            if (buf[i] == target[0] && buf[i + 1] == target[1] && buf[i + 2] == target[2] && buf[i + 3] == target[3])
+                                                hits.Add((uint)(mbi.BaseAddress.ToInt64() + i));
+                                    }
+                                }
+                                addr = new IntPtr(mbi.BaseAddress.ToInt64() + regSize);
+                            }
+
+                            var liveSet = new HashSet<uint>(liveNpcs.Select(n => n.NpcObjAddr));
+                            int playerObjForScan = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4514));
+                            if (playerObjForScan > 0x1000000) liveSet.Add((uint)playerObjForScan);
+
+                            var corpses = new List<(uint ptr, uint oid, float x, float y, float dist)>();
+                            foreach (var ptr in hits)
+                            {
+                                if (liveSet.Contains(ptr)) continue;
+                                try
+                                {
+                                    float x = MemoryHelper.ReadFloat(hProcess, new IntPtr(ptr + 0x94));
+                                    float y = MemoryHelper.ReadFloat(hProcess, new IntPtr(ptr + 0x98));
+                                    if (!(x > -10000 && x < 10000 && y > -10000 && y < 10000)) continue;
+                                    float dist = (float)Math.Sqrt((x - px) * (x - px) + (y - py) * (y - py));
+                                    if (dist > 300) continue;  // only nearby corpses
+                                    uint oid = (uint)MemoryHelper.ReadInt32(hProcess, new IntPtr(ptr + 0x644));
+                                    if (oid == 0xFFFFFFFF || oid == 0) continue;
+                                    corpses.Add((ptr, oid, x, y, dist));
+                                }
+                                catch { }
+                            }
+                            corpses.Sort((a, b) => a.dist.CompareTo(b.dist));
+                            Console.WriteLine($"[N] {corpses.Count} corpses within 300:");
+                            foreach (var c in corpses.Take(8))
+                                Console.WriteLine($"    oid={c.oid}  pos=({c.x:F0},{c.y:F0})  dist={c.dist:F0}");
+
+                            if (corpses.Count == 0) { Console.WriteLine("[N] no corpses within 300"); break; }
+
+                            // Search each corpse - gold auto-collected
+                            for (int t = 0; t < corpses.Count; t++)
+                            {
+                                var c = corpses[t];
+                                Console.WriteLine($"[N] Try #{t + 1}: LootCorpse oid={c.oid} dist={c.dist:F0}");
+                                turn.LootCorpse(c.oid);
+                                Thread.Sleep(700);
+
+                                // Scan heap for CGwPuCorpse instance (first dword = 0xBB248C)
+                                byte[] vtableTarget = BitConverter.GetBytes((uint)0xBB248C);
+                                IntPtr scanAddr = IntPtr.Zero;
+                                uint foundInstance = 0;
+                                while (scanAddr.ToInt64() < 0x40000000L && foundInstance == 0)
+                                {
+                                    if (!MemoryHelper.VirtualQueryEx(hProcess, scanAddr, out var mbi, (uint)System.Runtime.InteropServices.Marshal.SizeOf<MemoryHelper.MEMORY_BASIC_INFORMATION>())) break;
+                                    long regSize = (long)mbi.RegionSize.ToInt64();
+                                    if (regSize <= 0) break;
+                                    if (mbi.State == 0x1000 && (mbi.Protect & 0xEE) != 0 && (mbi.Type & 0x1000000) == 0)
+                                    {
+                                        int size = (int)Math.Min(regSize, 0x400000);
+                                        byte[] buf = new byte[size];
+                                        if (MemoryHelper.ReadProcessMemory(hProcess, mbi.BaseAddress, buf, size, out int br))
+                                        {
+                                            for (int i = 0; i <= br - 4; i += 4)
+                                            {
+                                                if (buf[i] == vtableTarget[0] && buf[i + 1] == vtableTarget[1] && buf[i + 2] == vtableTarget[2] && buf[i + 3] == vtableTarget[3])
+                                                {
+                                                    foundInstance = (uint)(mbi.BaseAddress.ToInt64() + i);
+                                                    Console.WriteLine($"[N]   Found CGwPuCorpse instance @ 0x{foundInstance:X}");
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    scanAddr = new IntPtr(mbi.BaseAddress.ToInt64() + regSize);
+                                }
+
+                                if (foundInstance != 0)
+                                {
+                                    // Take all items first (if any non-gold items)
+                                    Console.WriteLine($"[N]   TakeAllLoot oid={c.oid}");
+                                    turn.TakeAllLoot(c.oid);
+                                    Thread.Sleep(300);
+
+                                    // Read instance fields to find sub-object pointers
+                                    byte[] dump = new byte[0x400];
+                                    MemoryHelper.ReadProcessMemory(hProcess, new IntPtr(foundInstance), dump, dump.Length, out int dr);
+                                    var subObjects = new List<(int off, uint ptr, uint vt, string cls)>();
+                                    for (int off = 0; off < Math.Min(dr, 0x300); off += 4)
+                                    {
+                                        uint val = BitConverter.ToUInt32(dump, off);
+                                        if (val > 0x100000 && val < 0x40000000 && val != foundInstance)
+                                        {
+                                            byte[] vt = new byte[4];
+                                            if (MemoryHelper.ReadProcessMemory(hProcess, new IntPtr(val), vt, 4, out _))
+                                            {
+                                                uint possibleVtable = BitConverter.ToUInt32(vt, 0);
+                                                if (possibleVtable > 0xB00000 && possibleVtable < 0xC00000)
+                                                {
+                                                    string cls = "?";
+                                                    if (possibleVtable == 0xB89DEC) cls = "GUiTouch";
+                                                    else if (possibleVtable == 0xBB8D34) cls = "CGWTipTouch";
+                                                    else if (possibleVtable == 0xBAC3F4 || possibleVtable == 0xBAC4CC) cls = "CGwMainMenu";
+                                                    subObjects.Add((off, val, possibleVtable, cls));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Hide all GUiTouch and CGWTipTouch sub-objects
+                                    foreach (var so in subObjects)
+                                    {
+                                        if (so.cls == "GUiTouch" || so.cls == "CGWTipTouch")
+                                            turn.HideGuiObject(so.ptr);
+                                    }
+                                    // Also hide the parent CGwPuCorpse itself
+                                    turn.HideLootWindow(foundInstance);
+                                    Console.WriteLine($"[N]   Hid {subObjects.Count(s => s.cls == "GUiTouch" || s.cls == "CGWTipTouch")} sub-objects + parent");
+                                    Thread.Sleep(400);
+                                }
+                                else
+                                {
+                                    Console.WriteLine("[N]   No CGwPuCorpse instance found");
+                                }
+                            }
+                            Console.WriteLine("[N] done.");
+                        }
+                        else if (key == ConsoleKey.I)
+                        {
+                            Console.WriteLine("[I] Scanning inventory...");
+                            bag.ScanInventory();
+                        }
+                        else if (key == ConsoleKey.U)
+                        {
+                            // Deep inspect a candidate. Prompt for address.
+                            Console.Write("[U] Enter inventory ptr to deep-inspect (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint ptr))
+                            {
+                                bag.InspectCandidate(ptr, 16);
+                            }
+                        }
+                        else if (key == ConsoleKey.M)
+                        {
+                            // Follow a pointer and dump it (memory inspector)
+                            Console.Write("[M] Enter pointer (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            Console.Write("[M] Size (hex, default 100): ");
+                            string sz = Console.ReadLine()?.Trim() ?? "";
+                            int size = 0x100;
+                            if (!string.IsNullOrEmpty(sz)) int.TryParse(sz, System.Globalization.NumberStyles.HexNumber, null, out size);
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint ptr))
+                            {
+                                bag.FollowPointer(ptr, size);
+                            }
+                        }
+                        else if (key == ConsoleKey.H)
+                        {
+                            // Search (hunt) all game memory for a specific item template ID
+                            Console.Write("[H] Enter item ID (decimal by default, or 0x-prefix for hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            uint itemId = 0;
+                            bool ok;
+                            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                                ok = uint.TryParse(s.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out itemId);
+                            else
+                                ok = uint.TryParse(s, out itemId);
+                            if (ok)
+                            {
+                                bag.SearchByItemId(itemId);
+                            }
+                            else
+                            {
+                                Console.WriteLine("[H] invalid number");
+                            }
+                        }
+                        else if (key == ConsoleKey.B)
+                        {
+                            // BUFF: auto-find CSvClient, then call SendUseItem(bagSlot, itemSlot, self).
+                            // Example: 真36天剑 at bag 0 slot 7 → [B] 0 7
+                            Console.Write("[B] Enter bag slot in pouch (0-7, hex): ");
+                            string s1 = Console.ReadLine()?.Trim() ?? "";
+                            Console.Write("[B] Enter item slot in bag (0-7, hex): ");
+                            string s2 = Console.ReadLine()?.Trim() ?? "";
+                            uint bagSlot = 0, itemSlot = 0;
+                            if (!string.IsNullOrEmpty(s1)) uint.TryParse(s1, System.Globalization.NumberStyles.HexNumber, null, out bagSlot);
+                            if (!string.IsNullOrEmpty(s2)) uint.TryParse(s2, System.Globalization.NumberStyles.HexNumber, null, out itemSlot);
+                            Console.WriteLine($"[B] AutoBuff(bag={bagSlot}, slot={itemSlot}, target=31351)");
+                            bag.AutoBuff(bagSlot, itemSlot, 31351);
+                        }
+                        else if (key == ConsoleKey.C)
+                        {
+                            // Capture: hook SendUseItem to log its args.
+                            // First press: install hook.
+                            // Subsequent presses: read captured args.
+                            Console.WriteLine("[C] Hook/capture SendUseItem args:");
+                            Console.WriteLine("    1) install hook 2) read captured");
+                            Console.Write("Choose (1/2): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            if (s == "1")
+                            {
+                                bag.InstallUseItemHook();
+                            }
+                            else
+                            {
+                                bag.ReadCapturedArgs();
+                            }
+                        }
+                        else if (key == ConsoleKey.X)
+                        {
+                            // Find places in memory that contain pointers to a given address.
+                            // Useful for discovering stable chains to a captured runtime pointer.
+                            Console.Write("[X] Enter target address (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint tgt))
+                            {
+                                bag.FindPointersTo(tgt);
+                            }
+                        }
+                        else if (key == ConsoleKey.E)
+                        {
+                            // Recursive pointer chain discovery.
+                            // Finds chain from stable module memory → heap → ... → target.
+                            Console.Write("[E] Enter target address (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            Console.Write("[E] Max depth (default 3): ");
+                            string sd = Console.ReadLine()?.Trim() ?? "";
+                            int depth = 3;
+                            if (!string.IsNullOrEmpty(sd)) int.TryParse(sd, out depth);
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint tgt))
+                            {
+                                bag.FindChainsTo(tgt, depth);
+                            }
+                        }
+                        else if (key == ConsoleKey.T)
+                        {
+                            // Find all heap objects matching a vtable (class instances).
+                            Console.Write("[T] Enter vtable address (hex): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            if (uint.TryParse(s, System.Globalization.NumberStyles.HexNumber, null, out uint vt))
+                            {
+                                bag.FindInstancesByVtable(vt);
+                            }
                         }
                         else if (key == ConsoleKey.K)
                         {

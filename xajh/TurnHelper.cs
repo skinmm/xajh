@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 namespace xajh
@@ -359,6 +360,48 @@ namespace xajh
         /// Matches DLL wrapper at 0x100022A0. Writes coords to face globals, then calls with
         /// push face_Y, push face_X, push state, ECX=playerObj, call 0x6871AF, [0xDD55A4]=1.</summary>
         /// <summary>Attack NPC by calling game function 0x6842CA directly with NPC pointer.</summary>
+        /// <summary>Call 0x6842CA with custom first arg. arg1 can be 1, 2, -1, etc. to test different actions.</summary>
+        public bool InteractNpcArg(uint npcPtr, int arg1)
+        {
+            if (npcPtr < 0x1000000) return false;
+            uint npcOid = (uint)MemoryHelper.ReadInt32(_hProcess, new IntPtr(npcPtr + 0x644));
+
+            byte[] oidBytes = BitConverter.GetBytes(npcOid);
+            byte[] ptrBytes = BitConverter.GetBytes(npcPtr);
+            byte[] a1Bytes = BitConverter.GetBytes(arg1);
+
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x68, ptrBytes[0], ptrBytes[1], ptrBytes[2], ptrBytes[3],  // push NPC_ptr
+                0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push OID
+                0x68, a1Bytes[0], a1Bytes[1], a1Bytes[2], a1Bytes[3],      // push arg1
+                0xA1, 0xC4, 0xD6, 0xDD, 0x00,                // mov eax, [0xDDD6C4]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x10,                                   // jz cleanup (+16)
+                0x8B, 0x48, 0x0C,                             // mov ecx, [eax+0x0C]
+                0x85, 0xC9,                                   // test ecx, ecx
+                0x74, 0x09,                                   // jz cleanup (+9)
+                0xB8, 0xCA, 0x42, 0x68, 0x00,                // mov eax, 0x6842CA
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x03,                                   // jmp end (+3)
+                0x83, 0xC4, 0x0C,                             // add esp, 0xC
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out _);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 1000);
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
         public bool AttackNpcDirect(uint npcPtr)
         {
             if (npcPtr < 0x1000000) return false;
@@ -369,9 +412,9 @@ namespace xajh
 
             byte[] sc = new byte[] {
                 0x60,                                         // pushad
-                0x6A, 0x01,                                   // push 1
+                0x68, ptrBytes[0], ptrBytes[1], ptrBytes[2], ptrBytes[3],  // push NPC_ptr (first → bottom of stack)
                 0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push NPC_OID
-                0x68, ptrBytes[0], ptrBytes[1], ptrBytes[2], ptrBytes[3],  // push NPC_ptr
+                0x6A, 0x01,                                   // push 1 (last → top of stack = first arg)
                 0xA1, 0xC4, 0xD6, 0xDD, 0x00,                // mov eax, [0xDDD6C4]
                 0x85, 0xC0,                                   // test eax, eax
                 0x74, 0x10,                                   // jz cleanup (+16)
@@ -560,6 +603,50 @@ namespace xajh
             if (chainD == 0) return false;
             int flag = MemoryHelper.ReadInt32(_hProcess, new IntPtr((uint)chainD + 0x508));
             return flag == 1;
+        }
+
+        /// <summary>Call 0x6842CA(-1, 0, 0) — searches/interacts with nearest NPC (loot corpse?).
+        /// Replicates DLL function at 0x10002A50.
+        /// ECX chain: [0xD78AE0]+0x58+0x0C</summary>
+        public bool SearchCorpse()
+        {
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x6A, 0x00,                                   // push 0
+                0x6A, 0x00,                                   // push 0
+                0x6A, 0xFF,                                   // push -1
+                0xA1, 0xE0, 0x8A, 0xD7, 0x00,                // mov eax, [0xD78AE0]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x17,                                   // jz cleanup (+23)
+                0x8B, 0x40, 0x58,                             // mov eax, [eax+0x58]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x10,                                   // jz cleanup (+16)
+                0x8B, 0x48, 0x0C,                             // mov ecx, [eax+0x0C]
+                0x85, 0xC9,                                   // test ecx, ecx
+                0x74, 0x09,                                   // jz cleanup (+9)
+                0xB8, 0xCA, 0x42, 0x68, 0x00,                // mov eax, 0x6842CA
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x03,                                   // jmp end (+3)
+                0x83, 0xC4, 0x0C,                             // add esp, 0xC (cleanup)
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 2000);
+                uint exitCode;
+                GetExitCodeThread(thread, out exitCode);
+                Console.WriteLine($"  [SearchCorpse] thread done exitCode=0x{exitCode:X}");
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
         }
 
         /// <summary>Check if player is currently attacking a target (combat_obj+0 = NPC pointer).</summary>
@@ -764,6 +851,447 @@ namespace xajh
             Thread.Sleep(holdMs);
             keybd_event((byte)VK_F, sc, 2, UIntPtr.Zero);
             Thread.Sleep(20);
+            return true;
+        }
+
+        /// <summary>Test calling 0x67F644 with configurable ECX - may trigger loot packet.
+        /// ecxMode: 0 = [0xDDD6C4], 1 = [0xDDD6C4]+0x0C, 2 = [0xDDD6C4]+0x04, 3 = playerObj, 4 = NPC ptr</summary>
+        public bool TestSendPacket(int ecxMode, uint npcPtr = 0)
+        {
+            byte[] sc;
+            if (ecxMode == 0)
+            {
+                sc = new byte[] {
+                    0x60,                                     // pushad
+                    0x8B, 0x0D, 0xC4, 0xD6, 0xDD, 0x00,      // mov ecx, [0xDDD6C4]
+                    0x85, 0xC9,                               // test ecx, ecx
+                    0x74, 0x07,                               // jz +7
+                    0xB8, 0x44, 0xF6, 0x67, 0x00,            // mov eax, 0x67F644
+                    0xFF, 0xD0,                               // call eax
+                    0x61,                                     // popad
+                    0xC3                                      // ret
+                };
+            }
+            else if (ecxMode == 1)
+            {
+                sc = new byte[] {
+                    0x60,
+                    0xA1, 0xC4, 0xD6, 0xDD, 0x00,            // mov eax, [0xDDD6C4]
+                    0x85, 0xC0,                               // test eax, eax
+                    0x74, 0x0A,                               // jz +10
+                    0x8B, 0x48, 0x0C,                         // mov ecx, [eax+0x0C]
+                    0xB8, 0x44, 0xF6, 0x67, 0x00,            // mov eax, 0x67F644
+                    0xFF, 0xD0,
+                    0x61,
+                    0xC3
+                };
+            }
+            else if (ecxMode == 2)
+            {
+                sc = new byte[] {
+                    0x60,
+                    0xA1, 0xC4, 0xD6, 0xDD, 0x00,            // mov eax, [0xDDD6C4]
+                    0x85, 0xC0,
+                    0x74, 0x0A,
+                    0x8B, 0x48, 0x04,                         // mov ecx, [eax+0x04]
+                    0xB8, 0x44, 0xF6, 0x67, 0x00,
+                    0xFF, 0xD0,
+                    0x61,
+                    0xC3
+                };
+            }
+            else if (ecxMode == 3)
+            {
+                sc = new byte[] {
+                    0x60,
+                    0x8B, 0x0D, 0x14, 0x45, 0xDD, 0x00,      // mov ecx, [0xDD4514] (playerObj)
+                    0x85, 0xC9,
+                    0x74, 0x07,
+                    0xB8, 0x44, 0xF6, 0x67, 0x00,
+                    0xFF, 0xD0,
+                    0x61,
+                    0xC3
+                };
+            }
+            else if (ecxMode == 4)
+            {
+                if (npcPtr < 0x1000000) return false;
+                byte[] ptrBytes = BitConverter.GetBytes(npcPtr);
+                sc = new byte[] {
+                    0x60,
+                    0xB9, ptrBytes[0], ptrBytes[1], ptrBytes[2], ptrBytes[3],  // mov ecx, npcPtr
+                    0xB8, 0x44, 0xF6, 0x67, 0x00,
+                    0xFF, 0xD0,
+                    0x61,
+                    0xC3
+                };
+            }
+            else return false;
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out _);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 1500);
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>Replicate XajhSmileDll.dll's search corpse wrapper (0x10002410).
+        /// Logic: call 0x67E62C(corpseOid) with ECX=playerObj → get packet obj
+        ///        call 0x67F644 with ECX=packet obj → send packet to server
+        /// The DLL uses global 0xDD55C4 as input buffer — we inline the OID.</summary>
+        public bool LootCorpse(uint corpseOid)
+        {
+            byte[] oidBytes = BitConverter.GetBytes(corpseOid);
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push corpseOid (arg for 0x67E62C)
+                0x8B, 0x0D, 0x14, 0x45, 0xDD, 0x00,          // mov ecx, [0xDD4514]  (playerObj)
+                0x85, 0xC9,                                   // test ecx, ecx
+                0x74, 0x16,                                   // jz cleanup (+22)
+                0xB8, 0x2C, 0xE6, 0x67, 0x00,                // mov eax, 0x67E62C
+                0xFF, 0xD0,                                   // call eax
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x0B,                                   // jz cleanup (+11)
+                0x8B, 0xC8,                                   // mov ecx, eax
+                0xB8, 0x44, 0xF6, 0x67, 0x00,                // mov eax, 0x67F644
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x03,                                   // jmp end
+                0x83, 0xC4, 0x04,                             // add esp, 4 (cleanup)
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 2000);
+                uint ec;
+                GetExitCodeThread(thread, out ec);
+                Console.WriteLine($"  [LootCorpse] thread done exitCode=0x{ec:X}");
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>Replicate XajhSmileDll.dll's 0x10002450 — likely "confirm/take-all loot".
+        /// Calls 0x9A3430(arg) with ECX = [0xDDD6C4]+0x0C+0x94.
+        /// Packet 0x1C3 with single arg (corpse OID).</summary>
+        public bool ConfirmLoot(uint corpseOid)
+        {
+            byte[] oidBytes = BitConverter.GetBytes(corpseOid);
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push corpseOid
+                // ECX chain: [0xDDD6C4] → +0x0C → +0x94
+                0xA1, 0xC4, 0xD6, 0xDD, 0x00,                // mov eax, [0xDDD6C4]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x1A,                                   // jz cleanup (+26)
+                0x8B, 0x40, 0x0C,                             // mov eax, [eax+0x0C]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x13,                                   // jz cleanup (+19)
+                0x8B, 0x88, 0x94, 0x00, 0x00, 0x00,          // mov ecx, [eax+0x94]
+                0x85, 0xC9,                                   // test ecx, ecx
+                0x74, 0x09,                                   // jz cleanup (+9)
+                0xB8, 0x30, 0x34, 0x9A, 0x00,                // mov eax, 0x9A3430
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x03,                                   // jmp end
+                0x83, 0xC4, 0x04,                             // add esp, 4
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 2000);
+                uint ec;
+                GetExitCodeThread(thread, out ec);
+                Console.WriteLine($"  [ConfirmLoot] thread done exitCode=0x{ec:X}");
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>Replicate XajhSmileDll.dll's 0x100024A0 — another corpse-related action.
+        /// Calls 0x679B5E(oid, 1, count, count) with ECX = [0xDDD6C4]+0x0C+0x94.
+        /// Try this if 0x10002450 doesn't close the loot window.</summary>
+        public bool CloseLootWindow(uint corpseOid)
+        {
+            byte[] oidBytes = BitConverter.GetBytes(corpseOid);
+            // XajhSmileDll 0x100024A0: pushes [0xDD5654], 1, [0xDD5654] (NOT [0xDD5664] — see below), [0xDD5664]
+            // Actually re-reading: pushes [ebp-4]=[0xDD5654], 1, EAX, [ebp-8]=[0xDD5664]
+            // where EAX was [0xDD5664] (set just before pushad and still in eax after pushad pop?)
+            // Simpler: assume both globals are same value = corpseOid, so push oid,1,oid,oid
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push corpseOid  (arg4)
+                0x6A, 0x01,                                   // push 1                       (arg3)
+                0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push corpseOid  (arg2)
+                0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push corpseOid  (arg1)
+                0xA1, 0xC4, 0xD6, 0xDD, 0x00,                // mov eax, [0xDDD6C4]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x1A,                                   // jz cleanup
+                0x8B, 0x40, 0x0C,                             // mov eax, [eax+0x0C]
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x13,                                   // jz cleanup
+                0x8B, 0x88, 0x94, 0x00, 0x00, 0x00,          // mov ecx, [eax+0x94]
+                0x85, 0xC9,                                   // test ecx, ecx
+                0x74, 0x09,                                   // jz cleanup
+                0xB8, 0x5E, 0x9B, 0x67, 0x00,                // mov eax, 0x679B5E
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x03,                                   // jmp end
+                0x83, 0xC4, 0x10,                             // add esp, 0x10 (4 args cleanup)
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 2000);
+                uint ec;
+                GetExitCodeThread(thread, out ec);
+                Console.WriteLine($"  [CloseLootWindow] thread done exitCode=0x{ec:X}");
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>CSvClient::GetAllFromCorpse — take all items from corpse.
+        /// Writes corpseOid to [0xDD5614], then calls 0x9A3430 with ECX = [0xDDD6C4]+0x0C+0x94.
+        /// Packet: field 0x1C3 (size 0x20) + field 0x14 = corpseOid.</summary>
+        public bool TakeAllLoot(uint corpseOid)
+        {
+            byte[] oidBytes = BitConverter.GetBytes(corpseOid);
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                // Write corpseOid to [0xDD5614]
+                0xC7, 0x05, 0x14, 0x56, 0xDD, 0x00, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // mov [0xDD5614], corpseOid
+                // Now call CSvClient::GetAllFromCorpse
+                0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push corpseOid (arg1)
+                0xA1, 0xC4, 0xD6, 0xDD, 0x00,                // mov eax, [0xDDD6C4]
+                0x85, 0xC0, 0x74, 0x1A,                      // jz cleanup
+                0x8B, 0x40, 0x0C,                             // mov eax, [eax+0x0C]
+                0x85, 0xC0, 0x74, 0x13,                      // jz cleanup
+                0x8B, 0x88, 0x94, 0x00, 0x00, 0x00,          // mov ecx, [eax+0x94]
+                0x85, 0xC9, 0x74, 0x09,                      // jz cleanup
+                0xB8, 0x30, 0x34, 0x9A, 0x00,                // mov eax, 0x9A3430
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x03,                                   // jmp end
+                0x83, 0xC4, 0x04,                             // add esp, 4 (cleanup)
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 2000);
+                uint ec;
+                GetExitCodeThread(thread, out ec);
+                Console.WriteLine($"  [TakeAllLoot] thread done exitCode=0x{ec:X}");
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>CSvClient::ReleaseCorpse (0x9A3590) — closes the corpse loot window.
+        /// Packet: 0x153 with field 0x14 = corpseOid.</summary>
+        public bool ReleaseCorpse(uint corpseOid)
+        {
+            byte[] oidBytes = BitConverter.GetBytes(corpseOid);
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x68, oidBytes[0], oidBytes[1], oidBytes[2], oidBytes[3],  // push corpseOid
+                0xA1, 0xC4, 0xD6, 0xDD, 0x00,                // mov eax, [0xDDD6C4]
+                0x85, 0xC0, 0x74, 0x1A,                      // jz cleanup
+                0x8B, 0x40, 0x0C,                             // mov eax, [eax+0x0C]
+                0x85, 0xC0, 0x74, 0x13,                      // jz cleanup
+                0x8B, 0x88, 0x94, 0x00, 0x00, 0x00,          // mov ecx, [eax+0x94]
+                0x85, 0xC9, 0x74, 0x09,                      // jz cleanup
+                0xB8, 0x90, 0x35, 0x9A, 0x00,                // mov eax, 0x9A3590
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x03,                                   // jmp end
+                0x83, 0xC4, 0x04,                             // add esp, 4 (cleanup)
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 2000);
+                uint ec;
+                GetExitCodeThread(thread, out ec);
+                Console.WriteLine($"  [ReleaseCorpse] thread done exitCode=0x{ec:X}");
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+        [DllImport("user32.dll")] static extern bool SetCursorPos(int X, int Y);
+        [DllImport("user32.dll")] static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, IntPtr dwExtraInfo);
+        [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT lpPoint);
+        [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+        const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+        const uint MOUSEEVENTF_LEFTUP = 0x0004;
+
+        /// <summary>Click the "蓝色按钮" to take all items + close loot window.
+        /// Uses real hardware mouse event (moves the cursor, then clicks).
+        /// Client coords default to (62, 277) — loot window is anchored top-left of game client.</summary>
+        public bool ClickLootConfirmButton(int clientX = 62, int clientY = 277)
+        {
+            if (_gameHwnd == IntPtr.Zero) { Console.WriteLine("  [ClickLootConfirmButton] no game window"); return false; }
+
+            // Convert client coords to screen coords
+            POINT pt = new POINT { X = clientX, Y = clientY };
+            if (!ClientToScreen(_gameHwnd, ref pt))
+            {
+                Console.WriteLine("  [ClickLootConfirmButton] ClientToScreen failed");
+                return false;
+            }
+
+            // Save original cursor pos to restore later
+            POINT origPt;
+            GetCursorPos(out origPt);
+
+            // Move cursor, click, restore
+            SetCursorPos(pt.X, pt.Y);
+            Thread.Sleep(80);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+            Thread.Sleep(60);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+            Thread.Sleep(80);
+            SetCursorPos(origPt.X, origPt.Y);
+
+            Console.WriteLine($"  [ClickLootConfirmButton] clicked at screen ({pt.X},{pt.Y}) [client ({clientX},{clientY})], restored to ({origPt.X},{origPt.Y})");
+            return true;
+        }
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        /// <summary>Sets the ESC key flag [0xDDD6C8] = 1, which simulates ESC press.
+        /// Found in the key handler at game+0x9EA9C9: cmp eax, 0x1B; jnz; mov [0xDDD6C8], 1.
+        /// This may close the loot window (same as manual ESC).</summary>
+        public bool SetEscapeFlag()
+        {
+            // Simple direct write
+            byte[] val = { 0x01, 0x00, 0x00, 0x00 };
+            int written;
+            bool ok = MemoryHelper.WriteProcessMemory(_hProcess, new IntPtr(0xDDD6C8), val, 4, out written);
+            Console.WriteLine($"  [SetEscapeFlag] wrote [0xDDD6C8]=1, ok={ok}");
+            return ok;
+        }
+
+        /// <summary>Call CGwPuCorpse::Visible(show=false) on a given instance.
+        /// Instance must be found by scanning for vtable=0xBB248C in memory.
+        /// Method 0x912950 is at sub-vtable +8, slot 9. Takes (this+8, bShow, arg2=0).</summary>
+        public bool HideLootWindow(uint instancePtr)
+        {
+            // Shellcode: ECX = instance+8, push 0, push 0, call 0x912950
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x6A, 0x00,                                   // push 0 (arg2)
+                0x6A, 0x00,                                   // push 0 (bShow=false)
+                0xB9, 0x00, 0x00, 0x00, 0x00,                // mov ecx, instancePtr+8  (patched below)
+                0xB8, 0x50, 0x29, 0x91, 0x00,                // mov eax, 0x912950
+                0xFF, 0xD0,                                   // call eax
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+            // Patch ECX with instance+8
+            uint thisArg = instancePtr + 8;
+            byte[] thisBytes = BitConverter.GetBytes(thisArg);
+            sc[6] = thisBytes[0];
+            sc[7] = thisBytes[1];
+            sc[8] = thisBytes[2];
+            sc[9] = thisBytes[3];
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 2000);
+                uint ec;
+                GetExitCodeThread(thread, out ec);
+                Console.WriteLine($"  [HideLootWindow] called Visible(false) on 0x{instancePtr:X}, exitCode=0x{ec:X}");
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>Generic hide: call Visible(false) on any GUi-derived object.
+        /// ECX = objPtr, pushes (0, 0), calls vtable[9] = method at offset 0x24 in vtable.
+        /// Works for GUiObject, GUiWidget, GUiTouch, CGWTipTouch, etc.</summary>
+        public bool HideGuiObject(uint objPtr)
+        {
+            byte[] ptrBytes = BitConverter.GetBytes(objPtr);
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x6A, 0x00,                                   // push 0 (arg2)
+                0x6A, 0x00,                                   // push 0 (bShow=false)
+                0xB9, ptrBytes[0], ptrBytes[1], ptrBytes[2], ptrBytes[3],  // mov ecx, objPtr
+                0x85, 0xC9,                                   // test ecx, ecx
+                0x74, 0x0D,                                   // jz cleanup
+                0x8B, 0x01,                                   // mov eax, [ecx] (vtable)
+                0x85, 0xC0,                                   // test eax, eax
+                0x74, 0x07,                                   // jz cleanup
+                0x8B, 0x40, 0x24,                             // mov eax, [eax+0x24] (vtable[9] = Visible)
+                0xFF, 0xD0,                                   // call eax
+                0xEB, 0x03,                                   // jmp end
+                0x83, 0xC4, 0x08,                             // add esp, 8 (cleanup)
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 1000);
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
             return true;
         }
 
