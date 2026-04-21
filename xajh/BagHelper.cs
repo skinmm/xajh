@@ -524,6 +524,197 @@ namespace xajh
             Console.WriteLine($"  [Hook] last ECX  = 0x{ecx:X} (CSvClient ptr)");
         }
 
+        /// <summary>Install hooks on all known Send* functions (0x9A3030-0x9A54B0) that log
+        /// their packet ID + first 3 args + return address to a ring buffer.
+        /// User triggers an in-game action (e.g. equip item) and we see which packets got sent.
+        /// 
+        /// Ring buffer layout @ 0xDD5800:
+        ///   +0x00: next write index (increments each call)
+        ///   +0x04..: entries of 24 bytes each (up to 40 entries = 0x3C0 bytes)
+        ///     entry: [fn_va, arg1, arg2, arg3, return_addr, csvclient_ptr]</summary>
+        public bool InstallSendHooks()
+        {
+            // Known Send* functions and their packet IDs
+            uint[] sendFuncs = new uint[] {
+                0x9A3030, 0x9A32A0, 0x9A3430, 0x9A3590, 0x9A36E0, 0x9A3850, 0x9A39B0,
+                0x9A3B20, 0x9A3CD0, 0x9A3E20, 0x9A3FA0, 0x9A42D0, 0x9A4440, 0x9A45A0,
+                0x9A4710, /* 0x9A4870 already hooked as UseItem */ 0x9A49E0, 0x9A4B00,
+                0x9A4B70, 0x9A4CC0, 0x9A4D40, 0x9A5080, 0x9A50D0, 0x9A52B0
+            };
+
+            // Clear ring buffer
+            byte[] zeros = new byte[0x400];
+            MemoryHelper.WriteProcessMemory(_hProcess, new IntPtr(0xDD5800), zeros, zeros.Length, out _);
+
+            int hooked = 0;
+            foreach (uint fn in sendFuncs)
+            {
+                // Alloc stub
+                IntPtr stub = VirtualAllocEx(_hProcess, IntPtr.Zero, 128, 0x3000, 0x40);
+                if (stub == IntPtr.Zero) continue;
+                uint stubAddr = (uint)stub.ToInt64();
+                byte[] fnBytes = BitConverter.GetBytes(fn);
+
+                // Build stub that:
+                // - pushad + pushfd
+                // - Compute ring index: idx = [0xDD5800], [0xDD5800] = idx+1
+                // - entry_addr = 0xDD5804 + (idx % 40) * 24
+                // - Write fn_va, arg1, arg2, arg3, retaddr, ecx to entry
+                // - popfd + popad
+                // - Replay first 5 bytes (55 8B EC 6A FF) and jmp to fn+5
+                //
+                // Simpler: use a non-wrapping counter, entry_addr = 0xDD5800 + 4 + ((counter-1) % 40) * 24
+                // But easier: just use a fixed slot per fn. No — we want chronological order.
+                //
+                // Simplest: write to slot (counter % 40), no mod = just wrap at 40 via cmp+reset.
+
+                byte[] stubCode = new byte[] {
+                    0x60,                                         // pushad
+                    0x9C,                                         // pushfd
+                    // EAX = counter = [0xDD5800]; inc counter
+                    0xA1, 0x00, 0x58, 0xDD, 0x00,                 // mov eax, [0xDD5800]
+                    0xFF, 0x05, 0x00, 0x58, 0xDD, 0x00,           // inc [0xDD5800]
+                    // ECX = (counter % 40) * 24 + 0xDD5804
+                    0x83, 0xE0, 0x1F,                             // and eax, 0x1F (mod 32 instead of 40 for simplicity)
+                    0x6B, 0xC0, 0x18,                             // imul eax, 24
+                    0x05, 0x04, 0x58, 0xDD, 0x00,                 // add eax, 0xDD5804
+                    0x89, 0xC1,                                   // mov ecx, eax
+                    // [ecx+0x00] = fn_va
+                    0xC7, 0x01, fnBytes[0], fnBytes[1], fnBytes[2], fnBytes[3], // mov [ecx], fn
+                    // [ecx+0x04] = arg1 (from original esp+0x28 — pushad(32)+pushfd(4)=36, arg1@+0x28)
+                    0x8B, 0x44, 0x24, 0x28,                       // mov eax, [esp+0x28]
+                    0x89, 0x41, 0x04,                             // mov [ecx+0x04], eax
+                    0x8B, 0x44, 0x24, 0x2C,                       // mov eax, [esp+0x2C]
+                    0x89, 0x41, 0x08,                             // mov [ecx+0x08], eax
+                    0x8B, 0x44, 0x24, 0x30,                       // mov eax, [esp+0x30]
+                    0x89, 0x41, 0x0C,                             // mov [ecx+0x0C], eax
+                    // retaddr = [esp+0x24]
+                    0x8B, 0x44, 0x24, 0x24,                       // mov eax, [esp+0x24]
+                    0x89, 0x41, 0x10,                             // mov [ecx+0x10], eax
+                    // original ECX (this) is in pushad area. Offset: pushad stores edi esi ebp esp ebx edx ecx eax
+                    // from low to high. ecx at [esp+0x18] after pushad. +pushfd=+4 → [esp+0x1C]
+                    0x8B, 0x44, 0x24, 0x1C,                       // mov eax, [esp+0x1C]
+                    0x89, 0x41, 0x14,                             // mov [ecx+0x14], eax
+                    0x9D,                                         // popfd
+                    0x61,                                         // popad
+                    // Replay original 5 bytes: 55 8B EC 6A FF
+                    0x55, 0x8B, 0xEC, 0x6A, 0xFF,
+                    0xE9, 0x00, 0x00, 0x00, 0x00                  // jmp rel32
+                };
+                uint jmpInsnAddr = stubAddr + (uint)stubCode.Length - 5;
+                uint jmpTarget = fn + 5;
+                int rel32 = (int)(jmpTarget - (jmpInsnAddr + 5));
+                Array.Copy(BitConverter.GetBytes(rel32), 0, stubCode, stubCode.Length - 4, 4);
+
+                MemoryHelper.WriteProcessMemory(_hProcess, stub, stubCode, stubCode.Length, out _);
+
+                // Patch fn to JMP stubAddr
+                byte[] patchJmp = new byte[5];
+                patchJmp[0] = 0xE9;
+                int patchRel = (int)(stubAddr - (fn + 5));
+                Array.Copy(BitConverter.GetBytes(patchRel), 0, patchJmp, 1, 4);
+
+                if (!VirtualProtectEx(_hProcess, new IntPtr(fn), new UIntPtr(5), 0x40, out uint oldProt))
+                    continue;
+                MemoryHelper.WriteProcessMemory(_hProcess, new IntPtr(fn), patchJmp, 5, out _);
+                VirtualProtectEx(_hProcess, new IntPtr(fn), new UIntPtr(5), oldProt, out _);
+                hooked++;
+            }
+            Console.WriteLine($"  [SendHooks] installed hooks on {hooked} Send* functions");
+            Console.WriteLine($"  [SendHooks] ring buffer @ 0xDD5800, 32 entries × 24 bytes");
+            Console.WriteLine($"  [SendHooks] now trigger in-game action (e.g. equip an item), then use [Q] to read log");
+            return true;
+        }
+
+        /// <summary>Read the ring buffer of captured Send* calls.</summary>
+        public void ReadSendLog()
+        {
+            byte[] buf = new byte[0x400];
+            if (!MemoryHelper.ReadProcessMemory(_hProcess, new IntPtr(0xDD5800), buf, buf.Length, out int r) || r < 0x400)
+            {
+                Console.WriteLine("  [SendLog] failed to read");
+                return;
+            }
+            uint total = BitConverter.ToUInt32(buf, 0);
+            Console.WriteLine($"  [SendLog] total calls: {total}");
+            int entries = (int)Math.Min(total, 32);
+            // Show most recent entries
+            for (int e = 0; e < entries; e++)
+            {
+                int slot = (int)((total - entries + e) % 32);
+                int off = 4 + slot * 24;
+                uint fn = BitConverter.ToUInt32(buf, off + 0);
+                uint arg1 = BitConverter.ToUInt32(buf, off + 4);
+                uint arg2 = BitConverter.ToUInt32(buf, off + 8);
+                uint arg3 = BitConverter.ToUInt32(buf, off + 12);
+                uint ret = BitConverter.ToUInt32(buf, off + 16);
+                uint ecx = BitConverter.ToUInt32(buf, off + 20);
+                Console.WriteLine($"    #{total - entries + e}: fn=0x{fn:X} args=(0x{arg1:X}, 0x{arg2:X}, 0x{arg3:X}) from=0x{ret:X} ecx=0x{ecx:X}");
+            }
+        }
+
+        /// <summary>Call the Equip/Swap function 0x9A39B0 (packet 0x179).
+        /// Performs "swap cursor item with equip slot". Args = (1, 0, equipSlot).
+        /// For 衣服 (chest) slot, equipSlot = 4.
+        /// 
+        /// To automate "穿着 buff" — call this TWICE quickly with same args:
+        /// - Call 1: bag[bagSlot,itemSlot] ↔ equip_slot (item goes on, old item goes to cursor)
+        /// - Call 2: bag[bagSlot,itemSlot] ↔ equip_slot (item comes off, old item goes back on)
+        /// - Result: item back in bag, buff lingers</summary>
+        public bool EquipSwap(uint arg1, uint arg2, uint equipSlot)
+        {
+            uint csvClient = FindCSvClient();
+            if (csvClient == 0)
+            {
+                Console.WriteLine("  [EquipSwap] Could not find CSvClient");
+                return false;
+            }
+
+            byte[] a1 = BitConverter.GetBytes(arg1);
+            byte[] a2 = BitConverter.GetBytes(arg2);
+            byte[] a3 = BitConverter.GetBytes(equipSlot);
+            byte[] ec = BitConverter.GetBytes(csvClient);
+
+            byte[] sc = new byte[] {
+                0x60,                                         // pushad
+                0x68, a3[0], a3[1], a3[2], a3[3],             // push equipSlot (arg3)
+                0x68, a2[0], a2[1], a2[2], a2[3],             // push arg2
+                0x68, a1[0], a1[1], a1[2], a1[3],             // push arg1
+                0xB9, ec[0], ec[1], ec[2], ec[3],             // mov ecx, CSvClient
+                0xB8, 0xB0, 0x39, 0x9A, 0x00,                 // mov eax, 0x9A39B0
+                0xFF, 0xD0,                                   // call eax
+                0x61,                                         // popad
+                0xC3                                          // ret
+            };
+
+            IntPtr alloc = VirtualAllocEx(_hProcess, IntPtr.Zero, (uint)sc.Length, 0x3000, 0x40);
+            if (alloc == IntPtr.Zero) return false;
+            MemoryHelper.WriteProcessMemory(_hProcess, alloc, sc, sc.Length, out _);
+            uint tid;
+            IntPtr thread = CreateRemoteThread(_hProcess, IntPtr.Zero, 0, alloc, IntPtr.Zero, 0, out tid);
+            if (thread != IntPtr.Zero)
+            {
+                WaitForSingleObject(thread, 2000);
+                GetExitCodeThread(thread, out uint exitCode);
+                Console.WriteLine($"  [EquipSwap] (arg1=0x{arg1:X}, arg2=0x{arg2:X}, equipSlot=0x{equipSlot:X}), exitCode=0x{exitCode:X}");
+                CloseHandle(thread);
+            }
+            VirtualFreeEx(_hProcess, alloc, 0, 0x8000);
+            return true;
+        }
+
+        /// <summary>The full "wear + immediately unwear" buff cycle.
+        /// Calls EquipSwap twice rapidly, which equips+unequips the item and leaves a buff.</summary>
+        public bool WearBuff(uint arg1 = 1, uint arg2 = 0, uint equipSlot = 4, int delayMs = 50)
+        {
+            Console.WriteLine($"  [WearBuff] Starting swap cycle...");
+            if (!EquipSwap(arg1, arg2, equipSlot)) return false;
+            System.Threading.Thread.Sleep(delayMs);
+            if (!EquipSwap(arg1, arg2, equipSlot)) return false;
+            Console.WriteLine($"  [WearBuff] Done. Item should be back in bag, buff applied.");
+            return true;
+        }
+
         /// <summary>Auto-find the single CSvClient instance by scanning for its vtable.
         /// Returns 0 if not found. Uses vtable 0xBBBA34 (CSvClient type).
         /// This is STABLE across game sessions because the vtable is in the .rdata section 

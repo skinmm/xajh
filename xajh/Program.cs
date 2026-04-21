@@ -3745,6 +3745,47 @@ namespace Xajh
                                 bag.FindInstancesByVtable(vt);
                             }
                         }
+                        else if (key == ConsoleKey.Q)
+                        {
+                            // Hook all Send* functions. Trigger in-game action, then read log.
+                            Console.WriteLine("[Q] Send-hook tool:");
+                            Console.WriteLine("    1) install hooks on all Send* functions");
+                            Console.WriteLine("    2) read captured log");
+                            Console.WriteLine("    3) clear log (reset counter)");
+                            Console.Write("Choose (1/2/3): ");
+                            string s = Console.ReadLine()?.Trim() ?? "";
+                            if (s == "1")
+                            {
+                                bag.InstallSendHooks();
+                            }
+                            else if (s == "3")
+                            {
+                                byte[] zeros = new byte[0x400];
+                                MemoryHelper.WriteProcessMemory(hProcess, new IntPtr(0xDD5800), zeros, zeros.Length, out _);
+                                Console.WriteLine("  [Q] log cleared");
+                            }
+                            else
+                            {
+                                bag.ReadSendLog();
+                            }
+                        }
+                        else if (key == ConsoleKey.W)
+                        {
+                            // Wear-buff: equip + immediately unequip (toggle twice) to leave buff.
+                            // For 杨再兴银铠: arg1=1 arg2=0 equipSlot=4 (chest).
+                            Console.Write("[W] arg1 (hex, default 1): ");
+                            string s1 = Console.ReadLine()?.Trim() ?? "";
+                            Console.Write("[W] arg2 (hex, default 0): ");
+                            string s2 = Console.ReadLine()?.Trim() ?? "";
+                            Console.Write("[W] equipSlot (hex, default 4 = chest): ");
+                            string s3 = Console.ReadLine()?.Trim() ?? "";
+                            uint arg1 = 1, arg2 = 0, slot = 4;
+                            if (!string.IsNullOrEmpty(s1)) uint.TryParse(s1, System.Globalization.NumberStyles.HexNumber, null, out arg1);
+                            if (!string.IsNullOrEmpty(s2)) uint.TryParse(s2, System.Globalization.NumberStyles.HexNumber, null, out arg2);
+                            if (!string.IsNullOrEmpty(s3)) uint.TryParse(s3, System.Globalization.NumberStyles.HexNumber, null, out slot);
+                            Console.WriteLine($"[W] WearBuff(arg1=0x{arg1:X}, arg2=0x{arg2:X}, slot=0x{slot:X}) — will swap TWICE");
+                            bag.WearBuff(arg1, arg2, slot, 50);
+                        }
                         else if (key == ConsoleKey.K)
                         {
                             int po = MemoryHelper.ReadInt32(hProcess, IntPtr.Add(moduleBase, 0x9D4514));
